@@ -26,7 +26,7 @@
     <div id="onboarding" class="view">
       <header class="ob-header">
         <h1 data-i18n="appName">headlenss</h1>
-        <p class="muted" data-i18n="appTagline">音声で Claude Code を動かす</p>
+        <p class="muted" data-i18n="appTagline">音声でエージェントを動かす</p>
       </header>
 
       <!-- Step 1: server -->
@@ -133,10 +133,10 @@
         </ol>
       </section>
 
-      <!-- 新規 Claude セッション (WebView から tmux + claude code を起動) -->
+      <!-- 新規 Agent セッション (WebView から tmux + claude code を起動) -->
       <section class="new-claude-session card" id="newClaudeSessionCard">
         <header class="section-head">
-          <h2 data-i18n="newClaudeHead">新規 Claude セッション</h2>
+          <h2 data-i18n="newClaudeHead">新規 Agent セッション</h2>
         </header>
         <form id="newClaudeSessionForm" class="claude-form">
           <label class="row">
@@ -152,7 +152,14 @@
                    placeholder="~/works/myproject"
                    autocapitalize="off" autocorrect="off" spellcheck="false" />
           </label>
-          <button type="submit" class="primary" data-i18n="newClaudeStart">Claude を起動</button>
+          <label class="row">
+            <span data-i18n="newAgentKind">Agent</span>
+            <select id="newAgentKind">
+              <option value="claude">Claude</option>
+              <option value="codex">Codex</option>
+            </select>
+          </label>
+          <button type="submit" class="primary" data-i18n="newClaudeStart">Agent を起動</button>
         </form>
         <div id="newClaudeStatus" class="probe small muted"></div>
       </section>
@@ -161,7 +168,7 @@
            普段は畳んでおき、必要なときだけ開く -->
       <details class="claude-sessions-card card" id="claudeSessionsCard">
         <summary>
-          <span data-i18n="claudeSessionsHead">Claude セッション</span>
+          <span data-i18n="claudeSessionsHead">Agent セッション</span>
           <span id="claudeSessionsCount" class="claude-count muted small"></span>
         </summary>
         <div class="claude-sessions-body">

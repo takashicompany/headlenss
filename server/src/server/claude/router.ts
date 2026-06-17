@@ -9,7 +9,10 @@ import { setTimeout as wait } from 'node:timers/promises';
 import { detectClaudeSessions } from './process-detect.ts';
 import * as store from './store.ts';
 import { resolveTmuxSessionName } from './tmux-resolver.ts';
+import { captureOutput } from '../tmux.ts';
 import { extractChatFromTranscript, extractLastAssistantText, sanitizeChatText } from './transcript.ts';
+import { extractCodexChatFromTranscript } from '../codex/transcript.ts';
+import { detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
 import type { AskQuestion, HookDecision, RespondInput, SessionStatus } from './types.ts';
 
 const exec = promisify(execFile);
@@ -39,6 +42,21 @@ function transcriptPathFor(cwd: string, sessionId: string): string {
 export const claudeRouter = new Hono();
 
 const PENDING_TIMEOUT_MS = 600_000;
+
+async function clearStaleCodexPermissionIfTmuxNoLongerAsking(tmuxName: string): Promise<void> {
+  const pending = store.getPending(tmuxName);
+  if (!pending || pending.source !== 'codex' || pending.kind !== 'permission') return;
+  // Keep the chat/G2 permission UI only while Codex is visibly waiting in tmux.
+  // Auto-review or direct tmux approval can advance before PostToolUse/Stop reaches
+  // headlenss, especially for Codex sessions that were started before hooks changed.
+  try {
+    const pane = await captureOutput(tmuxName, 80);
+    const stillAsking = isCodexPermissionPrompt(pane);
+    if (!stillAsking) store.clearPending(tmuxName);
+  } catch {
+    // If tmux capture fails, leave the pending alone; normal cleanup paths can still clear it.
+  }
+}
 
 async function getTmuxName(c: Context): Promise<string> {
   const pane = c.req.header('X-Tmux-Pane') ?? '';
@@ -421,7 +439,10 @@ claudeRouter.get('/claude/sessions', async (c) => {
   const trackedNames = new Set(trackedAlive.map((s) => s.tmuxSessionName));
 
   // ~/.claude/sessions/ レジストリから検出 (プラグインなしでも検出可)
-  const detected = await detectClaudeSessions();
+  const [detected, codexDetected] = await Promise.all([
+    detectClaudeSessions(),
+    detectCodexSessions().catch(() => []),
+  ]);
 
   const merged: Array<{
     tmuxSessionName: string;
@@ -429,6 +450,9 @@ claudeRouter.get('/claude/sessions', async (c) => {
     status: SessionStatus;
     startedAt: number;
     lastSeenAt: number;
+    source?: 'claude' | 'codex';
+    codexHookHealth?: ReturnType<typeof getCodexHookHealth>;
+    codexNeedsHookAttention?: boolean;
   }> = [];
 
   for (const s of trackedAlive) {
@@ -438,6 +462,8 @@ claudeRouter.get('/claude/sessions', async (c) => {
       status: s.status,
       startedAt: s.startedAt,
       lastSeenAt: s.lastSeenAt,
+      source: s.source,
+      codexHookHealth: s.source === 'codex' ? getCodexHookHealth(s.cwd) : undefined,
     });
   }
 
@@ -452,6 +478,22 @@ claudeRouter.get('/claude/sessions', async (c) => {
       status: d.status,
       startedAt: d.startedAt,
       lastSeenAt: d.startedAt,
+      source: 'claude',
+    });
+  }
+
+  for (const d of codexDetected) {
+    if (trackedNames.has(d.tmuxSessionName)) continue;
+    if (liveTmux && !liveTmux.has(d.tmuxSessionName)) continue;
+    merged.push({
+      tmuxSessionName: d.tmuxSessionName,
+      cwd: d.cwd,
+      status: d.status,
+      startedAt: d.startedAt,
+      lastSeenAt: d.lastSeenAt,
+      source: 'codex',
+      codexHookHealth: d.hookHealth,
+      codexNeedsHookAttention: d.needsHookAttention,
     });
   }
 
@@ -460,18 +502,27 @@ claudeRouter.get('/claude/sessions', async (c) => {
 
 claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   const tmuxName = c.req.param('tmuxName');
+  await clearStaleCodexPermissionIfTmuxNoLongerAsking(tmuxName);
   const session = store.getSession(tmuxName);
 
-  // 現在動いてる Claude Code を registry から探して transcript path を割り出す
-  const detected = await detectClaudeSessions();
+  // 現在動いてる Claude Code / Codex を registry や tmux から探す
+  const [detected, codexDetected] = await Promise.all([
+    detectClaudeSessions(),
+    detectCodexSessions().catch(() => []),
+  ]);
   const det = detected.find((d) => d.tmuxSessionName === tmuxName);
+  const codexDet = codexDetected.find((d) => d.tmuxSessionName === tmuxName);
 
   // hook 経由で記録された chat
   const hookChat = session?.chat ?? [];
 
-  // transcript を読んで履歴を補完 (hook では取りこぼす過去分も拾える)
-  let transcriptChat: Array<{ role: 'user' | 'assistant'; text: string; ts: number }> = [];
-  if (det && det.cwd && det.ccSessionId) {
+  // transcript を読んで履歴を補完 (hook では取りこぼす過去分も拾える)。
+  // Claude は registry から transcript path を推定し、Codex は hook payload の
+  // transcript_path をセッションに保存して使う。
+  let transcriptChat: Array<{ role: 'user' | 'assistant'; text: string; ts: number; synthetic?: boolean }> = [];
+  if (session?.source === 'codex' && session.transcriptPath && existsSync(session.transcriptPath)) {
+    transcriptChat = await extractCodexChatFromTranscript(session.transcriptPath, 200);
+  } else if (det && det.cwd && det.ccSessionId) {
     const path = transcriptPathFor(det.cwd, det.ccSessionId);
     if (existsSync(path)) {
       transcriptChat = await extractChatFromTranscript(path, 200);
@@ -489,14 +540,14 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   // 最後に ts でソート: AskUserQuestion 回答の合成 user メッセージなど、
   // transcript に存在しないが時系列上は中間に位置する項目を正しい位置に置くため。
   const seen = new Set(transcriptChat.map((m) => `${m.role}:${m.text}`));
-  const merged = [...transcriptChat];
+  const merged: Array<{ role: 'user' | 'assistant'; text: string; ts: number; synthetic?: boolean }> = [...transcriptChat];
   for (const m of cleanedHookChat) {
     const key = `${m.role}:${m.text}`;
     if (!seen.has(key)) merged.push(m);
   }
   merged.sort((a, b) => a.ts - b.ts);
 
-  if (merged.length === 0 && !session) {
+  if (merged.length === 0 && !session && !codexDet) {
     return c.json({ error: 'not found' }, 404);
   }
   // Claude Code の動作状態 (idle / busy / waiting-*) を一緒に返して、
@@ -510,6 +561,7 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   // 単純な ?? チェーンでは registry 由来の 'busy' が永遠に拾われない。merge する。
   let status: SessionStatus = 'idle';
   if (det?.status === 'busy') status = 'busy';
+  if (codexDet?.status === 'waiting-permission') status = 'waiting-permission';
   if (session?.status === 'waiting-permission' || session?.status === 'waiting-question') {
     status = session.status;
   }
@@ -534,11 +586,22 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   }
   // pending (PreToolUse / PermissionRequest 待ち) も同梱して、
   // chat UI で許可応答 / 質問回答の UI を出せるようにする。
-  return c.json({ chat: merged, status, pending: session?.pending ?? null });
+  const codexHookHealth = session?.source === 'codex'
+    ? getCodexHookHealth(session.cwd)
+    : codexDet?.hookHealth;
+  return c.json({
+    chat: merged,
+    status,
+    pending: session?.pending ?? null,
+    source: session?.source ?? (codexDet ? 'codex' : det ? 'claude' : undefined),
+    codexHookHealth: codexHookHealth ?? null,
+    codexNeedsHookAttention: codexDet?.needsHookAttention ?? false,
+  });
 });
 
-claudeRouter.get('/claude/sessions/:tmuxName/pending', (c) => {
+claudeRouter.get('/claude/sessions/:tmuxName/pending', async (c) => {
   const tmuxName = c.req.param('tmuxName');
+  await clearStaleCodexPermissionIfTmuxNoLongerAsking(tmuxName);
   const pending = store.getPending(tmuxName);
   if (!pending) return c.json({ pending: null });
   return c.json({ pending });
@@ -609,6 +672,31 @@ claudeRouter.post('/claude/sessions/:tmuxName/respond', async (c) => {
     }
   } else {
     if (body.kind === 'permission') {
+      if (pending.source === 'codex') {
+        try {
+          const before = await captureOutput(tmuxName, 60);
+          if (!isCodexPermissionPrompt(before)) {
+            store.clearPending(tmuxName);
+            return c.json({ ok: true, stale: true });
+          }
+          if (body.decision === 'allow') {
+            await exec('tmux', ['send-keys', '-t', tmuxName, 'Enter']);
+          } else {
+            await exec('tmux', ['send-keys', '-t', tmuxName, 'Down']);
+            await wait(80);
+            await exec('tmux', ['send-keys', '-t', tmuxName, 'Enter']);
+          }
+          await wait(350);
+          const after = await captureOutput(tmuxName, 40);
+          if (isCodexPermissionPrompt(after)) {
+            return c.json({ error: 'Codex still appears to be waiting for approval in tmux. Open tmux view and approve there.' }, 409);
+          }
+          store.clearPending(tmuxName);
+          return c.json({ ok: true });
+        } catch (e) {
+          return c.json({ error: 'failed to send keys to tmux: ' + (e as Error).message }, 500);
+        }
+      }
       decision = {
         event: 'PermissionRequest',
         behavior: body.decision,

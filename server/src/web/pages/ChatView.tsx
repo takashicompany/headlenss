@@ -29,6 +29,13 @@ type Pending = {
   createdAt: number;
 };
 
+type CodexHookHealth = {
+  status: 'ok' | 'missing' | 'incomplete';
+  missingEvents: string[];
+  setupCommand: string;
+  notes: string[];
+};
+
 /** 表示用前処理: `@/tmp/headlenss-uploads/<file>` を見つけたら markdown image
  *  記法 `![](/api/uploads/<file>)` に置き換え、チャットバブル内でインライン
  *  画像として表示できるようにする。
@@ -61,6 +68,9 @@ export function ChatView({
   // pending interaction: AskUserQuestion / 許可リクエストの待ち状態
   // (chat の楽観的更新用 `pending` とは別物。InterAction の意味で `pendingInter`)
   const [pendingInter, setPendingInter] = useState<Pending | null>(null);
+  const [source, setSource] = useState<'claude' | 'codex' | undefined>(undefined);
+  const [codexHookHealth, setCodexHookHealth] = useState<CodexHookHealth | null>(null);
+  const [codexNeedsHookAttention, setCodexNeedsHookAttention] = useState(false);
   // 質問への回答種別 (predefined / type-something / chat-about-this)
   const [qKind, setQKind] = useState<Record<number, 'predefined' | 'type-something' | 'chat-about-this'>>({});
   // predefined 用: 選んだ option の label (単一選択)
@@ -160,6 +170,9 @@ export function ChatView({
             chat: ChatMessage[];
             status?: SessionStatus;
             pending?: Pending | null;
+            source?: 'claude' | 'codex';
+            codexHookHealth?: CodexHookHealth | null;
+            codexNeedsHookAttention?: boolean;
           };
           if (!disposed) {
             // 合成メッセージ (status 表示用に server 側で動的注入したもの) は
@@ -167,6 +180,9 @@ export function ChatView({
             const next = (json.chat ?? []).filter((m) => !m.synthetic);
             setServerChat(next);
             if (json.status) setStatus(json.status);
+            setSource(json.source);
+            setCodexHookHealth(json.codexHookHealth ?? null);
+            setCodexNeedsHookAttention(json.codexNeedsHookAttention === true);
             // pending が変わった(or null になった)ら入力中の選択肢/メモを破棄して
             // 別の質問に持ち越さないようにする
             setPendingInter((prev) => {
@@ -337,7 +353,17 @@ export function ChatView({
   // pending への応答送信
   const respondToPending = useCallback(async (
     body: { kind: 'permission'; decision: 'allow' | 'deny'; message?: string }
-       | { kind: 'question'; answers: Array<{ question: string; option: string; notes?: string }> },
+       | {
+           kind: 'question';
+           answers: Array<{
+             question: string;
+             answerKind?: 'predefined' | 'type-something' | 'chat-about-this';
+             option?: string;
+             options?: string[];
+             text?: string;
+             notes?: string;
+           }>;
+         },
   ) => {
     if (!pendingInter || respondingPending) return;
     setRespondingPending(true);
@@ -472,6 +498,25 @@ export function ChatView({
         className="chat-scroller"
         style={scrollerPaddingBottom ? { paddingBottom: scrollerPaddingBottom } : undefined}
       >
+        {source === 'codex' && codexHookHealth && (codexHookHealth.status !== 'ok' || codexNeedsHookAttention) && (
+          <div className="chat-diagnostic">
+            <div className="chat-diagnostic-title">
+              {codexHookHealth.status === 'missing'
+                ? t('codexHooksMissingTitle')
+                : codexHookHealth.status === 'incomplete'
+                ? t('codexHooksIncompleteTitle')
+                : t('codexHooksNeedTrustTitle')}
+            </div>
+            <div className="chat-diagnostic-body">
+              {codexHookHealth.notes[0] ?? t('codexHooksNeedTrustBody')}
+              {codexHookHealth.missingEvents.length > 0 && (
+                <div>{t('codexHooksMissingEvents')}: {codexHookHealth.missingEvents.join(', ')}</div>
+              )}
+            </div>
+            <code className="chat-diagnostic-command">{codexHookHealth.setupCommand}</code>
+          </div>
+        )}
+
         {displayChat.length === 0 ? (
           <div className="chat-empty">{t('chatEmpty')}</div>
         ) : (
@@ -482,7 +527,7 @@ export function ChatView({
                 key={i}
                 className={`chat-msg chat-msg-${m.role}${isPending ? ' chat-msg-pending' : ''}`}
               >
-                <div className="chat-msg-role">{m.role === 'user' ? 'YOU' : 'Claude'}</div>
+                <div className="chat-msg-role">{m.role === 'user' ? 'YOU' : 'Agent'}</div>
                 <div className="chat-msg-bubble markdown-body">
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm, remarkBreaks]}

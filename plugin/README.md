@@ -31,3 +31,33 @@ Claude Code がイベントを発火するたびに、headlenss サーバーの 
 ## 設定
 
 現状はサーバーURLが `http://localhost:3000` でハードコード。今後 `userConfig` で変更可能にする予定。
+
+## Codex hooks
+
+This plugin also includes Codex lifecycle hooks under `plugin/codex-hooks/` and `plugin/.codex-plugin/plugin.json`.
+
+When installed as a Codex plugin, the hooks forward `SessionStart`, `UserPromptSubmit`, `Stop`, and `PermissionRequest` events to the headlenss server at `http://localhost:3000` by default. Set `HEADLENSS_SERVER_URL` before launching Codex to target a different server URL.
+
+Install the global Codex hooks once:
+
+```bash
+node /path/to/headlenss/plugin/codex-hooks/install.mjs
+```
+
+This merges HeadLenss hook definitions into `~/.codex/hooks.json` and backs up any existing file before writing. Restart Codex, open `/hooks`, and review/trust the HeadLenss hook definitions.
+
+After that, launch Codex inside any tmux session so the hook can resolve `TMUX_PANE` back to the headlenss tmux session:
+
+```bash
+tmux new -s codex-work -c /path/to/your/project codex
+```
+
+No HeadLenss Web UI session creation is required; the tmux session appears automatically after Codex starts and emits lifecycle events.
+
+To remove the global Codex hooks:
+
+```bash
+node /path/to/headlenss/plugin/codex-hooks/uninstall.mjs
+```
+
+For HeadLenss development, this repository also includes project-local `.codex/hooks.json`, but global hooks are the normal setup for end users because they work from any project.

@@ -24,6 +24,8 @@ export function upsertSession(input: {
   tmuxPane: string;
   tmuxSessionName: string;
   cwd: string;
+  source?: 'claude' | 'codex';
+  transcriptPath?: string;
 }): ClaudeSession {
   const existing = sessions.get(input.tmuxSessionName);
   const now = Date.now();
@@ -31,6 +33,8 @@ export function upsertSession(input: {
     existing.ccSessionId = input.ccSessionId;
     existing.tmuxPane = input.tmuxPane;
     existing.cwd = input.cwd;
+    if (input.source) existing.source = input.source;
+    if (input.transcriptPath) existing.transcriptPath = input.transcriptPath;
     existing.lastSeenAt = now;
     return existing;
   }
@@ -39,6 +43,8 @@ export function upsertSession(input: {
     tmuxPane: input.tmuxPane,
     tmuxSessionName: input.tmuxSessionName,
     cwd: input.cwd,
+    source: input.source,
+    transcriptPath: input.transcriptPath,
     status: 'idle',
     startedAt: now,
     lastSeenAt: now,

@@ -20,6 +20,7 @@ import {
 } from './renderer'
 import {
   HeadlenssClient,
+  type AgentSource,
   type ChatItem,
   type ClaudeSessionInfo,
   type Pending,
@@ -132,6 +133,7 @@ const newClaudeSessionCardEl = document.getElementById('newClaudeSessionCard') a
 const newClaudeForm = document.getElementById('newClaudeSessionForm') as HTMLFormElement
 const newClaudeNameEl = document.getElementById('newClaudeName') as HTMLInputElement
 const newClaudeCwdEl = document.getElementById('newClaudeCwd') as HTMLInputElement
+const newAgentKindEl = document.getElementById('newAgentKind') as HTMLSelectElement
 const newClaudeStatusEl = document.getElementById('newClaudeStatus') as HTMLDivElement
 
 const recordBtn = document.getElementById('recordBtn') as HTMLButtonElement
@@ -173,7 +175,7 @@ function scrollAnimTickMs(): number {
 // レンズが勝手にもう一度折り返す」ズレを無くす。-2px は丸め誤差のセーフティマージン。
 const CHAT_WRAP_PX = MAIN_INNER_WIDTH - 2
 const CHAT_WRAP_WIDTH = 56             // (cc-response の粗いスライス用) 全角28文字相当のカラム数
-const CC_POLL_INTERVAL_MS = 1500       // Claude sessions / chat / pending のポーリング間隔
+const CC_POLL_INTERVAL_MS = 1500       // Agent sessions / chat / pending のポーリング間隔
 const ROOT_LIST_VISIBLE = 7            // G2 root 画面に同時表示するセッション数 (8 行送ると容量超えでスクロールバーが出るため 7 に絞る)
 const CC_LIST_VISIBLE = 7              // cc-response 画面に同時表示する行数 (rootlist と揃える)
 
@@ -246,6 +248,7 @@ function isUnread(s: ClaudeSessionInfo): boolean {
 // Claude Code hook 連携
 let claudeSessions: ClaudeSessionInfo[] = []     // 起動中Claude Codeを持つtmuxセッション一覧
 let claudeChat: ChatItem[] = []                  // 現在選択中セッションのチャット履歴
+let currentAgentSource: AgentSource | undefined = undefined
 let claudePending: Pending | null = null         // 現在選択中セッションの承認/質問待ち
 let claudePollTimer: ReturnType<typeof setInterval> | null = null
 let respondCursor = 0                            // cc-response 画面のカーソル位置(現在質問の行 index)
@@ -469,9 +472,10 @@ function buildRootListView(): string {
     const s = items[i]
     const cursor = i === rootCursor ? '▶ ' : '  '
     const mark = claudeStatusMark(s)
+    const agent = s.source === 'codex' ? 'Codex' : s.source === 'claude' ? 'Claude' : 'Agent'
     // 既読セッションは空白で揃え、未読は '*' でマーク
     const unread = isUnread(s) ? '*' : ' '
-    lines.push(`${cursor}${s.tmuxSessionName} ${unread}${mark}`)
+    lines.push(`${cursor}${s.tmuxSessionName} [${agent}] ${unread}${mark}`)
   }
   return lines.join('\n')
 }
@@ -597,7 +601,7 @@ function summarizeToolInput(input: unknown): string {
 
 /**
  * チャット項目を G2 レンズ用に整形。
- * 役割タグ ([YOU] / [Claude]) を独立行で挟み、タグの前に空行を入れる。
+ * 役割タグ ([YOU] / [Claude|Codex]) を独立行で挟み、タグの前に空行を入れる。
  * 生ログ (claudeChat) は書き換えず、表示時にこの関数で都度生成する。
  */
 function formatChatLines(items: ChatItem[], maxWidthPx: number): string[] {
@@ -605,7 +609,8 @@ function formatChatLines(items: ChatItem[], maxWidthPx: number): string[] {
   for (const item of items) {
     const text = item.text.replace(/\r/g, '').trim()
     if (!text) continue
-    const tag = item.role === 'user' ? '[YOU]' : '[Claude]'
+    const agentName = currentAgentSource === 'codex' ? 'Codex' : currentAgentSource === 'claude' ? 'Claude' : 'Agent'
+    const tag = item.role === 'user' ? '[YOU]' : `[${agentName}]`
     if (out.length > 0) out.push('')  // タグの直前に空行を挟んで境目を強調
     out.push(tag)
     const paragraphs = text.split('\n')
@@ -981,10 +986,12 @@ async function refreshClaudeData(): Promise<void> {
     return
   }
   try {
-    const [chat, pending] = await Promise.all([
+    const [chatResponse, pending] = await Promise.all([
       client.getClaudeChat(settings.sessionName),
       client.getClaudePending(settings.sessionName),
     ])
+    const chat = chatResponse.chat
+    currentAgentSource = chatResponse.source ?? claudeSessions.find((s) => s.tmuxSessionName === settings.sessionName)?.source
     // chat: scrollback 中なら新着分だけオフセット繰り上げ
     if (scrollOffset > 0) {
       const oldLen = formatChatLines(claudeChat, CHAT_WRAP_PX).length
@@ -1770,8 +1777,9 @@ function openSelectedFromRoot(): void {
   if (!sel) return
   settings.sessionName = sel.tmuxSessionName
   void persistSettings()
-  log(`Opened Claude session: ${sel.tmuxSessionName}`)
+  log(`Opened Agent session: ${sel.tmuxSessionName}`)
   claudeChat = []
+  currentAgentSource = sel.source
   claudePending = null
   resetScroll()
   phase = 'idle'
@@ -2028,10 +2036,11 @@ function renderClaudeSessionsList(): void {
       killClass = 'claude-kill kill-pending'
       killLabel = escapeHtml(t('claudeKillConfirmBtn'))
     }
+    const agent = s.source === 'codex' ? 'Codex' : s.source === 'claude' ? 'Claude' : 'Agent'
     li.innerHTML =
       `<span class="claude-status" data-status="${escapeAttr(status)}" title="${escapeAttr(claudeStatusLabel(status))}">●</span>` +
       `<div class="claude-info">` +
-        `<div class="claude-name">${escapeHtml(s.tmuxSessionName)}</div>` +
+        `<div class="claude-name">${escapeHtml(s.tmuxSessionName)} <span class="agent-label">${agent}</span></div>` +
         `<div class="claude-cwd">${escapeHtml(s.cwd || '~')}</div>` +
       `</div>` +
       `<button class="${killClass}" data-action="kill" aria-label="kill ${escapeAttr(s.tmuxSessionName)}"${killDisabled}>${killLabel}</button>`
@@ -2110,7 +2119,7 @@ function handleKillButtonClick(name: string, btn: HTMLButtonElement): void {
 }
 
 async function doKillClaudeSession(name: string): Promise<void> {
-  log(`Killing Claude session: ${name}`)
+  log(`Killing Agent session: ${name}`)
   killingSessions.add(name)
   // 「停止中…」表示を即時反映
   renderClaudeSessionsList()
@@ -2151,11 +2160,12 @@ async function submitNewClaudeSession(e: Event): Promise<void> {
   try {
     await client.createSession(name, {
       cwd: cwdRaw || undefined,
-      startClaude: true,
+      startClaude: newAgentKindEl.value !== 'codex',
+      startCodex: newAgentKindEl.value === 'codex',
     })
-    log(`Started new Claude session: ${name} cwd=${cwdRaw || '(home)'}`)
+    log(`Started new agent session: ${name} cwd=${cwdRaw || '(home)'}`)
 
-    // claude プロセスが ~/.claude/sessions/<PID>.json に登録されるまで時間がかかるので、
+    // agent プロセスが ~/.claude/sessions/<PID>.json に登録されるまで時間がかかるので、
     // listClaudeSessions に新セッションが現れるまで polling する。
     // 起動成功 ≠ 即検出可能 なので、最大 ~12 秒まで 500ms 間隔でリトライ。
     const startedAt = Date.now()
@@ -2176,12 +2186,12 @@ async function submitNewClaudeSession(e: Event): Promise<void> {
       const idx = claudeSessions.findIndex((s) => s.tmuxSessionName === name)
       if (idx >= 0) rootCursor = idx
       setNewClaudeStatus('ok', `${t('newClaudeOk')} (${name})`)
-      log(`Claude session "${name}" detected (took ${Date.now() - startedAt}ms)`)
+      log(`Agent session "${name}" detected (took ${Date.now() - startedAt}ms)`)
     } else {
       // tmux session 自体は作成済みだが Claude の registry 登録が遅れているケース。
       // 一覧に出るのは遅延するが処理は成功扱いとする。
       setNewClaudeStatus('ok', `${t('newClaudeOk')} (${name}) ${t('newClaudeWaitDetect')}`)
-      log(`Claude session "${name}" not yet registered after ${POLL_TIMEOUT_MS}ms — keep polling in background`)
+      log(`Agent session "${name}" not yet registered after ${POLL_TIMEOUT_MS}ms — keep polling in background`)
     }
     newClaudeNameEl.value = ''
     newClaudeCwdEl.value = ''

@@ -61,6 +61,19 @@ function getSessionEnvArgs(): string[] {
     .flatMap((pair) => ['-e', pair]);
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function getHeadlenssServerUrl(): string {
+  const explicit = (process.env.HEADLENSS_SERVER_URL ?? '').trim();
+  if (explicit) return explicit;
+  const rawHost = process.env.HOST ?? '127.0.0.1';
+  const host = rawHost === '0.0.0.0' || rawHost === '::' ? '127.0.0.1' : rawHost;
+  const port = process.env.PORT ?? '3000';
+  return `http://${host}:${port}`;
+}
+
 export function validateName(name: string): void {
   if (!NAME_RE.test(name)) {
     throw new Error('invalid session name (use [a-zA-Z0-9_-], max 40 chars)');
@@ -123,9 +136,11 @@ export type CreateSessionOptions = {
   /** セッション開始時の作業ディレクトリ。`~`、`~/...`、相対パスはホーム基準で展開。
    *  ディレクトリが存在しなければ mkdir -p で作成する。 */
   cwd?: string;
-  /** true なら新規シェル上で `claude -c || claude` を実行する (claude code 起動)。
+  /** true なら新規シェル上で `claude -c || claude` を実行する (Claude Code 起動)。
    *  `claude -c` は過去会話の継続。失敗時 (該当会話無し等) は通常 `claude` にフォールバック。 */
   startClaude?: boolean;
+  /** true なら新規シェル上で Codex を起動する。HeadLenss hooks が有効な cwd では chat view に登録される。 */
+  startCodex?: boolean;
 };
 
 export async function createSession(
@@ -156,6 +171,13 @@ export async function createSession(
     await exec('tmux', tmuxArgs, { cwd: targetCwd });
   }
   await configureSessionForHeadless(name);
+
+  if (options.startCodex) {
+    await new Promise((r) => setTimeout(r, 300));
+    const env = `HEADLENSS_SERVER_URL=${shellQuote(getHeadlenssServerUrl())}`;
+    await sendKeys(name, `${env} codex resume --last || ${env} codex`, true);
+    return;
+  }
 
   if (options.startClaude) {
     // 新セッションのシェルがプロンプト準備完了するまで少し待つ

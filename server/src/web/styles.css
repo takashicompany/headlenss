@@ -181,6 +181,16 @@ button {
   color: #e25555;
 }
 
+.agent-indicator {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.codex-hook-warning {
+  color: #f5a623;
+  font-weight: 500;
+}
+
 .session-kill {
   background: transparent;
   border: none;
@@ -325,6 +335,7 @@ button {
 /* 吹き出し以外の要素は端から余白を取る */
 .chat-status,
 .chat-pending,
+.chat-diagnostic,
 .chat-error,
 .chat-empty {
   margin-left: 0.75rem;
@@ -427,6 +438,42 @@ button {
 @keyframes chat-status-pulse {
   0%, 100% { opacity: 0.35; transform: scale(0.85); }
   50%      { opacity: 1;    transform: scale(1.1);  }
+}
+
+.chat-diagnostic {
+  background: rgba(245, 166, 35, 0.09);
+  border: 1px solid rgba(245, 166, 35, 0.42);
+  border-radius: 8px;
+  padding: 0.7rem 0.85rem;
+  margin: 0.5rem 0;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.chat-diagnostic-title {
+  color: #f5a623;
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+
+.chat-diagnostic-body {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.chat-diagnostic-command {
+  display: block;
+  background: #0e0e10;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 0.45rem 0.55rem;
+  overflow-x: auto;
+  white-space: pre;
+  font-size: 0.78rem;
 }
 
 /* AskUserQuestion / 許可リクエスト UI (chat-scroller の末尾に出す) */
