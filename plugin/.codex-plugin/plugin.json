@@ -1,0 +1,11 @@
+{
+  "name": "headlenss",
+  "version": "0.1.1",
+  "description": "Surface Codex activity (user prompts, replies, approvals) to Even G2 smart glasses and the headlenss web UI.",
+  "hooks": "./codex-hooks/hooks.json",
+  "author": {
+    "name": "takashicompany"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/takashicompany/headlenss"
+}

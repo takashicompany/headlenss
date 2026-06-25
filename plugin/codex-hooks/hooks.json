@@ -1,0 +1,77 @@
+{
+  "description": "Forward Codex lifecycle events to the headlenss server so G2/Web chat can show Codex activity.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT:-$(pwd)/plugin}/codex-hooks/headlenss-codex-hook.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Registering headlenss session"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT:-$(pwd)/plugin}/codex-hooks/headlenss-codex-hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT:-$(pwd)/plugin}/codex-hooks/headlenss-codex-hook.mjs\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT:-$(pwd)/plugin}/codex-hooks/headlenss-codex-hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT:-$(pwd)/plugin}/codex-hooks/headlenss-codex-hook.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Notifying headlenss"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT:-$(pwd)/plugin}/codex-hooks/headlenss-codex-hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

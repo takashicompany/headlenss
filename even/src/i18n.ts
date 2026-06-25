@@ -8,7 +8,7 @@ export type Language = 'en' | 'ja'
 const STRINGS = {
   // ─── App ─────────────────────────────────────────────────────
   appName:        { en: 'headlenss',                            ja: 'headlenss' },
-  appTagline:     { en: 'Voice control for Claude Code',        ja: '音声で Claude Code を動かす' },
+  appTagline:     { en: 'Voice control for coding agents',        ja: '音声でエージェントを動かす' },
 
   // ─── Onboarding ──────────────────────────────────────────────
   step1of2:       { en: 'Step 1 / 2',                           ja: 'Step 1 / 2' },
@@ -45,8 +45,8 @@ const STRINGS = {
   chatNoMsg:           { en: '(no messages yet)',               ja: '(まだ発言なし)' },
   noticeQuestion:      { en: '? Question waiting (tap to answer)',    ja: '? 質問待ち (clickで回答)' },
   noticePermission:    { en: '⏸ Permission waiting (tap to respond)', ja: '⏸ 承認待ち (clickで応答)' },
-  rootListEmpty:       { en: '(no Claude Code session)\n\nStart `claude` inside a tmux session',
-                         ja: '(Claude Code が動いている tmux が無い)\n\ntmux 内で `claude` を起動してください' },
+  rootListEmpty:       { en: '(no agent session)\n\nStart agent or Codex inside tmux',
+                         ja: '(エージェントが動いている tmux が無い)\n\ntmux 内でエージェントを起動してください' },
 
   // ─── G2 cc-response (approve / answer) ───────────────────────
   approveTool:         { en: '⏸ Approve {name}',                ja: '⏸ {name} の承認' },
@@ -54,13 +54,13 @@ const STRINGS = {
   submitOption:        { en: '> Submit',                        ja: '> Submit (確定)' },
   voiceInputBadge:     { en: '(voice input)',                   ja: '(音声入力)' },
 
-  // ─── New Claude session detection ────────────────────────────
+  // ─── New Agent session detection ────────────────────────────
   newClaudeDetecting:  { en: '(detecting…)',                    ja: '(検出中…)' },
-  newClaudeWaitDetect: { en: '— Awaiting Claude detection',     ja: '— Claude 検出待ち' },
+  newClaudeWaitDetect: { en: '— Awaiting agent detection',     ja: '— エージェント検出待ち' },
 
   // ─── Claude Sessions list ────────────────────────────────────
-  claudeSessionsHead:    { en: 'Claude sessions',               ja: 'Claude セッション' },
-  claudeSessionsEmpty:   { en: '(no Claude sessions)',          ja: '(Claude セッションなし)' },
+  claudeSessionsHead:    { en: 'Agent sessions',               ja: 'エージェント セッション' },
+  claudeSessionsEmpty:   { en: '(no Agent sessions)',          ja: '(エージェント セッションなし)' },
   claudeSessionsLoading: { en: 'Loading…',                      ja: '読み込み中…' },
   claudeStatusIdle:      { en: 'idle',                          ja: 'アイドル' },
   claudeStatusBusy:      { en: 'busy',                          ja: 'ビジー' },
@@ -71,10 +71,11 @@ const STRINGS = {
   claudeKillingBtn:      { en: 'Killing…',                      ja: '停止中…' },
 
   // ─── New Claude Session ──────────────────────────────────────
-  newClaudeHead:  { en: 'New Claude session',                   ja: '新規 Claude セッション' },
+  newClaudeHead:  { en: 'New Agent session',                   ja: '新規 エージェント セッション' },
   newClaudeName:  { en: 'Session name',                         ja: 'セッション名' },
   newClaudeCwd:   { en: 'Working directory',                    ja: '作業ディレクトリ' },
-  newClaudeStart: { en: 'Start Claude',                         ja: 'Claude を起動' },
+  newAgentKind:   { en: 'Agent',                                ja: 'エージェント' },
+  newClaudeStart: { en: 'Start agent',                         ja: 'エージェントを起動' },
   newClaudeNeedName: { en: 'Session name is required.',         ja: 'セッション名を入力してください。' },
   newClaudeStarting: { en: 'Starting…',                         ja: '起動中…' },
   newClaudeOk:    { en: 'Started ✓',                            ja: '起動しました ✓' },
@@ -143,7 +144,7 @@ const STRINGS = {
   g2HeadFinalizing:   { en: 'Transcribing',                     ja: '文字起こし中' },
   g2HeadPending:      { en: 'Pending',                          ja: '確認待ち' },
   g2HeadSending:      { en: 'Sending',                          ja: '送信中' },
-  g2HeadCcResponse:   { en: 'Claude Prompt',                    ja: 'Claude 応答' },
+  g2HeadCcResponse:   { en: 'Agent Prompt',                    ja: 'エージェント応答' },
   g2HeadError:        { en: 'Error',                            ja: 'エラー' },
 
   // ─── G2 lens ─────────────────────────────────────────────────
@@ -162,8 +163,8 @@ const STRINGS = {
   g2Sending:        { en: 'Sending →',                          ja: 'Sending →' },
   g2NoSessions:     { en: '(no sessions)\nCreate one in app',   ja: '(セッション無し)\nスマホで作成' },
   g2NoSessionsBrief:{ en: 'No session',                         ja: 'セッション無し' },
-  g2Sessions:       { en: 'Claude sessions',                    ja: 'Claude セッション' },
-  g2ClaudeAck:      { en: 'Claude waiting',                     ja: 'Claude 応答待ち' },
+  g2Sessions:       { en: 'Agent sessions',                    ja: 'エージェント セッション' },
+  g2ClaudeAck:      { en: 'Agent waiting',                     ja: 'エージェント応答待ち' },
   // G2 footer (28全角文字 = 56半角文字 以内)。各 phase で利用可能な全操作を網羅する。
   // 共通記法: `Tap:X　↑↓:Y　2Tap:Z` (区切りは全角スペース U+3000、2Tap = double tap)
   g2FootRoot:       { en: 'Tap:Open　↑↓:Nav　2Tap:Exit',           ja: 'タップ:開く　↑↓:移動　2タップ:終了' },

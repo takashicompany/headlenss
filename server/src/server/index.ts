@@ -9,10 +9,12 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { captureOutput, createSession, killSession, listSessions, sendKeys } from './tmux.ts';
+import { captureOutput, createSession, killSession, listSessions, sendKey, sendKeys } from './tmux.ts';
 import { handlePtyConnection } from './pty.ts';
 import { getBackendName, isAsrReady, transcribePcm16, transcribeWav } from './asr/index.ts';
 import { claudeRouter } from './claude/router.ts';
+import { codexRouter } from './codex/router.ts';
+import { detectCodexSessions, getCodexHookHealth } from './codex/status.ts';
 import { detectClaudeSessions } from './claude/process-detect.ts';
 import * as claudeStore from './claude/store.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot } from './persist.ts';
@@ -67,26 +69,48 @@ app.use('/api/*', cors({ origin: ALLOW_ALL_ORIGINS ? '*' : ALLOWED_ORIGINS }));
 app.get('/api/health', (c) => c.json({ ok: true }));
 
 app.get('/api/sessions', async (c) => {
-  const [sessions, detected] = await Promise.all([
+  const [sessions, detected, codexDetected] = await Promise.all([
     listSessions(),
     detectClaudeSessions().catch(() => []),
+    detectCodexSessions().catch(() => []),
   ]);
   const detectedMap = new Map(detected.map((d) => [d.tmuxSessionName, d]));
-  const enriched = sessions.map((s) => ({
-    ...s,
-    claudeStatus: detectedMap.get(s.name)?.status,
-  }));
+  const codexMap = new Map(codexDetected.map((d) => [d.tmuxSessionName, d]));
+  const enriched = sessions.map((s) => {
+    const tracked = claudeStore.getSession(s.name);
+    const agent = tracked?.source ?? (codexMap.has(s.name) ? 'codex' : detectedMap.has(s.name) ? 'claude' : undefined);
+    return {
+      ...s,
+      claudeStatus: tracked?.source === 'claude' ? tracked.status : detectedMap.get(s.name)?.status,
+      agent,
+      codexStatus: tracked?.source === 'codex' ? tracked.status : codexMap.get(s.name)?.status,
+      codexHookHealth: codexMap.get(s.name)?.hookHealth ?? (agent === 'codex' ? getCodexHookHealth(tracked?.cwd) : getCodexHookHealth()),
+      codexNeedsHookAttention: codexMap.get(s.name)?.needsHookAttention ?? false,
+    };
+  });
   return c.json({ sessions: enriched });
 });
 
 app.post('/api/sessions', async (c) => {
-  const body = await c.req.json<{ name?: string; cwd?: string; startClaude?: boolean }>();
+  const body = await c.req.json<{ name?: string; cwd?: string; startClaude?: boolean; startCodex?: boolean }>();
   if (!body.name) return c.json({ error: 'name is required' }, 400);
   try {
+    const cwd = typeof body.cwd === 'string' && body.cwd.trim() ? body.cwd.trim() : undefined;
     await createSession(body.name, {
-      cwd: typeof body.cwd === 'string' && body.cwd.trim() ? body.cwd.trim() : undefined,
+      cwd,
       startClaude: body.startClaude === true,
+      startCodex: body.startCodex === true,
     });
+    const source = body.startCodex === true ? 'codex' : body.startClaude === true ? 'claude' : undefined;
+    if (source) {
+      claudeStore.upsertSession({
+        ccSessionId: 'web-' + randomUUID(),
+        tmuxPane: body.name,
+        tmuxSessionName: body.name,
+        cwd: cwd ?? process.cwd(),
+        source,
+      });
+    }
     // 直近の tmux 状態をスナップショットに反映 (再起動越しの復元に効く)
     void saveSnapshot();
     return c.json({ ok: true });
@@ -130,6 +154,15 @@ app.post('/api/sessions/:name/input', async (c) => {
     return c.json({ error: 'body must be { "text": string, "submit"?: boolean }' }, 400);
   }
   try {
+    if (body.submit === true) {
+      const pane = await captureOutput(name, 30).catch(() => '');
+      const shouldQueueInCodex = /tab to queue message/i.test(pane);
+      if (shouldQueueInCodex) {
+        await sendKeys(name, body.text, false);
+        await sendKey(name, 'Tab');
+        return c.json({ ok: true, queued: true });
+      }
+    }
     await sendKeys(name, body.text, body.submit === true);
     return c.json({ ok: true });
   } catch (e) {
@@ -141,6 +174,7 @@ app.post('/api/sessions/:name/input', async (c) => {
 });
 
 app.route('/api', claudeRouter);
+app.route('/api', codexRouter);
 
 // ───────── 画像アップロード (Web UI → Claude Code) ─────────
 //

@@ -3,6 +3,13 @@ import { useLanguage, type Language, type StringKey } from '../i18n.tsx';
 
 type ClaudeStatus = 'idle' | 'busy' | 'waiting-permission' | 'waiting-question';
 
+type CodexHookHealth = {
+  status: 'ok' | 'missing' | 'incomplete';
+  missingEvents: string[];
+  setupCommand: string;
+  notes: string[];
+};
+
 type Session = {
   name: string;
   created: number;
@@ -11,6 +18,10 @@ type Session = {
   windows: number;
   attached: boolean;
   claudeStatus?: ClaudeStatus;
+  codexStatus?: ClaudeStatus;
+  agent?: 'claude' | 'codex';
+  codexHookHealth?: CodexHookHealth;
+  codexNeedsHookAttention?: boolean;
 };
 
 const STARRED_STORAGE_KEY = 'headlenss_starred_sessions';
@@ -36,12 +47,25 @@ function saveStarred(starred: Set<string>): void {
   }
 }
 
-function claudeIndicator(status: ClaudeStatus | undefined, t: (key: StringKey) => string): string {
+function agentLabel(agent: Session['agent']): string {
+  switch (agent) {
+    case 'claude': return 'Claude';
+    case 'codex': return 'Codex';
+    default: return 'Agent';
+  }
+}
+
+function claudeIndicator(
+  status: ClaudeStatus | undefined,
+  agent: Session['agent'],
+  t: (key: StringKey) => string,
+): string {
+  const label = agentLabel(agent);
   switch (status) {
-    case 'busy': return t('ccBusy');
-    case 'idle': return t('ccIdle');
-    case 'waiting-permission': return t('ccWaitingPermission');
-    case 'waiting-question': return t('ccWaitingQuestion');
+    case 'busy': return '● ' + label + ' ' + t('ccBusy');
+    case 'idle': return '◯ ' + label + ' ' + t('ccIdle');
+    case 'waiting-permission': return '⏸ ' + label + ' ' + t('ccWaitingPermission');
+    case 'waiting-question': return '? ' + label + ' ' + t('ccWaitingQuestion');
     default: return '';
   }
 }
@@ -50,6 +74,8 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
   const { t, language, setLanguage } = useLanguage();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [newName, setNewName] = useState('');
+  const [newCwd, setNewCwd] = useState('');
+  const [newAgent, setNewAgent] = useState<'shell' | 'claude' | 'codex'>('shell');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [starred, setStarred] = useState<Set<string>>(loadStarred);
@@ -104,11 +130,18 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
       const res = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({
+          name,
+          cwd: newCwd.trim() || undefined,
+          startClaude: newAgent === 'claude',
+          startCodex: newAgent === 'codex',
+        }),
       });
       const data = (await res.json()) as { ok?: boolean; error?: string };
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
       setNewName('');
+      setNewCwd('');
+      setNewAgent('shell');
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -162,6 +195,24 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
           autoCorrect="off"
           spellCheck={false}
         />
+        <input
+          type="text"
+          placeholder="working directory (optional)"
+          value={newCwd}
+          onChange={(e) => setNewCwd(e.target.value)}
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+        />
+        <select
+          value={newAgent}
+          onChange={(e) => setNewAgent(e.target.value as 'shell' | 'claude' | 'codex')}
+          aria-label="start command"
+        >
+          <option value="shell">shell</option>
+          <option value="claude">Claude</option>
+          <option value="codex">Codex</option>
+        </select>
         <button type="submit">{t('newSession')}</button>
       </form>
 
@@ -174,7 +225,12 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
       ) : (
         <ul className="session-list">
           {sortedSessions.map((s) => {
-            const cc = claudeIndicator(s.claudeStatus, t);
+            const status = s.agent === 'codex' ? s.codexStatus ?? s.claudeStatus : s.claudeStatus;
+            const cc = claudeIndicator(status, s.agent, t);
+            const agentOnly = !cc && s.agent ? agentLabel(s.agent) : '';
+            const codexHookLabel = s.agent === 'codex' && s.codexHookHealth?.status !== 'ok'
+              ? s.codexHookHealth?.status === 'missing' ? t('codexHooksMissing') : t('codexHooksIncomplete')
+              : s.agent === 'codex' && s.codexNeedsHookAttention ? t('codexHooksNeedTrust') : '';
             const isStarred = starred.has(s.name);
             return (
               <li key={s.name}>
@@ -191,7 +247,9 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
                   <span className="session-meta">
                     {s.windows} {t(s.windows === 1 ? 'windowUnit' : 'windowUnitPlural')}
                     {s.attached && ` • ${t('attached')}`}
-                    {cc && <span className={`cc-indicator cc-${s.claudeStatus}`}> • {cc}</span>}
+                    {cc && <span className={`cc-indicator cc-${status}`}> • {cc}</span>}
+                    {agentOnly && <span className="agent-indicator"> • {agentOnly}</span>}
+                    {codexHookLabel && <span className="codex-hook-warning"> • {codexHookLabel}</span>}
                   </span>
                 </button>
                 <button className="session-kill" onClick={() => remove(s.name)} aria-label={`kill ${s.name}`}>

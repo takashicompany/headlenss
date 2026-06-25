@@ -18,12 +18,15 @@ export type SendKeysOptions = {
 
 export type ClaudeSessionStatus = 'idle' | 'busy' | 'waiting-permission' | 'waiting-question'
 
+export type AgentSource = 'claude' | 'codex'
+
 export type ClaudeSessionInfo = {
   tmuxSessionName: string
   cwd: string
   status: ClaudeSessionStatus
   startedAt: number
   lastSeenAt: number
+  source?: AgentSource
 }
 
 export type ChatRole = 'user' | 'assistant'
@@ -32,6 +35,11 @@ export type ChatItem = {
   role: ChatRole
   text: string
   ts: number
+}
+
+export type ClaudeChatResponse = {
+  chat: ChatItem[]
+  source?: AgentSource
 }
 
 export type AskQuestionOption = { label: string; description?: string }
@@ -107,16 +115,16 @@ export class HeadlenssClient {
    * tmux セッションを作成。
    * @param name セッション名
    * @param opts.cwd 作業ディレクトリ (~/foo, /abs/path, または相対パス → home基準)。存在しなければ mkdir -p
-   * @param opts.startClaude true で `claude -c || claude` を初期コマンドとして流す
+   * @param opts.startClaude true で `claude -c || claude`、startCodex true で `codex resume --last || codex` を初期コマンドとして流す
    */
   async createSession(
     name: string,
-    opts?: { cwd?: string; startClaude?: boolean },
+    opts?: { cwd?: string; startClaude?: boolean; startCodex?: boolean },
   ): Promise<void> {
     const res = await fetch(this.url('/api/sessions'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, cwd: opts?.cwd, startClaude: opts?.startClaude === true }),
+      body: JSON.stringify({ name, cwd: opts?.cwd, startClaude: opts?.startClaude === true, startCodex: opts?.startCodex === true }),
     })
     if (!res.ok) {
       const body = await res.text().catch(() => '')
@@ -155,12 +163,12 @@ export class HeadlenssClient {
     return data.sessions
   }
 
-  async getClaudeChat(name: string): Promise<ChatItem[]> {
+  async getClaudeChat(name: string): Promise<ClaudeChatResponse> {
     const res = await fetch(this.url(`/api/claude/sessions/${encodeURIComponent(name)}/chat`))
-    if (res.status === 404) return []
+    if (res.status === 404) return { chat: [] }
     if (!res.ok) throw new Error(`getClaudeChat HTTP ${res.status}`)
-    const data = (await res.json()) as { chat: ChatItem[] }
-    return data.chat
+    const data = (await res.json()) as ClaudeChatResponse
+    return { chat: data.chat ?? [], source: data.source }
   }
 
   async getClaudePending(name: string): Promise<Pending | null> {

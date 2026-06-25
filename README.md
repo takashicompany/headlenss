@@ -56,6 +56,27 @@ headlenss/
 
 ## What It Can Do
 
+### Codex support
+
+HeadLenss can also surface Codex CLI sessions in the same browser/G2 chat view when Codex hooks are enabled.
+
+Install the global Codex hooks once:
+
+```bash
+node /path/to/headlenss/plugin/codex-hooks/install.mjs
+```
+
+Restart Codex, open `/hooks`, and review/trust the HeadLenss hook definitions. After that, start Codex in any tmux session:
+
+```bash
+tmux new -s codex-work -c /path/to/your/project codex
+```
+
+The tmux session will appear in the HeadLenss browser/G2 session list, and its prompts, replies, and permission requests will appear in chat view.
+
+Set `HEADLENSS_SERVER_URL` if your server is not `http://localhost:3000`.
+
+
 - Access Claude Code (tmux) on your PC from G2.
 - Send prompts using G2's voice input.
 - Add and view tmux sessions from a web browser. Supports both PCs and smartphones.

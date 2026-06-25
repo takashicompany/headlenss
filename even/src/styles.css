@@ -97,6 +97,17 @@ body[data-view="dashboard"] details.card:not(#settingsDetails):not(#claudeSessio
 .claude-status[data-status="waiting-question"]   { color: var(--warn); }
 .claude-info { min-width: 0; }
 .claude-name { font-weight: 500; word-break: break-all; }
+.agent-label {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  vertical-align: 1px;
+}
 .claude-cwd  {
   font-size: 0.78rem;
   color: var(--muted);

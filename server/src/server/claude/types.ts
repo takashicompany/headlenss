@@ -27,6 +27,7 @@ export type Pending = {
   id: string;
   kind: 'permission' | 'question';
   hookEvent: 'PreToolUse' | 'PermissionRequest';
+  source?: 'claude' | 'codex';
   toolName: string;
   toolInput: unknown;
   questions?: AskQuestion[];
@@ -43,6 +44,8 @@ export type ClaudeSession = {
   tmuxPane: string;
   tmuxSessionName: string;
   cwd: string;
+  source?: 'claude' | 'codex';
+  transcriptPath?: string;
   status: SessionStatus;
   startedAt: number;
   lastSeenAt: number;
