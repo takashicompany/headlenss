@@ -272,8 +272,14 @@ export async function sendKeys(name: string, text: string, submit = false): Prom
     await exec('tmux', ['send-keys', '-t', name, '-l', text]);
   }
   if (submit) {
-    await exec('tmux', ['send-keys', '-t', name, 'Enter']);
+    await exec('tmux', ['send-keys', '-t', name, 'C-m']);
   }
+}
+
+export async function sendKey(name: string, key: string): Promise<void> {
+  validateName(name);
+  if (!/^[A-Za-z0-9_+-]+$/.test(key)) throw new Error('invalid key');
+  await exec('tmux', ['send-keys', '-t', name, key]);
 }
 
 /**

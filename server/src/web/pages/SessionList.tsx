@@ -47,12 +47,25 @@ function saveStarred(starred: Set<string>): void {
   }
 }
 
-function claudeIndicator(status: ClaudeStatus | undefined, t: (key: StringKey) => string): string {
+function agentLabel(agent: Session['agent']): string {
+  switch (agent) {
+    case 'claude': return 'Claude';
+    case 'codex': return 'Codex';
+    default: return 'Agent';
+  }
+}
+
+function claudeIndicator(
+  status: ClaudeStatus | undefined,
+  agent: Session['agent'],
+  t: (key: StringKey) => string,
+): string {
+  const label = agentLabel(agent);
   switch (status) {
-    case 'busy': return t('ccBusy');
-    case 'idle': return t('ccIdle');
-    case 'waiting-permission': return t('ccWaitingPermission');
-    case 'waiting-question': return t('ccWaitingQuestion');
+    case 'busy': return '● ' + label + ' ' + t('ccBusy');
+    case 'idle': return '◯ ' + label + ' ' + t('ccIdle');
+    case 'waiting-permission': return '⏸ ' + label + ' ' + t('ccWaitingPermission');
+    case 'waiting-question': return '? ' + label + ' ' + t('ccWaitingQuestion');
     default: return '';
   }
 }
@@ -213,7 +226,7 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
         <ul className="session-list">
           {sortedSessions.map((s) => {
             const status = s.agent === 'codex' ? s.codexStatus ?? s.claudeStatus : s.claudeStatus;
-            const cc = claudeIndicator(status, t);
+            const cc = claudeIndicator(status, s.agent, t);
             const codexHookLabel = s.agent === 'codex' && s.codexHookHealth?.status !== 'ok'
               ? s.codexHookHealth?.status === 'missing' ? t('codexHooksMissing') : t('codexHooksIncomplete')
               : s.agent === 'codex' && s.codexNeedsHookAttention ? t('codexHooksNeedTrust') : '';
@@ -233,7 +246,6 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
                   <span className="session-meta">
                     {s.windows} {t(s.windows === 1 ? 'windowUnit' : 'windowUnitPlural')}
                     {s.attached && ` • ${t('attached')}`}
-                    {s.agent === 'codex' && <span className="agent-indicator"> • Codex</span>}
                     {cc && <span className={`cc-indicator cc-${status}`}> • {cc}</span>}
                     {codexHookLabel && <span className="codex-hook-warning"> • {codexHookLabel}</span>}
                   </span>

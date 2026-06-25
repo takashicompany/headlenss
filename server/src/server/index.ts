@@ -9,7 +9,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { captureOutput, createSession, killSession, listSessions, sendKeys } from './tmux.ts';
+import { captureOutput, createSession, killSession, listSessions, sendKey, sendKeys } from './tmux.ts';
 import { handlePtyConnection } from './pty.ts';
 import { getBackendName, isAsrReady, transcribePcm16, transcribeWav } from './asr/index.ts';
 import { claudeRouter } from './claude/router.ts';
@@ -139,6 +139,15 @@ app.post('/api/sessions/:name/input', async (c) => {
     return c.json({ error: 'body must be { "text": string, "submit"?: boolean }' }, 400);
   }
   try {
+    if (body.submit === true) {
+      const pane = await captureOutput(name, 30).catch(() => '');
+      const shouldQueueInCodex = /tab to queue message/i.test(pane);
+      if (shouldQueueInCodex) {
+        await sendKeys(name, body.text, false);
+        await sendKey(name, 'Tab');
+        return c.json({ ok: true, queued: true });
+      }
+    }
     await sendKeys(name, body.text, body.submit === true);
     return c.json({ ok: true });
   } catch (e) {
