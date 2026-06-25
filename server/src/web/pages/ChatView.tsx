@@ -94,6 +94,9 @@ export function ChatView({
   const chatInputRef = useRef<HTMLFormElement>(null);
   const lastLenRef = useRef(0);
   const userScrolledUpRef = useRef(false);
+  const keyboardStickToBottomRef = useRef(false);
+  const ignoreKeyboardScrollUntilRef = useRef(0);
+  const keyboardStickClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
@@ -122,12 +125,11 @@ export function ChatView({
   }, []);
 
   // keyboard 開いている間だけ、 chat-scroller に padding-bottom を加える。
-  // chat-input は absolute になって flex flow から外れるので、 そのままだと
-  // 最新メッセージが chat-input の下に潜って見えなくなる。
-  // padding-bottom = keyboardH + chatInputH で「chat-input の上端」 まで
-  // コンテンツを押し上げる。 keyboard 閉じてる時は 0 で副作用なし。
+  // chat-input は visualViewport 下端に貼り付くため、可視領域内で必要なのは
+  // 入力欄の高さ分だけ。keyboardHeight まで足すと、フルソフトキーボード表示時に
+  // 末尾メッセージと入力欄の間へキーボード高ぶんの空白ができる。
   const scrollerPaddingBottom =
-    keyboardHeight > 0 ? `${keyboardHeight + chatInputHeight}px` : undefined;
+    keyboardHeight > 0 ? `${chatInputHeight}px` : undefined;
 
   // 表示は server + pending を順に並べる(pending は常に末尾、ts 順)
   const displayChat = useMemo(() => {
@@ -153,6 +155,23 @@ export function ChatView({
     requestAnimationFrame(pin);
     setTimeout(pin, 80);
   }, []);
+
+  // iOS Safari はソフトキーボードの開閉時に visual viewport を自動パンし、
+  // その過程で .chat-scroller に scroll イベントが飛ぶ。末尾にいたユーザまで
+  // 「履歴を遡った」と誤判定しないよう、フォーカス/送信時に末尾状態を保存し、
+  // keyboard/padding のレイアウト変更後に末尾へ固定し直す。
+  useEffect(() => {
+    if (!keyboardStickToBottomRef.current) return;
+    ignoreKeyboardScrollUntilRef.current = Date.now() + 500;
+    userScrolledUpRef.current = false;
+    scrollToBottom();
+    const t1 = setTimeout(scrollToBottom, 160);
+    const t2 = setTimeout(scrollToBottom, 320);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+  }, [keyboardHeight, chatInputHeight, scrollToBottom]);
 
   useEffect(() => {
     let disposed = false;
@@ -251,7 +270,28 @@ export function ChatView({
   }, [status, scrollToBottom]);
 
   const onScroll = () => {
+    if (Date.now() < ignoreKeyboardScrollUntilRef.current) return;
     userScrolledUpRef.current = !isNearBottom();
+  };
+
+  const onInputFocus = () => {
+    if (keyboardStickClearTimerRef.current) {
+      clearTimeout(keyboardStickClearTimerRef.current);
+      keyboardStickClearTimerRef.current = null;
+    }
+    keyboardStickToBottomRef.current = isNearBottom();
+    if (keyboardStickToBottomRef.current) {
+      userScrolledUpRef.current = false;
+      ignoreKeyboardScrollUntilRef.current = Date.now() + 500;
+    }
+  };
+
+  const onInputBlur = () => {
+    if (keyboardStickClearTimerRef.current) clearTimeout(keyboardStickClearTimerRef.current);
+    keyboardStickClearTimerRef.current = setTimeout(() => {
+      keyboardStickToBottomRef.current = false;
+      keyboardStickClearTimerRef.current = null;
+    }, 900);
   };
 
   const send = useCallback(async () => {
@@ -265,6 +305,8 @@ export function ChatView({
     // 送信は「ユーザが意図して末尾へ戻りたい」操作なので、
     // useEffect 経由の auto-scroll ガードに頼らず明示的に末尾固定する。
     userScrolledUpRef.current = false;
+    keyboardStickToBottomRef.current = true;
+    ignoreKeyboardScrollUntilRef.current = Date.now() + 800;
     scrollToBottom();
 
     setSending(true);
@@ -881,6 +923,8 @@ export function ChatView({
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onKeyDown}
+          onFocus={onInputFocus}
+          onBlur={onInputBlur}
           onPaste={onPaste}
           placeholder={uploading ? t('uploadingEllipsis') : t('messageInputPlaceholder')}
           rows={1}
