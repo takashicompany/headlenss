@@ -22,6 +22,8 @@ export type Session = {
   activity: number;
   windows: number;
   attached: boolean;
+  released?: boolean;
+  releasedAt?: number;
 };
 
 const NAME_RE = /^[a-zA-Z0-9_-]{1,40}$/;
@@ -264,6 +266,12 @@ export async function requireSession(name: string): Promise<void> {
 export async function killSession(name: string): Promise<void> {
   validateName(name);
   await exec('tmux', ['kill-session', '-t', name]);
+}
+
+export async function renameSession(name: string, nextName: string): Promise<void> {
+  validateName(name);
+  validateName(nextName);
+  await exec('tmux', ['rename-session', '-t', name, nextName]);
 }
 
 export async function sendKeys(name: string, text: string, submit = false): Promise<void> {

@@ -1011,3 +1011,83 @@ button {
     pointer-events: auto;
   }
 }
+
+.system-metrics {
+  position: fixed;
+  top: 0.55rem;
+  right: 0.75rem;
+  z-index: 30;
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  max-width: min(70vw, 520px);
+  padding: 0.25rem 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: rgba(26, 26, 29, 0.92);
+  color: var(--muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.session-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin: -0.35rem 0 0.75rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.session-toolbar label {
+  display: inline-flex;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.session-reorder {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+}
+
+.session-reorder button,
+.session-action {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  min-width: 2.3rem;
+  padding: 0 0.65rem;
+}
+
+.session-reorder button {
+  flex: 1;
+  min-height: 1.75rem;
+}
+
+.session-action {
+  border-left: 1px solid var(--border);
+}
+
+.session-reorder button:hover,
+.session-action:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+}
+
+.session-list li.is-released {
+  opacity: 0.82;
+}
+
+.released-indicator {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+@media (max-width: 640px) {
+  .system-metrics {
+    position: static;
+    margin: 0.5rem auto 0;
+    width: fit-content;
+    max-width: calc(100vw - 1rem);
+  }
+}
