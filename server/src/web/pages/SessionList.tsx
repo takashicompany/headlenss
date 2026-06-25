@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useLanguage, type Language, type StringKey } from '../i18n.tsx';
 
 type ClaudeStatus = 'idle' | 'busy' | 'waiting-permission' | 'waiting-question';
@@ -103,7 +103,7 @@ function claudeIndicator(
   }
 }
 
-export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
+export function SessionList({ onOpen, headerMetrics }: { onOpen: (name: string) => void; headerMetrics?: ReactNode }) {
   const { t, language, setLanguage } = useLanguage();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [newName, setNewName] = useState('');
@@ -284,8 +284,13 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
   return (
     <div className="page">
       <header className="page-header">
-        <h1>headlenss</h1>
-        <p className="muted">{t('appSubtitle')}</p>
+        <div className="page-header-row">
+          <div className="page-heading">
+            <h1>headlenss</h1>
+            <p className="muted">{t('appSubtitle')}</p>
+          </div>
+          {headerMetrics}
+        </div>
         <label className="lang-select">
           {t('language')}:
           <select

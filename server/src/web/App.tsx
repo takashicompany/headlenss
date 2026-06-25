@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { SessionList } from './pages/SessionList.tsx';
 import { SessionView } from './pages/SessionView.tsx';
 import { ChatView } from './pages/ChatView.tsx';
@@ -133,7 +133,7 @@ export function App() {
   };
 
   const metrics = systemStatus ? (
-    <div className="system-metrics" aria-label="PC usage">
+    <div className="header-metrics" aria-label="PC usage">
       CPU {systemStatus.cpuPercent == null ? '-' : systemStatus.cpuPercent.toFixed(0) + '%'}
       <span>MEM {systemStatus.memory.usedPercent.toFixed(0)}% ({formatBytes(systemStatus.memory.used)} / {formatBytes(systemStatus.memory.total)})</span>
     </div>
@@ -141,9 +141,9 @@ export function App() {
 
   const page = route.name === 'session'
     ? route.mode === 'chat'
-      ? <ChatView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
-      : <SessionView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
-    : <SessionList onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`)} />;
+      ? <ChatView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} headerMetrics={metrics as ReactNode} />
+      : <SessionView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} headerMetrics={metrics as ReactNode} />
+    : <SessionList onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`)} headerMetrics={metrics as ReactNode} />;
 
-  return <>{metrics}{page}</>;
+  return page;
 }

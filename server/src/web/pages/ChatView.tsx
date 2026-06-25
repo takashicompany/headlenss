@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
@@ -52,10 +52,12 @@ export function ChatView({
   sessionName,
   onBack,
   onSwitchMode,
+  headerMetrics,
 }: {
   sessionName: string;
   onBack: () => void;
   onSwitchMode: (m: Mode) => void;
+  headerMetrics?: ReactNode;
 }) {
   const { t, language } = useLanguage();
   // サーバから返ってくる確定 chat
@@ -491,6 +493,7 @@ export function ChatView({
             chat
           </button>
         </div>
+        {headerMetrics}
       </header>
       <div
         ref={scrollerRef}
