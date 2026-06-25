@@ -1,9 +1,14 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { SessionList } from './pages/SessionList.tsx';
 import { SessionView } from './pages/SessionView.tsx';
 import { ChatView } from './pages/ChatView.tsx';
 
 type Mode = 'tmux' | 'chat';
+
+type SystemStatus = {
+  cpuPercent: number | null;
+  memory: { usedPercent: number; used: number; total: number };
+};
 type Route =
   | { name: 'list' }
   | { name: 'session'; sessionName: string; mode: Mode };
@@ -82,13 +87,38 @@ function setMode(sessionName: string, mode: Mode): void {
   window.history.replaceState(null, '', url.toString());
 }
 
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value)) return '-';
+  const gb = value / 1024 / 1024 / 1024;
+  return gb >= 10 ? gb.toFixed(0) + 'GB' : gb.toFixed(1) + 'GB';
+}
+
 export function App() {
   const [route, setRoute] = useState<Route>(getRoute);
+  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
 
   useEffect(() => {
     const onPop = () => setRoute(getRoute());
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    const refresh = async () => {
+      try {
+        const res = await fetch('/api/system/status');
+        if (!res.ok) return;
+        const json = (await res.json()) as SystemStatus;
+        if (!disposed) setSystemStatus(json);
+      } catch { /* ignore */ }
+    };
+    refresh();
+    const timer = setInterval(refresh, 5000);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+    };
   }, []);
 
   const navigate = (path: string) => {
@@ -102,20 +132,18 @@ export function App() {
     setRoute(getRoute());
   };
 
-  if (route.name === 'session') {
-    return route.mode === 'chat' ? (
-      <ChatView
-        sessionName={route.sessionName}
-        onBack={() => navigate('/')}
-        onSwitchMode={switchMode}
-      />
-    ) : (
-      <SessionView
-        sessionName={route.sessionName}
-        onBack={() => navigate('/')}
-        onSwitchMode={switchMode}
-      />
-    );
-  }
-  return <SessionList onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`)} />;
+  const metrics = systemStatus ? (
+    <div className="header-metrics" aria-label="PC usage">
+      CPU {systemStatus.cpuPercent == null ? '-' : systemStatus.cpuPercent.toFixed(0) + '%'}
+      <span>MEM {systemStatus.memory.usedPercent.toFixed(0)}% ({formatBytes(systemStatus.memory.used)} / {formatBytes(systemStatus.memory.total)})</span>
+    </div>
+  ) : null;
+
+  const page = route.name === 'session'
+    ? route.mode === 'chat'
+      ? <ChatView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
+      : <SessionView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
+    : <SessionList onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`)} headerMetrics={metrics as ReactNode} />;
+
+  return page;
 }

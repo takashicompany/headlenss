@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useLanguage, type Language, type StringKey } from '../i18n.tsx';
 
 type ClaudeStatus = 'idle' | 'busy' | 'waiting-permission' | 'waiting-question';
@@ -17,6 +17,7 @@ type Session = {
   activity: number;
   windows: number;
   attached: boolean;
+  released?: boolean;
   claudeStatus?: ClaudeStatus;
   codexStatus?: ClaudeStatus;
   agent?: 'claude' | 'codex';
@@ -25,6 +26,8 @@ type Session = {
 };
 
 const STARRED_STORAGE_KEY = 'headlenss_starred_sessions';
+const ORDER_STORAGE_KEY = 'headlenss_session_order';
+const ORDER_MODE_STORAGE_KEY = 'headlenss_session_order_mode';
 
 /** localStorage からスター済みセッション名の集合を読む。型/JSON 不正は空集合に倒す。 */
 function loadStarred(): Set<string> {
@@ -45,6 +48,36 @@ function saveStarred(starred: Set<string>): void {
   } catch {
     /* private mode 等で書けなくても UI 上の挙動は維持 */
   }
+}
+
+function loadOrder(): string[] {
+  try {
+    const raw = localStorage.getItem(ORDER_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveOrder(order: string[]): void {
+  try {
+    localStorage.setItem(ORDER_STORAGE_KEY, JSON.stringify(order));
+  } catch { /* ignore */ }
+}
+
+function loadManualOrder(): boolean {
+  try {
+    return localStorage.getItem(ORDER_MODE_STORAGE_KEY) === 'manual';
+  } catch {
+    return false;
+  }
+}
+
+function saveManualOrder(enabled: boolean): void {
+  try {
+    localStorage.setItem(ORDER_MODE_STORAGE_KEY, enabled ? 'manual' : 'activity');
+  } catch { /* ignore */ }
 }
 
 function agentLabel(agent: Session['agent']): string {
@@ -70,7 +103,7 @@ function claudeIndicator(
   }
 }
 
-export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
+export function SessionList({ onOpen, headerMetrics }: { onOpen: (name: string) => void; headerMetrics?: ReactNode }) {
   const { t, language, setLanguage } = useLanguage();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [newName, setNewName] = useState('');
@@ -79,6 +112,8 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [starred, setStarred] = useState<Set<string>>(loadStarred);
+  const [manualOrder, setManualOrder] = useState(loadManualOrder);
+  const [order, setOrder] = useState<string[]>(loadOrder);
 
   const toggleStar = useCallback((name: string) => {
     setStarred((prev) => {
@@ -90,17 +125,23 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
     });
   }, []);
 
-  // スター優先 → 最終アクティビティ降順 で並べる。
-  // スター済みの中も最終アクティビティ降順にすると、よく触る pin の中でも
-  // 「今いじってるやつ」が一番上に来て自然。
   const sortedSessions = useMemo(() => {
+    if (manualOrder) {
+      const index = new Map(order.map((name, i) => [name, i]));
+      return [...sessions].sort((a, b) => {
+        const ia = index.get(a.name) ?? Number.MAX_SAFE_INTEGER;
+        const ib = index.get(b.name) ?? Number.MAX_SAFE_INTEGER;
+        if (ia !== ib) return ia - ib;
+        return b.activity - a.activity;
+      });
+    }
     return [...sessions].sort((a, b) => {
       const sa = starred.has(a.name) ? 1 : 0;
       const sb = starred.has(b.name) ? 1 : 0;
       if (sa !== sb) return sb - sa;
       return b.activity - a.activity;
     });
-  }, [sessions, starred]);
+  }, [manualOrder, order, sessions, starred]);
 
   const refresh = async () => {
     try {
@@ -108,6 +149,12 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as { sessions: Session[] };
       setSessions(data.sessions);
+      setOrder((prev) => {
+        const names = data.sessions.map((session) => session.name);
+        const next = [...prev.filter((name) => names.includes(name)), ...names.filter((name) => !prev.includes(name))];
+        saveOrder(next);
+        return next;
+      });
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -149,9 +196,48 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
   };
 
   const remove = async (name: string) => {
-    if (!confirm(`Kill session "${name}"?`)) return;
+    if (!confirm(`Delete session "${name}" from HeadLenss?`)) return;
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      const data = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      setOrder((prev) => {
+        const next = prev.filter((n) => n !== name);
+        saveOrder(next);
+        return next;
+      });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  const rename = async (name: string) => {
+    const nextName = prompt(t('renameSession'), name)?.trim();
+    if (!nextName || nextName === name) return;
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(name)}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: nextName }),
+      });
+      const data = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      setOrder((prev) => {
+        const next = prev.map((n) => n === name ? nextName : n);
+        saveOrder(next);
+        return next;
+      });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  const release = async (name: string) => {
+    if (!confirm(`Release tmux for "${name}" but keep it in the list?`)) return;
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(name)}/release`, { method: 'POST' });
       const data = (await res.json()) as { ok?: boolean; error?: string };
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
       await refresh();
@@ -160,11 +246,51 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
     }
   };
 
+  const open = async (session: Session) => {
+    if (!session.released) {
+      onOpen(session.name);
+      return;
+    }
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(session.name)}/mount`, { method: 'POST' });
+      const data = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      await refresh();
+      onOpen(session.name);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  const setManualOrderMode = (enabled: boolean) => {
+    setManualOrder(enabled);
+    saveManualOrder(enabled);
+  };
+
+  const move = (name: string, delta: -1 | 1) => {
+    setOrder((prev) => {
+      const names = sortedSessions.map((session) => session.name);
+      const base = [...prev.filter((n) => names.includes(n)), ...names.filter((n) => !prev.includes(n))];
+      const idx = base.indexOf(name);
+      const nextIdx = idx + delta;
+      if (idx < 0 || nextIdx < 0 || nextIdx >= base.length) return prev;
+      const next = [...base];
+      [next[idx], next[nextIdx]] = [next[nextIdx], next[idx]];
+      saveOrder(next);
+      return next;
+    });
+  };
+
   return (
     <div className="page">
       <header className="page-header">
-        <h1>headlenss</h1>
-        <p className="muted">{t('appSubtitle')}</p>
+        <div className="page-header-row">
+          <div className="page-heading">
+            <h1>headlenss</h1>
+            <p className="muted">{t('appSubtitle')}</p>
+          </div>
+          {headerMetrics}
+        </div>
         <label className="lang-select">
           {t('language')}:
           <select
@@ -216,6 +342,17 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
         <button type="submit">{t('newSession')}</button>
       </form>
 
+      <div className="session-toolbar">
+        <label>
+          <input
+            type="checkbox"
+            checked={manualOrder}
+            onChange={(e) => setManualOrderMode(e.target.checked)}
+          />
+          {t('manualOrder')}
+        </label>
+      </div>
+
       {error && <div className="error">{error}</div>}
 
       {loading ? (
@@ -233,7 +370,11 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
               : s.agent === 'codex' && s.codexNeedsHookAttention ? t('codexHooksNeedTrust') : '';
             const isStarred = starred.has(s.name);
             return (
-              <li key={s.name}>
+              <li key={s.name} className={s.released ? 'is-released' : undefined}>
+                {manualOrder && <div className="session-reorder">
+                  <button onClick={() => move(s.name, -1)} aria-label={t('moveUp')} title={t('moveUp')}>↑</button>
+                  <button onClick={() => move(s.name, 1)} aria-label={t('moveDown')} title={t('moveDown')}>↓</button>
+                </div>}
                 <button
                   className={`session-star${isStarred ? ' is-starred' : ''}`}
                   onClick={() => toggleStar(s.name)}
@@ -242,17 +383,24 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
                 >
                   {isStarred ? '★' : '☆'}
                 </button>
-                <button className="session-open" onClick={() => onOpen(s.name)}>
+                <button className="session-open" onClick={() => open(s)}>
                   <span className="session-name">{s.name}</span>
                   <span className="session-meta">
                     {s.windows} {t(s.windows === 1 ? 'windowUnit' : 'windowUnitPlural')}
                     {s.attached && ` • ${t('attached')}`}
+                    {s.released && <span className="released-indicator"> • {t('releasedSession')}</span>}
                     {cc && <span className={`cc-indicator cc-${status}`}> • {cc}</span>}
                     {agentOnly && <span className="agent-indicator"> • {agentOnly}</span>}
                     {codexHookLabel && <span className="codex-hook-warning"> • {codexHookLabel}</span>}
                   </span>
                 </button>
-                <button className="session-kill" onClick={() => remove(s.name)} aria-label={`kill ${s.name}`}>
+                <button className="session-action" onClick={() => rename(s.name)} aria-label={t('renameSession')} title={t('renameSession')}>
+                  ✎
+                </button>
+                {!s.released && <button className="session-action" onClick={() => release(s.name)} aria-label={t('releaseSession')} title={t('releaseSession')}>
+                  ⏏
+                </button>}
+                <button className="session-kill" onClick={() => remove(s.name)} aria-label={`delete ${s.name}`} title="Delete">
                   ✕
                 </button>
               </li>

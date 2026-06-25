@@ -34,6 +34,12 @@ const STRINGS = {
   codexHooksMissing:      { en: 'Codex hooks missing', ja: 'Codex hook 未導入' },
   codexHooksIncomplete:   { en: 'Codex hooks incomplete', ja: 'Codex hook 不完全' },
   codexHooksNeedTrust:    { en: 'Codex hooks need trust', ja: 'Codex hook 要確認' },
+  releasedSession:        { en: 'released', ja: '解放済み' },
+  releaseSession:         { en: 'Release tmux', ja: 'tmux を解放' },
+  renameSession:          { en: 'Rename session', ja: 'セッション名を変更' },
+  manualOrder:            { en: 'Manual order', ja: '手動並び替え' },
+  moveUp:                 { en: 'Move up', ja: '上へ移動' },
+  moveDown:               { en: 'Move down', ja: '下へ移動' },
 
   // ── ChatView: status / empty ──
   statusBusy:             { en: 'Agent is thinking', ja: 'エージェントが考えています' },

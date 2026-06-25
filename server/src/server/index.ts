@@ -7,9 +7,9 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { mkdir, readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { tmpdir } from 'node:os';
+import { cpus, freemem, loadavg, tmpdir, totalmem } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { captureOutput, createSession, killSession, listSessions, sendKey, sendKeys } from './tmux.ts';
+import { captureOutput, createSession, getSessionCwd, killSession, listSessions, renameSession, sendKey, sendKeys } from './tmux.ts';
 import { handlePtyConnection } from './pty.ts';
 import { getBackendName, isAsrReady, transcribePcm16, transcribeWav } from './asr/index.ts';
 import { claudeRouter } from './claude/router.ts';
@@ -18,6 +18,7 @@ import { detectCodexSessions, getCodexHookHealth } from './codex/status.ts';
 import { detectClaudeSessions } from './claude/process-detect.ts';
 import * as claudeStore from './claude/store.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot } from './persist.ts';
+import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIST = resolve(__dirname, '../../dist/web');
@@ -68,6 +69,48 @@ app.use('/api/*', cors({ origin: ALLOW_ALL_ORIGINS ? '*' : ALLOWED_ORIGINS }));
 
 app.get('/api/health', (c) => c.json({ ok: true }));
 
+let lastCpuSample: { idle: number; total: number } | null = null;
+
+function readCpuSample(): { idle: number; total: number } {
+  let idle = 0;
+  let total = 0;
+  for (const cpu of cpus()) {
+    idle += cpu.times.idle;
+    total += Object.values(cpu.times).reduce((sum, value) => sum + value, 0);
+  }
+  return { idle, total };
+}
+
+function readSystemStatus(): {
+  cpuPercent: number | null;
+  loadAverage: number[];
+  memory: { total: number; free: number; used: number; usedPercent: number };
+} {
+  const sample = readCpuSample();
+  let cpuPercent: number | null = null;
+  if (lastCpuSample) {
+    const idleDelta = sample.idle - lastCpuSample.idle;
+    const totalDelta = sample.total - lastCpuSample.total;
+    if (totalDelta > 0) cpuPercent = Math.max(0, Math.min(100, (1 - idleDelta / totalDelta) * 100));
+  }
+  lastCpuSample = sample;
+  const total = totalmem();
+  const free = freemem();
+  const used = total - free;
+  return {
+    cpuPercent,
+    loadAverage: loadavg(),
+    memory: {
+      total,
+      free,
+      used,
+      usedPercent: total > 0 ? (used / total) * 100 : 0,
+    },
+  };
+}
+
+app.get('/api/system/status', (c) => c.json(readSystemStatus()));
+
 app.get('/api/sessions', async (c) => {
   const [sessions, detected, codexDetected] = await Promise.all([
     listSessions(),
@@ -76,6 +119,7 @@ app.get('/api/sessions', async (c) => {
   ]);
   const detectedMap = new Map(detected.map((d) => [d.tmuxSessionName, d]));
   const codexMap = new Map(codexDetected.map((d) => [d.tmuxSessionName, d]));
+  const liveNames = new Set(sessions.map((s) => s.name));
   const enriched = sessions.map((s) => {
     const tracked = claudeStore.getSession(s.name);
     const agent = tracked?.source ?? (codexMap.has(s.name) ? 'codex' : detectedMap.has(s.name) ? 'claude' : undefined);
@@ -88,6 +132,16 @@ app.get('/api/sessions', async (c) => {
       codexNeedsHookAttention: codexMap.get(s.name)?.needsHookAttention ?? false,
     };
   });
+  for (const retained of listRetainedSessions(liveNames)) {
+    enriched.push({
+      ...retained,
+      claudeStatus: undefined,
+      agent: retained.agent,
+      codexStatus: undefined,
+      codexHookHealth: retained.agent === 'codex' ? getCodexHookHealth() : getCodexHookHealth(),
+      codexNeedsHookAttention: false,
+    });
+  }
   return c.json({ sessions: enriched });
 });
 
@@ -96,6 +150,7 @@ app.post('/api/sessions', async (c) => {
   if (!body.name) return c.json({ error: 'name is required' }, 400);
   try {
     const cwd = typeof body.cwd === 'string' && body.cwd.trim() ? body.cwd.trim() : undefined;
+    removeRetainedSession(body.name);
     await createSession(body.name, {
       cwd,
       startClaude: body.startClaude === true,
@@ -119,10 +174,93 @@ app.post('/api/sessions', async (c) => {
   }
 });
 
+app.patch('/api/sessions/:name', async (c) => {
+  const name = c.req.param('name');
+  const body = (await c.req.json().catch(() => ({}))) as { name?: unknown };
+  const nextName = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!nextName) return c.json({ error: 'name is required' }, 400);
+  try {
+    const live = (await listSessions()).some((s) => s.name === name);
+    const nextExists = (await listSessions()).some((s) => s.name === nextName) || hasRetainedSession(nextName);
+    if (nextExists) throw new Error('session name already exists');
+    if (live) {
+      await renameSession(name, nextName);
+    } else {
+      renameRetainedSession(name, nextName);
+    }
+    const tracked = claudeStore.getSession(name);
+    if (tracked) {
+      claudeStore.removeSession(name);
+      claudeStore.upsertSession({
+        ccSessionId: tracked.ccSessionId,
+        tmuxPane: tracked.tmuxPane,
+        tmuxSessionName: nextName,
+        cwd: tracked.cwd,
+        source: tracked.source,
+        transcriptPath: tracked.transcriptPath,
+      });
+    }
+    void saveSnapshot();
+    return c.json({ ok: true });
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
+});
+
+app.post('/api/sessions/:name/release', async (c) => {
+  const name = c.req.param('name');
+  try {
+    const sessions = await listSessions();
+    const live = sessions.find((s) => s.name === name);
+    if (!live) return c.json({ error: 'tmux session not found' }, 404);
+    const tracked = claudeStore.getSession(name);
+    const cwd = await getSessionCwd(name);
+    retainSession({ ...live, cwd: cwd ?? tracked?.cwd ?? process.cwd(), agent: tracked?.source });
+    await killSession(name);
+    claudeStore.removeSession(name);
+    void saveSnapshot();
+    return c.json({ ok: true });
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
+});
+
+app.post('/api/sessions/:name/mount', async (c) => {
+  const name = c.req.param('name');
+  try {
+    const retained = getRetainedSession(name);
+    if (!retained) return c.json({ error: 'retained session not found' }, 404);
+    const live = (await listSessions()).some((s) => s.name === name);
+    if (!live) {
+      await createSession(name, {
+        cwd: retained.cwd,
+        startClaude: retained.agent === 'claude',
+        startCodex: retained.agent === 'codex',
+      });
+    }
+    removeRetainedSession(name);
+    if (retained.agent) {
+      claudeStore.upsertSession({
+        ccSessionId: 'web-' + randomUUID(),
+        tmuxPane: name,
+        tmuxSessionName: name,
+        cwd: retained.cwd,
+        source: retained.agent,
+      });
+    }
+    void saveSnapshot();
+    return c.json({ ok: true });
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
+});
+
 app.delete('/api/sessions/:name', async (c) => {
   const name = c.req.param('name');
   try {
-    await killSession(name);
+    const live = (await listSessions()).some((s) => s.name === name);
+    if (live) await killSession(name);
+    removeRetainedSession(name);
     // hook 経由で記録された Claude セッションエントリも合わせて削除する。
     // これをやらないと /api/claude/sessions に死んだ tmux セッションが残り続ける。
     claudeStore.removeSession(name);
