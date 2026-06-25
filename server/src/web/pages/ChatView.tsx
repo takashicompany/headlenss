@@ -91,12 +91,16 @@ export function ChatView({
   const [error, setError] = useState<string | null>(null);
 
   const scrollerRef = useRef<HTMLDivElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
   const chatInputRef = useRef<HTMLFormElement>(null);
   const lastLenRef = useRef(0);
   const userScrolledUpRef = useRef(false);
   const keyboardStickToBottomRef = useRef(false);
   const ignoreKeyboardScrollUntilRef = useRef(0);
   const keyboardStickClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bottomLockTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const sendingRef = useRef(false);
+  const lastButtonSendRef = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
@@ -150,11 +154,32 @@ export function ChatView({
     const pin = () => {
       const el = scrollerRef.current;
       if (el) el.scrollTop = el.scrollHeight;
+      bottomRef.current?.scrollIntoView({ block: 'end' });
     };
     pin();
     requestAnimationFrame(pin);
     setTimeout(pin, 80);
   }, []);
+
+  const clearBottomLockTimers = useCallback(() => {
+    for (const timer of bottomLockTimersRef.current) clearTimeout(timer);
+    bottomLockTimersRef.current = [];
+  }, []);
+
+  const stickToBottomFor = useCallback((ms: number) => {
+    clearBottomLockTimers();
+    keyboardStickToBottomRef.current = true;
+    userScrolledUpRef.current = false;
+    ignoreKeyboardScrollUntilRef.current = Date.now() + ms;
+
+    const delays = [0, 16, 80, 160, 320, 640, 1000, 1500, 2200]
+      .filter((delay) => delay <= ms);
+    bottomLockTimersRef.current = delays.map((delay) =>
+      setTimeout(scrollToBottom, delay),
+    );
+  }, [clearBottomLockTimers, scrollToBottom]);
+
+  useEffect(() => clearBottomLockTimers, [clearBottomLockTimers]);
 
   // iOS Safari はソフトキーボードの開閉時に visual viewport を自動パンし、
   // その過程で .chat-scroller に scroll イベントが飛ぶ。末尾にいたユーザまで
@@ -162,16 +187,8 @@ export function ChatView({
   // keyboard/padding のレイアウト変更後に末尾へ固定し直す。
   useEffect(() => {
     if (!keyboardStickToBottomRef.current) return;
-    ignoreKeyboardScrollUntilRef.current = Date.now() + 500;
-    userScrolledUpRef.current = false;
-    scrollToBottom();
-    const t1 = setTimeout(scrollToBottom, 160);
-    const t2 = setTimeout(scrollToBottom, 320);
-    return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
-    };
-  }, [keyboardHeight, chatInputHeight, scrollToBottom]);
+    stickToBottomFor(1200);
+  }, [keyboardHeight, chatInputHeight, stickToBottomFor]);
 
   useEffect(() => {
     let disposed = false;
@@ -281,8 +298,7 @@ export function ChatView({
     }
     keyboardStickToBottomRef.current = isNearBottom();
     if (keyboardStickToBottomRef.current) {
-      userScrolledUpRef.current = false;
-      ignoreKeyboardScrollUntilRef.current = Date.now() + 500;
+      stickToBottomFor(900);
     }
   };
 
@@ -291,12 +307,13 @@ export function ChatView({
     keyboardStickClearTimerRef.current = setTimeout(() => {
       keyboardStickToBottomRef.current = false;
       keyboardStickClearTimerRef.current = null;
-    }, 900);
+    }, 1800);
   };
 
   const send = useCallback(async () => {
     const text = input;
-    if (!text.trim() || sending) return;
+    if (!text.trim() || sendingRef.current) return;
+    sendingRef.current = true;
 
     // 楽観的 UI 更新: 送信直後にチャット表示へ即時反映
     const optimistic: ChatMessage = { role: 'user', text, ts: Date.now() };
@@ -304,10 +321,7 @@ export function ChatView({
     setInput('');
     // 送信は「ユーザが意図して末尾へ戻りたい」操作なので、
     // useEffect 経由の auto-scroll ガードに頼らず明示的に末尾固定する。
-    userScrolledUpRef.current = false;
-    keyboardStickToBottomRef.current = true;
-    ignoreKeyboardScrollUntilRef.current = Date.now() + 800;
-    scrollToBottom();
+    stickToBottomFor(2500);
 
     setSending(true);
     setError(null);
@@ -327,10 +341,42 @@ export function ChatView({
       setInput(text);
       setError((e as Error).message);
     } finally {
+      sendingRef.current = false;
       setSending(false);
       inputRef.current?.focus();
     }
-  }, [input, sending, sessionName]);
+  }, [input, sessionName, stickToBottomFor]);
+
+  const keepInputFocusedForSend = (e: React.TouchEvent<HTMLButtonElement>) => {
+    if (sending || !input.trim()) return;
+    // iOS Safari は submit button にフォーカスが移る時に textarea を blur し、
+    // ソフトキーボード close/open の viewport 遷移を起こす。送信ボタンでは
+    // textarea のフォーカスを維持して、送信と同時のスクロールジャンプを避ける。
+    e.preventDefault();
+    inputRef.current?.focus();
+  };
+
+  const sendFromMouseDown = (e: React.MouseEvent<HTMLButtonElement>) => {
+    if (sending || !input.trim()) return;
+    e.preventDefault();
+    lastButtonSendRef.current = Date.now();
+    inputRef.current?.focus();
+    void send();
+  };
+
+  const sendFromTouch = (e: React.TouchEvent<HTMLButtonElement>) => {
+    if (sending || !input.trim()) return;
+    e.preventDefault();
+    lastButtonSendRef.current = Date.now();
+    inputRef.current?.focus();
+    void send();
+  };
+
+  const sendFromClick = () => {
+    // touchend で送信済みの直後に互換 click が来るブラウザでは二重送信を避ける。
+    if (Date.now() - lastButtonSendRef.current < 750) return;
+    void send();
+  };
 
   // スマホ等のタッチデバイスでは Enter を送信に使わない (PC キーボードと違い
   // ソフトキーボードでは改行入力に Enter を使うのが自然)。pointer: coarse で
@@ -883,6 +929,7 @@ export function ChatView({
             </div>
           </div>
         )}
+        <div ref={bottomRef} className="chat-bottom-anchor" aria-hidden="true" />
       </div>
       {error && <div className="chat-error">{t('sendErrorPrefix')}: {error}</div>}
       <form
@@ -930,7 +977,14 @@ export function ChatView({
           rows={1}
           disabled={sending}
         />
-        <button type="submit" disabled={sending || !input.trim()}>
+        <button
+          type="button"
+          onMouseDown={sendFromMouseDown}
+          onTouchStart={keepInputFocusedForSend}
+          onTouchEnd={sendFromTouch}
+          onClick={sendFromClick}
+          disabled={sending || !input.trim()}
+        >
           {sending ? '...' : t('send')}
         </button>
       </form>
