@@ -257,9 +257,6 @@ button {
   border-bottom: 1px solid var(--border);
 }
 
-.session-header .header-metrics {
-  margin-left: auto;
-}
 
 .session-header button {
   background: transparent;
@@ -1093,29 +1090,6 @@ button {
 }
 
 @media (max-width: 640px) {
-  .session-header {
-    flex-wrap: wrap;
-    gap: 0.4rem;
-    padding: 0.45rem 0.5rem;
-  }
-
-  .session-header button {
-    padding: 0.25rem 0.45rem;
-  }
-
-  .session-header .session-title {
-    flex: 1 1 7rem;
-    font-size: 0.9rem;
-  }
-
-  .session-header .mode-toggle {
-    flex: 0 0 auto;
-  }
-
-  .session-header .header-metrics {
-    margin-left: auto;
-  }
-
   .page-header-row {
     align-items: flex-start;
   }
@@ -1127,11 +1101,4 @@ button {
     font-size: 0.68rem;
   }
 
-  .session-header .header-metrics {
-    font-size: 0.68rem;
-  }
-
-  .session-header .header-metrics span {
-    display: none;
-  }
 }

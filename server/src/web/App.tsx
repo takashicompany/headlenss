@@ -141,8 +141,8 @@ export function App() {
 
   const page = route.name === 'session'
     ? route.mode === 'chat'
-      ? <ChatView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} headerMetrics={metrics as ReactNode} />
-      : <SessionView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} headerMetrics={metrics as ReactNode} />
+      ? <ChatView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
+      : <SessionView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
     : <SessionList onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`)} headerMetrics={metrics as ReactNode} />;
 
   return page;

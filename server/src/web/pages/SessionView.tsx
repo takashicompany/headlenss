@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
@@ -23,12 +23,10 @@ export function SessionView({
   sessionName,
   onBack,
   onSwitchMode,
-  headerMetrics,
 }: {
   sessionName: string;
   onBack: () => void;
   onSwitchMode: (m: Mode) => void;
-  headerMetrics?: ReactNode;
 }) {
   const { t } = useLanguage();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -384,7 +382,6 @@ export function SessionView({
             chat
           </button>
         </div>
-        {headerMetrics}
       </header>
       <div ref={containerRef} className="terminal-container" />
       {sessionMissing && (
