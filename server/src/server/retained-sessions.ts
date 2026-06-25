@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { validateName, type Session } from './tmux.ts';
 
 export type RetainedSession = Session & {
+  cwd: string;
   released: true;
   releasedAt: number;
   agent?: 'claude' | 'codex';
@@ -30,6 +31,7 @@ function loadFile(): RetainedFile {
         typeof s?.name === 'string' &&
         typeof s.created === 'number' &&
         typeof s.activity === 'number' &&
+        typeof s.cwd === 'string' &&
         typeof s.releasedAt === 'number',
       ),
     };
@@ -54,7 +56,7 @@ export function hasRetainedSession(name: string): boolean {
   return loadFile().sessions.some((s) => s.name === name);
 }
 
-export function retainSession(session: Session & { agent?: 'claude' | 'codex' }): RetainedSession {
+export function retainSession(session: Session & { cwd: string; agent?: 'claude' | 'codex' }): RetainedSession {
   validateName(session.name);
   const file = loadFile();
   const retained: RetainedSession = {
@@ -88,4 +90,9 @@ export function renameRetainedSession(name: string, nextName: string): RetainedS
   file.sessions[idx] = updated;
   saveFile(file);
   return updated;
+}
+
+export function getRetainedSession(name: string): RetainedSession | undefined {
+  validateName(name);
+  return loadFile().sessions.find((s) => s.name === name);
 }

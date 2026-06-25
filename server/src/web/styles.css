@@ -1013,18 +1013,13 @@ button {
 }
 
 .system-metrics {
-  position: fixed;
-  top: 0.55rem;
-  right: 0.75rem;
-  z-index: 30;
   display: flex;
+  justify-content: flex-end;
   gap: 0.5rem;
   align-items: center;
-  max-width: min(70vw, 520px);
-  padding: 0.25rem 0.45rem;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: rgba(26, 26, 29, 0.92);
+  width: min(720px, calc(100% - 2rem));
+  margin: 0.75rem auto -0.25rem;
+  padding: 0.25rem 0;
   color: var(--muted);
   font-size: 0.72rem;
   white-space: nowrap;
@@ -1085,9 +1080,9 @@ button {
 
 @media (max-width: 640px) {
   .system-metrics {
-    position: static;
-    margin: 0.5rem auto 0;
-    width: fit-content;
-    max-width: calc(100vw - 1rem);
+    justify-content: center;
+    width: calc(100% - 1rem);
+    margin: 0.5rem auto -0.5rem;
+    white-space: normal;
   }
 }

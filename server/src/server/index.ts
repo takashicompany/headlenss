@@ -9,7 +9,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cpus, freemem, loadavg, tmpdir, totalmem } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { captureOutput, createSession, killSession, listSessions, renameSession, sendKey, sendKeys } from './tmux.ts';
+import { captureOutput, createSession, getSessionCwd, killSession, listSessions, renameSession, sendKey, sendKeys } from './tmux.ts';
 import { handlePtyConnection } from './pty.ts';
 import { getBackendName, isAsrReady, transcribePcm16, transcribeWav } from './asr/index.ts';
 import { claudeRouter } from './claude/router.ts';
@@ -18,7 +18,7 @@ import { detectCodexSessions, getCodexHookHealth } from './codex/status.ts';
 import { detectClaudeSessions } from './claude/process-detect.ts';
 import * as claudeStore from './claude/store.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot } from './persist.ts';
-import { hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
+import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIST = resolve(__dirname, '../../dist/web');
@@ -214,9 +214,40 @@ app.post('/api/sessions/:name/release', async (c) => {
     const live = sessions.find((s) => s.name === name);
     if (!live) return c.json({ error: 'tmux session not found' }, 404);
     const tracked = claudeStore.getSession(name);
-    retainSession({ ...live, agent: tracked?.source });
+    const cwd = await getSessionCwd(name);
+    retainSession({ ...live, cwd: cwd ?? tracked?.cwd ?? process.cwd(), agent: tracked?.source });
     await killSession(name);
     claudeStore.removeSession(name);
+    void saveSnapshot();
+    return c.json({ ok: true });
+  } catch (e) {
+    return c.json({ error: (e as Error).message }, 400);
+  }
+});
+
+app.post('/api/sessions/:name/mount', async (c) => {
+  const name = c.req.param('name');
+  try {
+    const retained = getRetainedSession(name);
+    if (!retained) return c.json({ error: 'retained session not found' }, 404);
+    const live = (await listSessions()).some((s) => s.name === name);
+    if (!live) {
+      await createSession(name, {
+        cwd: retained.cwd,
+        startClaude: retained.agent === 'claude',
+        startCodex: retained.agent === 'codex',
+      });
+    }
+    removeRetainedSession(name);
+    if (retained.agent) {
+      claudeStore.upsertSession({
+        ccSessionId: 'web-' + randomUUID(),
+        tmuxPane: name,
+        tmuxSessionName: name,
+        cwd: retained.cwd,
+        source: retained.agent,
+      });
+    }
     void saveSnapshot();
     return c.json({ ok: true });
   } catch (e) {

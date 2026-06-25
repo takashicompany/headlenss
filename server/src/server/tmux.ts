@@ -22,6 +22,7 @@ export type Session = {
   activity: number;
   windows: number;
   attached: boolean;
+  cwd?: string;
   released?: boolean;
   releasedAt?: number;
 };
@@ -266,6 +267,16 @@ export async function requireSession(name: string): Promise<void> {
 export async function killSession(name: string): Promise<void> {
   validateName(name);
   await exec('tmux', ['kill-session', '-t', name]);
+}
+
+export async function getSessionCwd(name: string): Promise<string | undefined> {
+  validateName(name);
+  try {
+    const { stdout } = await exec('tmux', ['display-message', '-p', '-t', name, '#{pane_current_path}']);
+    return stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function renameSession(name: string, nextName: string): Promise<void> {

@@ -246,6 +246,22 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
     }
   };
 
+  const open = async (session: Session) => {
+    if (!session.released) {
+      onOpen(session.name);
+      return;
+    }
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(session.name)}/mount`, { method: 'POST' });
+      const data = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      await refresh();
+      onOpen(session.name);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
   const setManualOrderMode = (enabled: boolean) => {
     setManualOrder(enabled);
     saveManualOrder(enabled);
@@ -362,7 +378,7 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
                 >
                   {isStarred ? '★' : '☆'}
                 </button>
-                <button className="session-open" onClick={() => onOpen(s.name)}>
+                <button className="session-open" onClick={() => open(s)}>
                   <span className="session-name">{s.name}</span>
                   <span className="session-meta">
                     {s.windows} {t(s.windows === 1 ? 'windowUnit' : 'windowUnitPlural')}
