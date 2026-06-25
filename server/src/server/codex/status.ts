@@ -136,7 +136,7 @@ async function capturePane(paneId: string, lines = 80): Promise<string> {
 
 function isLikelyCodexPane(command: string, paneText: string): boolean {
   if (/\bcodex\b/i.test(command)) return true;
-  return /OpenAI Codex|Codex CLI|\/permissions|\/model|tokens used|approval policy|Auto Review|Would you like to run/i.test(paneText);
+  return /OpenAI Codex|Codex CLI|approval policy|Auto Review|Would you like to run|No, and tell Codex/i.test(paneText);
 }
 
 export function isCodexPermissionPrompt(paneText: string): boolean {

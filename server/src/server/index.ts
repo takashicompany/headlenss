@@ -76,14 +76,18 @@ app.get('/api/sessions', async (c) => {
   ]);
   const detectedMap = new Map(detected.map((d) => [d.tmuxSessionName, d]));
   const codexMap = new Map(codexDetected.map((d) => [d.tmuxSessionName, d]));
-  const enriched = sessions.map((s) => ({
-    ...s,
-    claudeStatus: detectedMap.get(s.name)?.status,
-    agent: codexMap.has(s.name) ? 'codex' : detectedMap.has(s.name) ? 'claude' : undefined,
-    codexStatus: codexMap.get(s.name)?.status,
-    codexHookHealth: codexMap.get(s.name)?.hookHealth ?? getCodexHookHealth(),
-    codexNeedsHookAttention: codexMap.get(s.name)?.needsHookAttention ?? false,
-  }));
+  const enriched = sessions.map((s) => {
+    const tracked = claudeStore.getSession(s.name);
+    const agent = tracked?.source ?? (codexMap.has(s.name) ? 'codex' : detectedMap.has(s.name) ? 'claude' : undefined);
+    return {
+      ...s,
+      claudeStatus: tracked?.source === 'claude' ? tracked.status : detectedMap.get(s.name)?.status,
+      agent,
+      codexStatus: tracked?.source === 'codex' ? tracked.status : codexMap.get(s.name)?.status,
+      codexHookHealth: codexMap.get(s.name)?.hookHealth ?? (agent === 'codex' ? getCodexHookHealth(tracked?.cwd) : getCodexHookHealth()),
+      codexNeedsHookAttention: codexMap.get(s.name)?.needsHookAttention ?? false,
+    };
+  });
   return c.json({ sessions: enriched });
 });
 
@@ -91,11 +95,22 @@ app.post('/api/sessions', async (c) => {
   const body = await c.req.json<{ name?: string; cwd?: string; startClaude?: boolean; startCodex?: boolean }>();
   if (!body.name) return c.json({ error: 'name is required' }, 400);
   try {
+    const cwd = typeof body.cwd === 'string' && body.cwd.trim() ? body.cwd.trim() : undefined;
     await createSession(body.name, {
-      cwd: typeof body.cwd === 'string' && body.cwd.trim() ? body.cwd.trim() : undefined,
+      cwd,
       startClaude: body.startClaude === true,
       startCodex: body.startCodex === true,
     });
+    const source = body.startCodex === true ? 'codex' : body.startClaude === true ? 'claude' : undefined;
+    if (source) {
+      claudeStore.upsertSession({
+        ccSessionId: 'web-' + randomUUID(),
+        tmuxPane: body.name,
+        tmuxSessionName: body.name,
+        cwd: cwd ?? process.cwd(),
+        source,
+      });
+    }
     // 直近の tmux 状態をスナップショットに反映 (再起動越しの復元に効く)
     void saveSnapshot();
     return c.json({ ok: true });

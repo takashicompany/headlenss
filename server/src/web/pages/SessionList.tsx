@@ -227,6 +227,7 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
           {sortedSessions.map((s) => {
             const status = s.agent === 'codex' ? s.codexStatus ?? s.claudeStatus : s.claudeStatus;
             const cc = claudeIndicator(status, s.agent, t);
+            const agentOnly = !cc && s.agent ? agentLabel(s.agent) : '';
             const codexHookLabel = s.agent === 'codex' && s.codexHookHealth?.status !== 'ok'
               ? s.codexHookHealth?.status === 'missing' ? t('codexHooksMissing') : t('codexHooksIncomplete')
               : s.agent === 'codex' && s.codexNeedsHookAttention ? t('codexHooksNeedTrust') : '';
@@ -247,6 +248,7 @@ export function SessionList({ onOpen }: { onOpen: (name: string) => void }) {
                     {s.windows} {t(s.windows === 1 ? 'windowUnit' : 'windowUnitPlural')}
                     {s.attached && ` • ${t('attached')}`}
                     {cc && <span className={`cc-indicator cc-${status}`}> • {cc}</span>}
+                    {agentOnly && <span className="agent-indicator"> • {agentOnly}</span>}
                     {codexHookLabel && <span className="codex-hook-warning"> • {codexHookLabel}</span>}
                   </span>
                 </button>
