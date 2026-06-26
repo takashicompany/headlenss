@@ -46,6 +46,7 @@ const STRINGS = {
   statusWaitingPermission:{ en: 'Agent is waiting for permission', ja: 'エージェントが許可を待っています' },
   statusWaitingQuestion:  { en: 'Agent is waiting for an answer', ja: 'エージェントが質問を待っています' },
   chatEmpty:              { en: 'No messages yet.', ja: 'まだ会話がありません。' },
+  scrollToBottom:         { en: 'Scroll to bottom', ja: '一番下へスクロール' },
   codexHooksMissingTitle: { en: 'Codex hooks are not installed', ja: 'Codex hook が未導入です' },
   codexHooksIncompleteTitle:{ en: 'Codex hooks are incomplete', ja: 'Codex hook が不完全です' },
   codexHooksNeedTrustTitle:{ en: 'Codex hooks may need review', ja: 'Codex hook の確認が必要かもしれません' },
