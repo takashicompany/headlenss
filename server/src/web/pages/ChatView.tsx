@@ -474,6 +474,18 @@ export function ChatView({
       <header className="session-header">
         <button onClick={onBack} aria-label={t('back')}>{t('back')}</button>
         <span className="session-title">{sessionName}</span>
+        <button
+          type="button"
+          className="session-scroll-bottom"
+          onClick={() => {
+            userScrolledUpRef.current = false;
+            scrollToBottom();
+          }}
+          aria-label={t('scrollToBottom')}
+          title={t('scrollToBottom')}
+        >
+          ↓
+        </button>
         <div className="mode-toggle" role="group" aria-label={t('viewMode')}>
           <button
             type="button"
