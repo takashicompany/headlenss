@@ -91,16 +91,9 @@ export function ChatView({
   const [error, setError] = useState<string | null>(null);
 
   const scrollerRef = useRef<HTMLDivElement>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
   const chatInputRef = useRef<HTMLFormElement>(null);
   const lastLenRef = useRef(0);
   const userScrolledUpRef = useRef(false);
-  const keyboardStickToBottomRef = useRef(false);
-  const ignoreKeyboardScrollUntilRef = useRef(0);
-  const keyboardStickClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const bottomLockTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
-  const sendingRef = useRef(false);
-  const lastButtonSendRef = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
@@ -129,11 +122,12 @@ export function ChatView({
   }, []);
 
   // keyboard 開いている間だけ、 chat-scroller に padding-bottom を加える。
-  // chat-input は visualViewport 下端に貼り付くため、可視領域内で必要なのは
-  // 入力欄の高さ分だけ。keyboardHeight まで足すと、フルソフトキーボード表示時に
-  // 末尾メッセージと入力欄の間へキーボード高ぶんの空白ができる。
+  // chat-input は absolute になって flex flow から外れるので、 そのままだと
+  // 最新メッセージが chat-input の下に潜って見えなくなる。
+  // padding-bottom = keyboardH + chatInputH で「chat-input の上端」 まで
+  // コンテンツを押し上げる。 keyboard 閉じてる時は 0 で副作用なし。
   const scrollerPaddingBottom =
-    keyboardHeight > 0 ? `${chatInputHeight}px` : undefined;
+    keyboardHeight > 0 ? `${keyboardHeight + chatInputHeight}px` : undefined;
 
   // 表示は server + pending を順に並べる(pending は常に末尾、ts 順)
   const displayChat = useMemo(() => {
@@ -154,41 +148,11 @@ export function ChatView({
     const pin = () => {
       const el = scrollerRef.current;
       if (el) el.scrollTop = el.scrollHeight;
-      bottomRef.current?.scrollIntoView({ block: 'end' });
     };
     pin();
     requestAnimationFrame(pin);
     setTimeout(pin, 80);
   }, []);
-
-  const clearBottomLockTimers = useCallback(() => {
-    for (const timer of bottomLockTimersRef.current) clearTimeout(timer);
-    bottomLockTimersRef.current = [];
-  }, []);
-
-  const stickToBottomFor = useCallback((ms: number) => {
-    clearBottomLockTimers();
-    keyboardStickToBottomRef.current = true;
-    userScrolledUpRef.current = false;
-    ignoreKeyboardScrollUntilRef.current = Date.now() + ms;
-
-    const delays = [0, 16, 80, 160, 320, 640, 1000, 1500, 2200]
-      .filter((delay) => delay <= ms);
-    bottomLockTimersRef.current = delays.map((delay) =>
-      setTimeout(scrollToBottom, delay),
-    );
-  }, [clearBottomLockTimers, scrollToBottom]);
-
-  useEffect(() => clearBottomLockTimers, [clearBottomLockTimers]);
-
-  // iOS Safari はソフトキーボードの開閉時に visual viewport を自動パンし、
-  // その過程で .chat-scroller に scroll イベントが飛ぶ。末尾にいたユーザまで
-  // 「履歴を遡った」と誤判定しないよう、フォーカス/送信時に末尾状態を保存し、
-  // keyboard/padding のレイアウト変更後に末尾へ固定し直す。
-  useEffect(() => {
-    if (!keyboardStickToBottomRef.current) return;
-    stickToBottomFor(1200);
-  }, [keyboardHeight, chatInputHeight, stickToBottomFor]);
 
   useEffect(() => {
     let disposed = false;
@@ -287,33 +251,12 @@ export function ChatView({
   }, [status, scrollToBottom]);
 
   const onScroll = () => {
-    if (Date.now() < ignoreKeyboardScrollUntilRef.current) return;
     userScrolledUpRef.current = !isNearBottom();
-  };
-
-  const onInputFocus = () => {
-    if (keyboardStickClearTimerRef.current) {
-      clearTimeout(keyboardStickClearTimerRef.current);
-      keyboardStickClearTimerRef.current = null;
-    }
-    keyboardStickToBottomRef.current = isNearBottom();
-    if (keyboardStickToBottomRef.current) {
-      stickToBottomFor(900);
-    }
-  };
-
-  const onInputBlur = () => {
-    if (keyboardStickClearTimerRef.current) clearTimeout(keyboardStickClearTimerRef.current);
-    keyboardStickClearTimerRef.current = setTimeout(() => {
-      keyboardStickToBottomRef.current = false;
-      keyboardStickClearTimerRef.current = null;
-    }, 1800);
   };
 
   const send = useCallback(async () => {
     const text = input;
-    if (!text.trim() || sendingRef.current) return;
-    sendingRef.current = true;
+    if (!text.trim() || sending) return;
 
     // 楽観的 UI 更新: 送信直後にチャット表示へ即時反映
     const optimistic: ChatMessage = { role: 'user', text, ts: Date.now() };
@@ -321,7 +264,8 @@ export function ChatView({
     setInput('');
     // 送信は「ユーザが意図して末尾へ戻りたい」操作なので、
     // useEffect 経由の auto-scroll ガードに頼らず明示的に末尾固定する。
-    stickToBottomFor(2500);
+    userScrolledUpRef.current = false;
+    scrollToBottom();
 
     setSending(true);
     setError(null);
@@ -341,42 +285,10 @@ export function ChatView({
       setInput(text);
       setError((e as Error).message);
     } finally {
-      sendingRef.current = false;
       setSending(false);
       inputRef.current?.focus();
     }
-  }, [input, sessionName, stickToBottomFor]);
-
-  const keepInputFocusedForSend = (e: React.TouchEvent<HTMLButtonElement>) => {
-    if (sending || !input.trim()) return;
-    // iOS Safari は submit button にフォーカスが移る時に textarea を blur し、
-    // ソフトキーボード close/open の viewport 遷移を起こす。送信ボタンでは
-    // textarea のフォーカスを維持して、送信と同時のスクロールジャンプを避ける。
-    e.preventDefault();
-    inputRef.current?.focus();
-  };
-
-  const sendFromMouseDown = (e: React.MouseEvent<HTMLButtonElement>) => {
-    if (sending || !input.trim()) return;
-    e.preventDefault();
-    lastButtonSendRef.current = Date.now();
-    inputRef.current?.focus();
-    void send();
-  };
-
-  const sendFromTouch = (e: React.TouchEvent<HTMLButtonElement>) => {
-    if (sending || !input.trim()) return;
-    e.preventDefault();
-    lastButtonSendRef.current = Date.now();
-    inputRef.current?.focus();
-    void send();
-  };
-
-  const sendFromClick = () => {
-    // touchend で送信済みの直後に互換 click が来るブラウザでは二重送信を避ける。
-    if (Date.now() - lastButtonSendRef.current < 750) return;
-    void send();
-  };
+  }, [input, sending, sessionName]);
 
   // スマホ等のタッチデバイスでは Enter を送信に使わない (PC キーボードと違い
   // ソフトキーボードでは改行入力に Enter を使うのが自然)。pointer: coarse で
@@ -929,7 +841,6 @@ export function ChatView({
             </div>
           </div>
         )}
-        <div ref={bottomRef} className="chat-bottom-anchor" aria-hidden="true" />
       </div>
       {error && <div className="chat-error">{t('sendErrorPrefix')}: {error}</div>}
       <form
@@ -970,21 +881,12 @@ export function ChatView({
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onKeyDown}
-          onFocus={onInputFocus}
-          onBlur={onInputBlur}
           onPaste={onPaste}
           placeholder={uploading ? t('uploadingEllipsis') : t('messageInputPlaceholder')}
           rows={1}
           disabled={sending}
         />
-        <button
-          type="button"
-          onMouseDown={sendFromMouseDown}
-          onTouchStart={keepInputFocusedForSend}
-          onTouchEnd={sendFromTouch}
-          onClick={sendFromClick}
-          disabled={sending || !input.trim()}
-        >
+        <button type="submit" disabled={sending || !input.trim()}>
           {sending ? '...' : t('send')}
         </button>
       </form>

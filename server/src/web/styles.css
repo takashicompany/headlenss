@@ -342,13 +342,6 @@ button {
   gap: 0.75rem;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
-  overflow-anchor: none;
-}
-
-.chat-bottom-anchor {
-  flex: 0 0 1px;
-  height: 1px;
-  overflow-anchor: none;
 }
 
 /* 吹き出し以外の要素は端から余白を取る */
