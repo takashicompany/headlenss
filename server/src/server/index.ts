@@ -292,14 +292,20 @@ app.post('/api/sessions/:name/input', async (c) => {
     return c.json({ error: 'body must be { "text": string, "submit"?: boolean }' }, 400);
   }
   try {
-    if (body.submit === true) {
-      const pane = await captureOutput(name, 30).catch(() => '');
-      const shouldQueueInCodex = /tab to queue message/i.test(pane);
-      if (shouldQueueInCodex) {
-        await sendKeys(name, body.text, false);
-        await sendKey(name, 'Tab');
-        return c.json({ ok: true, queued: true });
-      }
+    const tracked = claudeStore.getSession(name);
+    const pane = body.submit === true ? await captureOutput(name, 120).catch(() => '') : '';
+    const isCodex = body.submit === true && (
+      tracked?.source === 'codex' ||
+      /\bOpenAI Codex\b|\bCodex CLI\b|approval policy|Auto Review/i.test(pane) ||
+      (await detectCodexSessions()).some((session) => session.tmuxSessionName === name)
+    );
+    if (body.submit === true && isCodex) {
+      const visiblePaneTail = pane.slice(-3000);
+      const shouldQueueInCodex = /esc to interrupt/i.test(visiblePaneTail);
+      await sendKeys(name, body.text, false);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      await sendKey(name, shouldQueueInCodex ? 'Tab' : 'Enter');
+      return c.json({ ok: true, queued: shouldQueueInCodex });
     }
     await sendKeys(name, body.text, body.submit === true);
     return c.json({ ok: true });
