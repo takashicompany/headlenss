@@ -27,13 +27,28 @@ function extractText(content: unknown): string {
   return parts.join('').trim();
 }
 
+/** Codex は承認レビュー・環境注入・中断通知などの内部イベントも
+ *  response_item/message として transcript に残す。これらは tmux の通常会話ではなく、
+ *  chat view に出すとメイン会話に見えて順序も崩れる。 */
+const CODEX_INTERNAL_USER_RE =
+  /^\s*(<environment_context>|<subagent_notification>|<turn_aborted>|<task>|<skill>|<skills_instructions>|The following is the Codex agent history)/;
+const CODEX_AUTO_REVIEWER_RESULT_RE = /^\s*\{\s*("outcome"\s*:|"risk_level"[\s\S]*"outcome"\s*:)/;
+
+function isCodexInternalMessage(role: string, text: string): boolean {
+  if (role === 'user' && CODEX_INTERNAL_USER_RE.test(text)) return true;
+  if (role === 'assistant' && CODEX_AUTO_REVIEWER_RESULT_RE.test(text)) return true;
+  return false;
+}
+
 function extractMessage(line: CodexTranscriptLine): { role: 'user' | 'assistant'; text: string } | null {
   if (line.type !== 'response_item') return null;
   if (!line.payload || typeof line.payload !== 'object') return null;
   const payload = line.payload as CodexMessagePayload;
   if (payload.type !== 'message') return null;
   if (payload.role !== 'user' && payload.role !== 'assistant') return null;
-  const text = sanitizeChatText(extractText(payload.content));
+  const rawText = extractText(payload.content);
+  if (isCodexInternalMessage(payload.role, rawText)) return null;
+  const text = sanitizeChatText(rawText);
   if (!text) return null;
   return { role: payload.role, text };
 }
