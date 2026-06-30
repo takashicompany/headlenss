@@ -113,6 +113,12 @@ claudeRouter.post('/hooks/user-prompt-submit', async (c) => {
       cwd: body.cwd ?? '',
     });
   }
+  const existing = store.getSession(tmuxName);
+  if (existing?.source === 'codex') {
+    // Codex セッション内で検証用に起動した Claude CLI などの hook は、
+    // メイン Codex 会話ではないため chat 履歴には混ぜない。
+    return c.json({});
+  }
   // 新しいターンが始まる: 前ターンの Stop マーカーをクリア
   store.clearStopped(tmuxName);
   const text = (body.prompt ?? '').trim();
@@ -133,6 +139,11 @@ claudeRouter.post('/hooks/stop', async (c) => {
       tmuxSessionName: tmuxName,
       cwd: body.cwd ?? '',
     });
+  }
+  const existing = store.getSession(tmuxName);
+  if (existing?.source === 'codex') {
+    // Codex セッション内で起動した別 Claude の stop hook はメイン会話ではない。
+    return c.json({});
   }
   const transcriptPath = body.transcript_path ?? '';
   if (transcriptPath) {
@@ -531,7 +542,7 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
 
   // hook 由来の chat も transcript と同じシステムタグサニタイズを通す
   // (! 付きで実行された bash コマンド等のラッパが残らないように)。
-  const cleanedHookChat = hookChat
+  const cleanedHookChat = (session?.source === 'codex' && transcriptChat.length > 0 ? [] : hookChat)
     .map((m) => ({ ...m, text: sanitizeChatText(m.text) }))
     .filter((m) => m.text.length > 0);
 

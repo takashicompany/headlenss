@@ -5,6 +5,7 @@ type TranscriptLine = {
   message?: { role?: string; content?: unknown };
   role?: string;
   content?: unknown;
+  isMeta?: boolean;
 };
 
 function extractText(content: unknown): string {
@@ -60,42 +61,27 @@ export function sanitizeChatText(text: string): string {
   return s;
 }
 
-/** Claude Code がサブエージェント (Task tool) の完了を親エージェントに伝える時、
- *  API 仕様上 role=user として `<task-notification>...</task-notification>` で
- *  包んで transcript に書き込む。これは本物のユーザ入力ではないので Chat UI 上は
- *  AI 側 (assistant) に振り分けたい。
- *
- *  誤検知防止のため「開始タグ・<task-id>・終了タグ」の3点セットが全部揃った
- *  完全な構造を要求する。ユーザが文中に `<task-notification>` という文字列を
- *  単に書いた程度では絶対にマッチしない。 */
+/** Claude Code が内部制御・サブエージェント通知・ローカルコマンド結果を
+ *  role=user として transcript に書くことがある。これらはメインエージェントとの
+ *  会話ではなく、tmux の通常会話にも出ないため chat view から除外する。 */
 const TASK_NOTIFICATION_RE =
   /^\s*<task-notification>[\s\S]*<task-id>[\s\S]*<\/task-notification>\s*$/;
+const LOCAL_COMMAND_STDOUT_RE = /^\s*<local-command-stdout>[\s\S]*<\/local-command-stdout>\s*$/;
+const META_USER_TEXT_RE = /^(A session-scoped Stop hook is now active|Stop hook feedback:)/;
 
-function isTaskNotification(text: string): boolean {
-  return TASK_NOTIFICATION_RE.test(text);
-}
-
-/** <task-notification> ペイロードから人間が読みやすい本文を組み立てる。
- *  <task-id> / <tool-use-id> / <output-file> 等の機械用 ID は捨て、<summary> と
- *  <result> だけ残す。<status> が completed 以外ならその旨を頭に付ける。 */
-function formatTaskNotification(text: string): string {
-  const get = (tag: string): string =>
-    text.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`))?.[1].trim() ?? '';
-  const summary = get('summary');
-  const status = get('status');
-  const result = get('result');
-  const header = summary ? `**[サブエージェント] ${summary}**` : '**[サブエージェント]**';
-  const statusLine = status && status !== 'completed' ? `_status: ${status}_\n\n` : '';
-  return result
-    ? `${header}\n\n${statusLine}${result}`
-    : `${header}${statusLine ? '\n\n' + statusLine : ''}`;
+function isNonMainAgentTranscriptEntry(parsed: TranscriptLine, text: string): boolean {
+  if (parsed.isMeta === true) return true;
+  if (TASK_NOTIFICATION_RE.test(text)) return true;
+  if (LOCAL_COMMAND_STDOUT_RE.test(text)) return true;
+  if (META_USER_TEXT_RE.test(text)) return true;
+  return false;
 }
 
 /**
  * transcript JSONL からチャット履歴 (user prompt と assistant text) を順序通りに抽出する。
  * - tool_result / tool_use ブロックは除外
  * - sub-agent (isSidechain=true) は除外
- * - <task-notification> wrapper は role を assistant に振り替えて整形
+ * - Claude Code のメタ制御・ローカルコマンド結果・サブエージェント通知は除外
  * - limit: 末尾 N 件のみ返す (デフォルト 200)
  */
 export async function extractChatFromTranscript(
@@ -145,19 +131,11 @@ export async function extractChatFromTranscript(
       text = parts.join('').trim();
     }
     if (!text) continue;
-    // <task-notification> wrapper の判定はサニタイズ前に行う (sanitizeChatText が
-    // 未知タグの中身だけ残す処理を入れる可能性に備える)。マッチしたら role を
-    // assistant に上書きし、本文も summary/result だけの整形版に置換する。
-    let effectiveRole: 'user' | 'assistant' = role as 'user' | 'assistant';
-    let effectiveText = text;
-    if (effectiveRole === 'user' && isTaskNotification(text)) {
-      effectiveRole = 'assistant';
-      effectiveText = formatTaskNotification(text);
-    }
-    const cleaned = sanitizeChatText(effectiveText);
+    if (isNonMainAgentTranscriptEntry(parsed, text)) continue;
+    const cleaned = sanitizeChatText(text);
     if (!cleaned) continue;
     const ts = parsed.timestamp ? Date.parse(parsed.timestamp) : Date.now();
-    items.push({ role: effectiveRole, text: cleaned, ts: Number.isFinite(ts) ? ts : Date.now() });
+    items.push({ role: role as 'user' | 'assistant', text: cleaned, ts: Number.isFinite(ts) ? ts : Date.now() });
   }
   return items.slice(-limit);
 }
