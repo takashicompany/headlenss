@@ -270,11 +270,6 @@ button {
   border-color: var(--accent);
 }
 
-.session-scroll-bottom {
-  min-width: 2.2rem;
-  font-size: 0.95rem;
-  line-height: 1;
-}
 
 .session-title {
   font-weight: 500;
@@ -328,6 +323,45 @@ button {
   background: var(--bg);
 }
 
+.chat-floating-bottom {
+  position: absolute;
+  left: 50%;
+  z-index: 20;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  max-width: calc(100% - 2rem);
+  min-height: 2.25rem;
+  padding: 0.42rem 0.78rem;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  background: rgba(31, 34, 41, 0.96);
+  color: var(--text);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.34);
+  font-size: 0.84rem;
+  font-weight: 500;
+  white-space: nowrap;
+  backdrop-filter: blur(10px);
+}
+
+.chat-floating-bottom:hover {
+  border-color: rgba(74, 158, 255, 0.65);
+  background: rgba(37, 42, 52, 0.98);
+}
+
+.chat-floating-bottom span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.15rem;
+  height: 1.15rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: white;
+  line-height: 1;
+}
+
 .chat-scroller {
   flex: 1;
   overflow-y: auto;
@@ -365,6 +399,26 @@ button {
   text-align: center;
   margin-top: 2rem;
   font-size: 0.9rem;
+}
+
+.chat-show-older {
+  align-self: center;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.12rem;
+  max-width: calc(100% - 1.5rem);
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 0.85rem;
+}
+
+.chat-show-older span {
+  color: var(--muted);
+  font-size: 0.72rem;
 }
 
 .chat-msg {

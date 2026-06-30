@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
 import {
@@ -12,6 +12,8 @@ import { useLanguage } from '../i18n.tsx';
 type Mode = 'tmux' | 'chat';
 type ChatMessage = { role: 'user' | 'assistant'; text: string; ts: number; synthetic?: boolean };
 type SessionStatus = 'idle' | 'busy' | 'waiting-permission' | 'waiting-question';
+const INITIAL_VISIBLE_MESSAGES = 20;
+const VISIBLE_MESSAGES_STEP = 20;
 
 type AskQuestionOption = { label: string; description?: string };
 type AskQuestion = {
@@ -48,6 +50,73 @@ function inlineUploadedImages(text: string): string {
   );
 }
 
+function sameChatMessages(a: ChatMessage[], b: ChatMessage[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (
+      a[i].role !== b[i].role ||
+      a[i].text !== b[i].text ||
+      a[i].ts !== b[i].ts ||
+      a[i].synthetic !== b[i].synthetic
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const markdownComponents: Components = {
+  a: ({ children, href, ...rest }) => (
+    <a href={href} target="_blank" rel="noopener noreferrer" {...rest}>
+      {children}
+    </a>
+  ),
+  // loose list で react-markdown が <li><p>...</p></li> を出すと
+  // 空白テキストノードが li 内に残って anonymous block boxes が
+  // 余分な高さを生む。<p> 単独子の場合は <p> を剥がして tight list と
+  // 同じ DOM 構造に揃える。
+  li: ({ children, ...rest }) => {
+    const arr = React.Children.toArray(children);
+    const meaningful = arr.filter((c) =>
+      typeof c === 'string' ? c.trim().length > 0 : true,
+    );
+    if (
+      meaningful.length === 1 &&
+      React.isValidElement(meaningful[0]) &&
+      (meaningful[0] as React.ReactElement).type === 'p'
+    ) {
+      const p = meaningful[0] as React.ReactElement<{ children?: React.ReactNode }>;
+      return <li {...rest}>{p.props.children}</li>;
+    }
+    return <li {...rest}>{children}</li>;
+  },
+};
+
+const ChatMessageItem = React.memo(function ChatMessageItem({
+  message,
+  isPending,
+}: {
+  message: ChatMessage;
+  isPending: boolean;
+}) {
+  const renderedText = useMemo(() => inlineUploadedImages(message.text), [message.text]);
+  return (
+    <div
+      className={`chat-msg chat-msg-${message.role}${isPending ? ' chat-msg-pending' : ''}`}
+    >
+      <div className="chat-msg-role">{message.role === 'user' ? 'YOU' : 'Agent'}</div>
+      <div className="chat-msg-bubble markdown-body">
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm, remarkBreaks]}
+          components={markdownComponents}
+        >
+          {renderedText}
+        </ReactMarkdown>
+      </div>
+    </div>
+  );
+});
+
 export function ChatView({
   sessionName,
   onBack,
@@ -60,6 +129,7 @@ export function ChatView({
   const { t, language } = useLanguage();
   // サーバから返ってくる確定 chat
   const [serverChat, setServerChat] = useState<ChatMessage[]>([]);
+  const [visibleLimit, setVisibleLimit] = useState(INITIAL_VISIBLE_MESSAGES);
   // 送信直後の楽観的表示メッセージ。サーバ側 (transcript / hook) に同じ user メッセージが
   // 出てきたら自動的にここから取り除く。
   const [pending, setPending] = useState<ChatMessage[]>([]);
@@ -94,6 +164,7 @@ export function ChatView({
   const chatInputRef = useRef<HTMLFormElement>(null);
   const lastLenRef = useRef(0);
   const userScrolledUpRef = useRef(false);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
@@ -129,17 +200,28 @@ export function ChatView({
   const scrollerPaddingBottom =
     keyboardHeight > 0 ? `${keyboardHeight + chatInputHeight}px` : undefined;
 
-  // 表示は server + pending を順に並べる(pending は常に末尾、ts 順)
+  // 表示は server + pending を順に並べる(pending は常に末尾、ts 順)。
+  // 初期表示は直近分だけに絞り、必要に応じて上部ボタンで過去分を追加する。
   const displayChat = useMemo(() => {
     return [...serverChat, ...pending];
   }, [serverChat, pending]);
+  const visibleStart = Math.max(0, displayChat.length - visibleLimit);
+  const visibleChat = useMemo(() => {
+    return displayChat.slice(visibleStart);
+  }, [displayChat, visibleStart]);
+  const hasOlderChat = visibleStart > 0;
 
-  // 末尾近くに居れば新規メッセージで自動末尾追従。離れていれば追従しない。
-  const isNearBottom = () => {
+  const distanceFromBottom = useCallback(() => {
     const el = scrollerRef.current;
-    if (!el) return true;
-    return el.scrollHeight - el.scrollTop - el.clientHeight < 64;
-  };
+    if (!el) return 0;
+    return el.scrollHeight - el.scrollTop - el.clientHeight;
+  }, []);
+
+  const syncScrollState = useCallback(() => {
+    const distance = distanceFromBottom();
+    userScrolledUpRef.current = distance >= 64;
+    setShowScrollToBottom(distance > 240);
+  }, [distanceFromBottom]);
 
   // 末尾へ即時スクロール。 markdown / 画像の遅延レイアウトで scrollHeight が後から
   // 伸びるケースに耐えるよう、即時 + 次フレーム + 80ms 後 の 3 回試行する。
@@ -149,10 +231,15 @@ export function ChatView({
       const el = scrollerRef.current;
       if (el) el.scrollTop = el.scrollHeight;
     };
+    userScrolledUpRef.current = false;
+    setShowScrollToBottom(false);
     pin();
     requestAnimationFrame(pin);
-    setTimeout(pin, 80);
-  }, []);
+    setTimeout(() => {
+      pin();
+      syncScrollState();
+    }, 80);
+  }, [syncScrollState]);
 
   useEffect(() => {
     let disposed = false;
@@ -178,7 +265,7 @@ export function ChatView({
             // 合成メッセージ (status 表示用に server 側で動的注入したもの) は
             // PC chat では dot インジケータが既にあるので除外。G2 はこれを表示する。
             const next = (json.chat ?? []).filter((m) => !m.synthetic);
-            setServerChat(next);
+            setServerChat((prev) => sameChatMessages(prev, next) ? prev : next);
             if (json.status) setStatus(json.status);
             setSource(json.source);
             setCodexHookHealth(json.codexHookHealth ?? null);
@@ -234,6 +321,10 @@ export function ChatView({
     };
   }, [sessionName]);
 
+  useEffect(() => {
+    setVisibleLimit(INITIAL_VISIBLE_MESSAGES);
+  }, [sessionName]);
+
   // displayChat が伸びたら自動末尾追従(履歴遡り中はしない)
   useEffect(() => {
     if (displayChat.length > lastLenRef.current && !userScrolledUpRef.current) {
@@ -251,7 +342,7 @@ export function ChatView({
   }, [status, scrollToBottom]);
 
   const onScroll = () => {
-    userScrolledUpRef.current = !isNearBottom();
+    syncScrollState();
   };
 
   const send = useCallback(async () => {
@@ -264,7 +355,6 @@ export function ChatView({
     setInput('');
     // 送信は「ユーザが意図して末尾へ戻りたい」操作なので、
     // useEffect 経由の auto-scroll ガードに頼らず明示的に末尾固定する。
-    userScrolledUpRef.current = false;
     scrollToBottom();
 
     setSending(true);
@@ -474,18 +564,6 @@ export function ChatView({
       <header className="session-header">
         <button onClick={onBack} aria-label={t('back')}>{t('back')}</button>
         <span className="session-title">{sessionName}</span>
-        <button
-          type="button"
-          className="session-scroll-bottom"
-          onClick={() => {
-            userScrolledUpRef.current = false;
-            scrollToBottom();
-          }}
-          aria-label={t('scrollToBottom')}
-          title={t('scrollToBottom')}
-        >
-          ↓
-        </button>
         <div className="mode-toggle" role="group" aria-label={t('viewMode')}>
           <button
             type="button"
@@ -532,50 +610,29 @@ export function ChatView({
         {displayChat.length === 0 ? (
           <div className="chat-empty">{t('chatEmpty')}</div>
         ) : (
-          displayChat.map((m, i) => {
-            const isPending = i >= serverChat.length;
-            return (
-              <div
-                key={i}
-                className={`chat-msg chat-msg-${m.role}${isPending ? ' chat-msg-pending' : ''}`}
+          <>
+            {hasOlderChat && (
+              <button
+                type="button"
+                className="chat-show-older"
+                onClick={() => setVisibleLimit((limit) => limit + VISIBLE_MESSAGES_STEP)}
               >
-                <div className="chat-msg-role">{m.role === 'user' ? 'YOU' : 'Agent'}</div>
-                <div className="chat-msg-bubble markdown-body">
-                  <ReactMarkdown
-                    remarkPlugins={[remarkGfm, remarkBreaks]}
-                    components={{
-                      a: ({ children, href, ...rest }) => (
-                        <a href={href} target="_blank" rel="noopener noreferrer" {...rest}>
-                          {children}
-                        </a>
-                      ),
-                      // loose list で react-markdown が <li><p>...</p></li> を出すと
-                      // 空白テキストノードが li 内に残って anonymous block boxes が
-                      // 余分な高さを生む。<p> 単独子の場合は <p> を剥がして tight list と
-                      // 同じ DOM 構造に揃える。
-                      li: ({ children, ...rest }) => {
-                        const arr = React.Children.toArray(children);
-                        const meaningful = arr.filter((c) =>
-                          typeof c === 'string' ? c.trim().length > 0 : true,
-                        );
-                        if (
-                          meaningful.length === 1 &&
-                          React.isValidElement(meaningful[0]) &&
-                          (meaningful[0] as React.ReactElement).type === 'p'
-                        ) {
-                          const p = meaningful[0] as React.ReactElement<{ children?: React.ReactNode }>;
-                          return <li {...rest}>{p.props.children}</li>;
-                        }
-                        return <li {...rest}>{children}</li>;
-                      },
-                    }}
-                  >
-                    {inlineUploadedImages(m.text)}
-                  </ReactMarkdown>
-                </div>
-              </div>
-            );
-          })
+                {t('showOlderMessages')}
+                <span>{visibleStart} {t('hiddenMessagesCount')}</span>
+              </button>
+            )}
+            {visibleChat.map((m, i) => {
+              const globalIndex = visibleStart + i;
+              const isPending = globalIndex >= serverChat.length;
+              return (
+                <ChatMessageItem
+                  key={m.role + ':' + m.ts + ':' + globalIndex + ':' + m.text.slice(0, 32)}
+                  message={m}
+                  isPending={isPending}
+                />
+              );
+            })}
+          </>
         )}
         {status !== 'idle' && (
           <div className={`chat-status chat-status-${status}`}>
@@ -854,6 +911,19 @@ export function ChatView({
           </div>
         )}
       </div>
+      {showScrollToBottom && (
+        <button
+          type="button"
+          className="chat-floating-bottom"
+          onClick={scrollToBottom}
+          aria-label={t('scrollToBottom')}
+          title={t('scrollToBottom')}
+          style={{ bottom: `${(keyboardHeight > 0 ? keyboardHeight : 0) + chatInputHeight + 12}px` }}
+        >
+          <span aria-hidden="true">↓</span>
+          {t('scrollToBottom')}
+        </button>
+      )}
       {error && <div className="chat-error">{t('sendErrorPrefix')}: {error}</div>}
       <form
         ref={chatInputRef}
