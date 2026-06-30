@@ -286,7 +286,7 @@ export function SessionList({ onOpen, headerMetrics }: { onOpen: (name: string) 
       <header className="page-header">
         <div className="page-header-row">
           <div className="page-heading">
-            <h1>headlenss</h1>
+            <h1>HeadLenss</h1>
             <p className="muted">{t('appSubtitle')}</p>
           </div>
           {headerMetrics}

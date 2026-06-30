@@ -7,7 +7,7 @@ export type Language = 'en' | 'ja'
 
 const STRINGS = {
   // ─── App ─────────────────────────────────────────────────────
-  appName:        { en: 'headlenss',                            ja: 'headlenss' },
+  appName:        { en: 'HeadLenss',                            ja: 'HeadLenss' },
   appTagline:     { en: 'Voice control for coding agents',        ja: '音声でエージェントを動かす' },
 
   // ─── Onboarding ──────────────────────────────────────────────
