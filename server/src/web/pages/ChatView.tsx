@@ -164,6 +164,7 @@ export function ChatView({
   const chatInputRef = useRef<HTMLFormElement>(null);
   const lastLenRef = useRef(0);
   const userScrolledUpRef = useRef(false);
+  const scrollAfterPendingConfirmRef = useRef(false);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -291,6 +292,7 @@ export function ChatView({
               if (prev.length === 0) return prev;
               const remaining: ChatMessage[] = [];
               const consumed = new Set<number>();
+              let confirmed = false;
               for (const pm of prev) {
                 let matchedIdx = -1;
                 for (let i = 0; i < next.length; i++) {
@@ -302,8 +304,12 @@ export function ChatView({
                   }
                 }
                 if (matchedIdx === -1) remaining.push(pm);
-                else consumed.add(matchedIdx);
+                else {
+                  consumed.add(matchedIdx);
+                  confirmed = true;
+                }
               }
+              if (confirmed) scrollAfterPendingConfirmRef.current = true;
               return remaining;
             });
           }
@@ -332,6 +338,15 @@ export function ChatView({
     }
     lastLenRef.current = displayChat.length;
   }, [displayChat.length, scrollToBottom]);
+
+  // 楽観的 user 投稿が serverChat の確定メッセージに置き換わる時は、
+  // DOM 上では pending の灰色吹き出しが消えて白い確定吹き出しに置換される。
+  // メッセージ数が増えないため通常の length 監視では拾えないので、専用に末尾へ戻す。
+  useEffect(() => {
+    if (!scrollAfterPendingConfirmRef.current) return;
+    scrollAfterPendingConfirmRef.current = false;
+    scrollToBottom();
+  }, [pending.length, serverChat, scrollToBottom]);
 
   // 状態が変化(idle → busy 等)した時にも末尾追従。ユーザが下にいたなら、
   // 新しく現れた「考え中」インジケータが見える位置に揃える。
@@ -378,7 +393,7 @@ export function ChatView({
       setSending(false);
       inputRef.current?.focus();
     }
-  }, [input, sending, sessionName]);
+  }, [input, sending, sessionName, scrollToBottom]);
 
   // スマホ等のタッチデバイスでは Enter を送信に使わない (PC キーボードと違い
   // ソフトキーボードでは改行入力に Enter を使うのが自然)。pointer: coarse で
