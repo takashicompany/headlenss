@@ -53,7 +53,9 @@ codexRouter.post('/hooks/codex/user-prompt-submit', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as CodexHookPayload;
   const tmuxName = await getTmuxName(c);
   if (!tmuxName) return emptyHookResponse(c);
-  if (!store.getSession(tmuxName)) upsertCodexSession(tmuxName, c, body);
+  // Always upsert (not lazy-create) so that source flips to 'codex'
+  // when the user switches from Claude to Codex in the same pane.
+  upsertCodexSession(tmuxName, c, body);
   store.clearStopped(tmuxName);
   const text = (body.prompt ?? '').trim();
   console.log('[codex-hook] user-prompt tmux=' + tmuxName + ' len=' + text.length);
@@ -67,7 +69,7 @@ codexRouter.post('/hooks/codex/stop', async (c) => {
   const tmuxName = await getTmuxName(c);
   console.log('[codex-hook] stop tmux=' + tmuxName + ' transcript=' + (body.transcript_path ?? '').slice(-40));
   if (!tmuxName) return emptyHookResponse(c);
-  if (!store.getSession(tmuxName)) upsertCodexSession(tmuxName, c, body);
+  upsertCodexSession(tmuxName, c, body);
   const transcriptPath = body.transcript_path ?? '';
   if (transcriptPath) {
     const text = await extractLastCodexAssistantText(transcriptPath);
@@ -83,7 +85,7 @@ codexRouter.post('/hooks/codex/post-tool-use', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as CodexHookPayload;
   const tmuxName = await getTmuxName(c);
   if (!tmuxName) return emptyHookResponse(c);
-  if (!store.getSession(tmuxName)) upsertCodexSession(tmuxName, c, body);
+  upsertCodexSession(tmuxName, c, body);
   store.clearPending(tmuxName);
   return emptyHookResponse(c);
 });
@@ -91,7 +93,7 @@ codexRouter.post('/hooks/codex/post-tool-use', async (c) => {
 codexRouter.post('/hooks/codex/pre-tool-use', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as CodexHookPayload;
   const tmuxName = await getTmuxName(c);
-  if (tmuxName && !store.getSession(tmuxName)) upsertCodexSession(tmuxName, c, body);
+  if (tmuxName) upsertCodexSession(tmuxName, c, body);
   // Codex PreToolUse is a policy hook. headlenss only needs approvals/questions,
   // so allow Codex to continue to its normal PermissionRequest flow.
   return emptyHookResponse(c);
@@ -103,7 +105,7 @@ codexRouter.post('/hooks/codex/permission-request', async (c) => {
   const toolName = body.tool_name ?? '';
   console.log('[codex-hook] permission-request tmux=' + tmuxName + ' tool=' + toolName);
   if (!tmuxName) return emptyHookResponse(c);
-  if (!store.getSession(tmuxName)) upsertCodexSession(tmuxName, c, body);
+  upsertCodexSession(tmuxName, c, body);
 
   store.createPending(tmuxName, {
     kind: 'permission',

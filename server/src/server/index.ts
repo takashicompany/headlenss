@@ -294,11 +294,21 @@ app.post('/api/sessions/:name/input', async (c) => {
   try {
     const tracked = claudeStore.getSession(name);
     const pane = body.submit === true ? await captureOutput(name, 120).catch(() => '') : '';
-    const isCodex = body.submit === true && (
-      tracked?.source === 'codex' ||
-      /\bOpenAI Codex\b|\bCodex CLI\b|approval policy|Auto Review/i.test(pane) ||
-      (await detectCodexSessions()).some((session) => session.tmuxSessionName === name)
-    );
+    // Trust the session label when set; fall back to text heuristics only
+    // when no agent has claimed the session yet.
+    let isCodex: boolean;
+    if (body.submit !== true) {
+      isCodex = false;
+    } else if (tracked?.source === 'claude') {
+      isCodex = false;
+    } else if (tracked?.source === 'codex') {
+      isCodex = true;
+    } else {
+      isCodex = (
+        /\bOpenAI Codex\b|\bCodex CLI\b|approval policy|Auto Review/i.test(pane) ||
+        (await detectCodexSessions()).some((session) => session.tmuxSessionName === name)
+      );
+    }
     if (body.submit === true && isCodex) {
       const visiblePaneTail = pane.slice(-3000);
       const shouldQueueInCodex = /esc to interrupt/i.test(visiblePaneTail);
