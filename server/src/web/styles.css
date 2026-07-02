@@ -482,6 +482,15 @@ button {
   opacity: 0.6;
 }
 
+/* origin=external: スケジュール実行等の外部注入メッセージ。控えめに表示して
+   ユーザ自身の入力と視覚的に区別する。 */
+.chat-msg-external .chat-msg-bubble {
+  opacity: 0.7;
+}
+.chat-msg-external .chat-msg-role {
+  color: var(--muted);
+}
+
 /* Claude の動作状態インジケータ (busy / waiting-permission / waiting-question)。
    chat 末尾に控えめに表示して、別タブからも作業中か idle か分かるようにする。 */
 .chat-status {

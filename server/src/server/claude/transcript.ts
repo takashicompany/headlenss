@@ -87,7 +87,7 @@ function isNonMainAgentTranscriptEntry(parsed: TranscriptLine, text: string): bo
 export async function extractChatFromTranscript(
   transcriptPath: string,
   limit = 200,
-): Promise<Array<{ role: 'user' | 'assistant'; text: string; ts: number }>> {
+): Promise<Array<{ role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' }>> {
   if (!transcriptPath) return [];
   let raw: string;
   try {
@@ -95,7 +95,7 @@ export async function extractChatFromTranscript(
   } catch {
     return [];
   }
-  const items: Array<{ role: 'user' | 'assistant'; text: string; ts: number }> = [];
+  const items: Array<{ role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' }> = [];
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
     let parsed: TranscriptLine & { isSidechain?: boolean; timestamp?: string };
@@ -135,7 +135,14 @@ export async function extractChatFromTranscript(
     const cleaned = sanitizeChatText(text);
     if (!cleaned) continue;
     const ts = parsed.timestamp ? Date.parse(parsed.timestamp) : Date.now();
-    items.push({ role: role as 'user' | 'assistant', text: cleaned, ts: Number.isFinite(ts) ? ts : Date.now() });
+    const item: { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' } = {
+      role: role as 'user' | 'assistant',
+      text: cleaned,
+      ts: Number.isFinite(ts) ? ts : Date.now(),
+    };
+    // transcript 由来の assistant メッセージには agent: 'claude' を設定
+    if (role === 'assistant') item.agent = 'claude';
+    items.push(item);
   }
   return items.slice(-limit);
 }

@@ -70,7 +70,7 @@ function extractMessage(line: CodexTranscriptLine): { role: 'user' | 'assistant'
 export async function extractCodexChatFromTranscript(
   transcriptPath: string,
   limit = 200,
-): Promise<Array<{ role: 'user' | 'assistant'; text: string; ts: number }>> {
+): Promise<Array<{ role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' }>> {
   if (!transcriptPath) return [];
   let raw: string;
   try {
@@ -78,7 +78,7 @@ export async function extractCodexChatFromTranscript(
   } catch {
     return [];
   }
-  const items: Array<{ role: 'user' | 'assistant'; text: string; ts: number }> = [];
+  const items: Array<{ role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' }> = [];
   const seen = new Set<string>();
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
@@ -94,7 +94,13 @@ export async function extractCodexChatFromTranscript(
     if (seen.has(key)) continue;
     seen.add(key);
     const ts = parsed.timestamp ? Date.parse(parsed.timestamp) : Date.now();
-    items.push({ ...msg, ts: Number.isFinite(ts) ? ts : Date.now() });
+    const item: { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' } = {
+      ...msg,
+      ts: Number.isFinite(ts) ? ts : Date.now(),
+    };
+    // transcript 由来の assistant メッセージには agent: 'codex' を設定
+    if (msg.role === 'assistant') item.agent = 'codex';
+    items.push(item);
   }
   return items.slice(-limit);
 }

@@ -10,7 +10,7 @@ import { extractImagesFromClipboard, filterImageFiles, uploadImage } from '../up
 import { useLanguage } from '../i18n.tsx';
 
 type Mode = 'tmux' | 'chat';
-type ChatMessage = { role: 'user' | 'assistant'; text: string; ts: number; synthetic?: boolean };
+type ChatMessage = { role: 'user' | 'assistant'; text: string; ts: number; synthetic?: boolean; origin?: 'ui' | 'external'; agent?: 'claude' | 'codex' };
 type SessionStatus = 'idle' | 'busy' | 'waiting-permission' | 'waiting-question';
 const INITIAL_VISIBLE_MESSAGES = 20;
 const VISIBLE_MESSAGES_STEP = 20;
@@ -57,7 +57,9 @@ function sameChatMessages(a: ChatMessage[], b: ChatMessage[]): boolean {
       a[i].role !== b[i].role ||
       a[i].text !== b[i].text ||
       a[i].ts !== b[i].ts ||
-      a[i].synthetic !== b[i].synthetic
+      a[i].synthetic !== b[i].synthetic ||
+      a[i].origin !== b[i].origin ||
+      a[i].agent !== b[i].agent
     ) {
       return false;
     }
@@ -95,16 +97,30 @@ const markdownComponents: Components = {
 const ChatMessageItem = React.memo(function ChatMessageItem({
   message,
   isPending,
+  t,
 }: {
   message: ChatMessage;
   isPending: boolean;
+  t: (key: import('../i18n.tsx').StringKey) => string;
 }) {
   const renderedText = useMemo(() => inlineUploadedImages(message.text), [message.text]);
+  const isExternal = message.role === 'user' && message.origin === 'external';
+
+  // ラベル: user = 'YOU' / 'EXTERNAL'(外部入力)、assistant = agent 名 / 'Agent'(fallback)
+  let roleLabel: string;
+  if (message.role === 'user') {
+    roleLabel = isExternal ? t('originExternal') : 'YOU';
+  } else {
+    roleLabel = message.agent === 'claude' ? 'Claude'
+              : message.agent === 'codex' ? 'Codex'
+              : 'Agent';
+  }
+
   return (
     <div
-      className={`chat-msg chat-msg-${message.role}${isPending ? ' chat-msg-pending' : ''}`}
+      className={`chat-msg chat-msg-${message.role}${isPending ? ' chat-msg-pending' : ''}${isExternal ? ' chat-msg-external' : ''}`}
     >
-      <div className="chat-msg-role">{message.role === 'user' ? 'YOU' : 'Agent'}</div>
+      <div className="chat-msg-role">{roleLabel}</div>
       <div className="chat-msg-bubble markdown-body">
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkBreaks]}
@@ -644,6 +660,7 @@ export function ChatView({
                   key={m.role + ':' + m.ts + ':' + globalIndex + ':' + m.text.slice(0, 32)}
                   message={m}
                   isPending={isPending}
+                  t={t}
                 />
               );
             })}

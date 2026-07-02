@@ -41,6 +41,9 @@ const STRINGS = {
   moveUp:                 { en: 'Move up', ja: '上へ移動' },
   moveDown:               { en: 'Move down', ja: '下へ移動' },
 
+  // ── ChatView: origin / agent labels ──
+  originExternal:         { en: 'EXTERNAL', ja: '外部入力' },
+
   // ── ChatView: status / empty ──
   statusBusy:             { en: 'Agent is thinking', ja: 'エージェントが考えています' },
   statusWaitingPermission:{ en: 'Agent is waiting for permission', ja: 'エージェントが許可を待っています' },

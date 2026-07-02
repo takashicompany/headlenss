@@ -13,6 +13,7 @@ import { captureOutput } from '../tmux.ts';
 import { extractChatFromTranscript, extractLastAssistantText, sanitizeChatText } from './transcript.ts';
 import { extractCodexChatFromTranscript } from '../codex/transcript.ts';
 import { detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
+import { matchUiSubmission } from '../uiSubmissions.ts';
 import type { AskQuestion, HookDecision, RespondInput, SessionStatus } from './types.ts';
 
 const exec = promisify(execFile);
@@ -167,7 +168,10 @@ claudeRouter.post('/hooks/user-prompt-submit', async (c) => {
   store.clearStopped(tmuxName);
   const text = (body.prompt ?? '').trim();
   console.log(`[hook] user-prompt tmux=${tmuxName} len=${text.length}`);
-  if (text) store.appendChat(tmuxName, 'user', text);
+  if (text) {
+    const origin = matchUiSubmission(tmuxName, text) ? 'ui' as const : 'external' as const;
+    store.appendChat(tmuxName, 'user', text, { origin });
+  }
   return c.json({});
 });
 
@@ -206,7 +210,7 @@ claudeRouter.post('/hooks/stop', async (c) => {
   if (transcriptPath) {
     const text = await extractLastAssistantText(transcriptPath);
     console.log(`[hook] stop -> assistant text len=${text.length}`);
-    if (text) store.appendChat(tmuxName, 'assistant', text);
+    if (text) store.appendChat(tmuxName, 'assistant', text, { agent: 'claude' });
   }
   // ターン終了マーカーを立てる: registry の busy が idle に追いつくまでの
   // ラグの間、考え中インジケータをこちらで先に消す。
@@ -617,7 +621,8 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   // transcript を読んで履歴を補完 (hook では取りこぼす過去分も拾える)。
   // Claude は registry から transcript path を推定し、Codex は hook payload の
   // transcript_path をセッションに保存して使う。
-  let transcriptChat: Array<{ role: 'user' | 'assistant'; text: string; ts: number; synthetic?: boolean }> = [];
+  type MergedChatItem = { role: 'user' | 'assistant'; text: string; ts: number; synthetic?: boolean; origin?: 'ui' | 'external'; agent?: 'claude' | 'codex' };
+  let transcriptChat: MergedChatItem[] = [];
   if (session?.source === 'codex' && session.transcriptPath && existsSync(session.transcriptPath)) {
     transcriptChat = await extractCodexChatFromTranscript(session.transcriptPath, 200);
   } else if (det && det.cwd && det.ccSessionId) {
@@ -629,19 +634,45 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
 
   // hook 由来の chat も transcript と同じシステムタグサニタイズを通す
   // (! 付きで実行された bash コマンド等のラッパが残らないように)。
-  const cleanedHookChat = (session?.source === 'codex' && transcriptChat.length > 0 ? [] : hookChat)
+  // サニタイズ済み hookChat (全件)。enrichment 用の lookup は常にこれから作る。
+  const allCleanedHookChat = hookChat
     .map((m) => ({ ...m, text: sanitizeChatText(m.text) }))
     .filter((m) => m.text.length > 0);
+  // マージ用: Codex で transcript がある場合は hookChat を重複源として空にしていたが、
+  // origin / agent のメタデータ enrichment と、transcript に無い項目の補完は必要。
+  const cleanedHookChat = session?.source === 'codex' && transcriptChat.length > 0 ? [] : allCleanedHookChat;
+
+  // hookChat の origin / agent を role:text キーで引けるルックアップを作成。
+  // transcript 側のエントリが重複排除で勝つ際に、hook 側の origin / agent を引き継ぐ。
+  // Codex でも全件から構築する (cleanedHookChat が空でも enrichment は有効にする)。
+  const hookLookup = new Map<string, { origin?: 'ui' | 'external'; agent?: 'claude' | 'codex' }>();
+  for (const m of allCleanedHookChat) {
+    const key = `${m.role}:${m.text}`;
+    if (m.origin || m.agent) hookLookup.set(key, { origin: m.origin, agent: m.agent });
+  }
 
   // hook の最新分が transcript から漏れてる可能性に備えてマージ。
   // transcript を base にして、hook側の項目を text 一致で重複排除。
   // 最後に ts でソート: AskUserQuestion 回答の合成 user メッセージなど、
   // transcript に存在しないが時系列上は中間に位置する項目を正しい位置に置くため。
+  // transcript 側エントリに hookChat の origin / agent を引き継ぐ (enrich)。
   const seen = new Set(transcriptChat.map((m) => `${m.role}:${m.text}`));
-  const merged: Array<{ role: 'user' | 'assistant'; text: string; ts: number; synthetic?: boolean }> = [...transcriptChat];
-  for (const m of cleanedHookChat) {
+  const merged: MergedChatItem[] = transcriptChat.map((m) => {
     const key = `${m.role}:${m.text}`;
-    if (!seen.has(key)) merged.push(m);
+    const enrichment = hookLookup.get(key);
+    if (enrichment) {
+      return { ...m, origin: enrichment.origin ?? m.origin, agent: enrichment.agent ?? m.agent };
+    }
+    return m;
+  });
+  // hookChat から transcript に無いエントリを追加。allCleanedHookChat を使って
+  // Codex セッション (cleanedHookChat が空) でも transcript に無い項目を拾う。
+  for (const m of allCleanedHookChat) {
+    const key = `${m.role}:${m.text}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      merged.push(m);
+    }
   }
   merged.sort((a, b) => a.ts - b.ts);
 
@@ -760,7 +791,7 @@ claudeRouter.post('/claude/sessions/:tmuxName/respond', async (c) => {
         }
         return `${head}${a.question}\n${line}`.trim();
       });
-      store.appendChat(tmuxName, 'user', summaryLines.join('\n\n'));
+      store.appendChat(tmuxName, 'user', summaryLines.join('\n\n'), { origin: 'ui' });
       // pending を即 clear(楽観的)、watcher も止める
       store.clearPending(tmuxName);
       tuiWatchers.get(tmuxName)?.cancel();
