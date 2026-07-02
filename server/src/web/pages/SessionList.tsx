@@ -23,6 +23,7 @@ type Session = {
   agent?: 'claude' | 'codex';
   codexHookHealth?: CodexHookHealth;
   codexNeedsHookAttention?: boolean;
+  lastChat?: { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' };
 };
 
 const STARRED_STORAGE_KEY = 'headlenss_starred_sessions';
@@ -82,6 +83,15 @@ function saveManualOrder(enabled: boolean): void {
 
 function agentLabel(agent: Session['agent']): string {
   switch (agent) {
+    case 'claude': return 'Claude';
+    case 'codex': return 'Codex';
+    default: return 'Agent';
+  }
+}
+
+function lastChatLabel(lc: NonNullable<Session['lastChat']>): string {
+  if (lc.role === 'user') return 'YOU';
+  switch (lc.agent) {
     case 'claude': return 'Claude';
     case 'codex': return 'Codex';
     default: return 'Agent';
@@ -393,6 +403,11 @@ export function SessionList({ onOpen, headerMetrics }: { onOpen: (name: string) 
                     {agentOnly && <span className="agent-indicator"> • {agentOnly}</span>}
                     {codexHookLabel && <span className="codex-hook-warning"> • {codexHookLabel}</span>}
                   </span>
+                  {s.lastChat && (
+                    <span className="session-last-chat">
+                      {lastChatLabel(s.lastChat)}: {s.lastChat.text}
+                    </span>
+                  )}
                 </button>
                 <button className="session-action" onClick={() => rename(s.name)} aria-label={t('renameSession')} title={t('renameSession')}>
                   ✎

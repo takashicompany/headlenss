@@ -178,6 +178,16 @@ button {
   margin-top: 0.2rem;
 }
 
+.session-last-chat {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-top: 0.15rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .cc-indicator {
   color: var(--accent);
   font-weight: 500;
