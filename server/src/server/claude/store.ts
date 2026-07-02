@@ -7,6 +7,7 @@ import type {
   Pending,
   SessionStatus,
 } from './types.ts';
+import { clearUiSubmissions } from '../uiSubmissions.ts';
 
 const sessions = new Map<string, ClaudeSession>();
 const pendingResolvers = new Map<string, (decision: HookDecision) => void>();
@@ -65,6 +66,7 @@ export function removeSession(tmuxName: string): void {
     }
   }
   sessions.delete(tmuxName);
+  clearUiSubmissions(tmuxName);
 }
 
 export function appendChat(

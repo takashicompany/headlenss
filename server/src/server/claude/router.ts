@@ -14,7 +14,7 @@ import { extractChatFromTranscript, extractLastAssistantText, sanitizeChatText }
 import { extractCodexChatFromTranscript } from '../codex/transcript.ts';
 import { detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
 import { matchUiSubmission } from '../uiSubmissions.ts';
-import type { AskQuestion, HookDecision, RespondInput, SessionStatus } from './types.ts';
+import type { AskQuestion, ChatItem, HookDecision, RespondInput, SessionStatus } from './types.ts';
 
 const exec = promisify(execFile);
 
@@ -621,8 +621,7 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   // transcript を読んで履歴を補完 (hook では取りこぼす過去分も拾える)。
   // Claude は registry から transcript path を推定し、Codex は hook payload の
   // transcript_path をセッションに保存して使う。
-  type MergedChatItem = { role: 'user' | 'assistant'; text: string; ts: number; synthetic?: boolean; origin?: 'ui' | 'external'; agent?: 'claude' | 'codex' };
-  let transcriptChat: MergedChatItem[] = [];
+  let transcriptChat: ChatItem[] = [];
   if (session?.source === 'codex' && session.transcriptPath && existsSync(session.transcriptPath)) {
     transcriptChat = await extractCodexChatFromTranscript(session.transcriptPath, 200);
   } else if (det && det.cwd && det.ccSessionId) {
@@ -638,8 +637,8 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   const allCleanedHookChat = hookChat
     .map((m) => ({ ...m, text: sanitizeChatText(m.text) }))
     .filter((m) => m.text.length > 0);
-  // マージ用: Codex で transcript がある場合は hookChat を重複源として空にしていたが、
-  // origin / agent のメタデータ enrichment と、transcript に無い項目の補完は必要。
+  // 補完は cleanedHookChat から (Codex+transcript は従来どおり全捨て)、
+  // enrichment だけは全 hookChat から行う。
   const cleanedHookChat = session?.source === 'codex' && transcriptChat.length > 0 ? [] : allCleanedHookChat;
 
   // hookChat の origin / agent を role:text キーで引けるルックアップを作成。
@@ -657,17 +656,17 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   // transcript に存在しないが時系列上は中間に位置する項目を正しい位置に置くため。
   // transcript 側エントリに hookChat の origin / agent を引き継ぐ (enrich)。
   const seen = new Set(transcriptChat.map((m) => `${m.role}:${m.text}`));
-  const merged: MergedChatItem[] = transcriptChat.map((m) => {
+  const merged: ChatItem[] = transcriptChat.map((m) => {
     const key = `${m.role}:${m.text}`;
     const enrichment = hookLookup.get(key);
     if (enrichment) {
+      // hook 側の値が優先される (transcript は origin/agent を持たないため)
       return { ...m, origin: enrichment.origin ?? m.origin, agent: enrichment.agent ?? m.agent };
     }
     return m;
   });
-  // hookChat から transcript に無いエントリを追加。allCleanedHookChat を使って
-  // Codex セッション (cleanedHookChat が空) でも transcript に無い項目を拾う。
-  for (const m of allCleanedHookChat) {
+  // hookChat のうち transcript に無いエントリで補完 (cleanedHookChat を使用)。
+  for (const m of cleanedHookChat) {
     const key = `${m.role}:${m.text}`;
     if (!seen.has(key)) {
       seen.add(key);
