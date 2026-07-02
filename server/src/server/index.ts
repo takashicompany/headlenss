@@ -114,7 +114,7 @@ function readSystemStatus(): {
 app.get('/api/system/status', (c) => c.json(readSystemStatus()));
 
 /** Extract the last non-synthetic chat entry for the session list preview. */
-function buildLastChat(tmuxName: string): { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' } | undefined {
+function buildLastChat(tmuxName: string): { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex'; origin?: 'ui' | 'external' } | undefined {
   const chat = claudeStore.getChat(tmuxName);
   for (let i = chat.length - 1; i >= 0; i--) {
     const item = chat[i];
@@ -122,12 +122,13 @@ function buildLastChat(tmuxName: string): { role: 'user' | 'assistant'; text: st
     let text = sanitizeChatText(item.text);
     text = text.replace(/\n/g, ' ');
     if (text.length > 80) text = text.slice(0, 80) + '…';
-    const entry: { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' } = {
+    const entry: { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex'; origin?: 'ui' | 'external' } = {
       role: item.role,
       text,
       ts: item.ts,
     };
     if (item.agent) entry.agent = item.agent;
+    if (item.origin) entry.origin = item.origin;
     return entry;
   }
   return undefined;

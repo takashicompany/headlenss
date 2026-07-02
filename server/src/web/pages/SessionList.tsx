@@ -23,7 +23,7 @@ type Session = {
   agent?: 'claude' | 'codex';
   codexHookHealth?: CodexHookHealth;
   codexNeedsHookAttention?: boolean;
-  lastChat?: { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' };
+  lastChat?: { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex'; origin?: 'ui' | 'external' };
 };
 
 const STARRED_STORAGE_KEY = 'headlenss_starred_sessions';
@@ -89,8 +89,8 @@ function agentLabel(agent: Session['agent']): string {
   }
 }
 
-function lastChatLabel(lc: NonNullable<Session['lastChat']>): string {
-  if (lc.role === 'user') return 'YOU';
+function lastChatLabel(lc: NonNullable<Session['lastChat']>, t: (key: StringKey) => string): string {
+  if (lc.role === 'user') return lc.origin === 'external' ? t('originExternal') : 'YOU';
   switch (lc.agent) {
     case 'claude': return 'Claude';
     case 'codex': return 'Codex';
@@ -405,7 +405,7 @@ export function SessionList({ onOpen, headerMetrics }: { onOpen: (name: string) 
                   </span>
                   {s.lastChat && (
                     <span className="session-last-chat">
-                      {lastChatLabel(s.lastChat)}: {s.lastChat.text}
+                      {lastChatLabel(s.lastChat, t)}: {s.lastChat.text}
                     </span>
                   )}
                 </button>
