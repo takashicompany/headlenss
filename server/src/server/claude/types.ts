@@ -7,6 +7,12 @@ export type ChatItem = {
   /** サーバ側で動的に注入した「合成メッセージ」(transcript には永続化されない、
    *  状態通知用などに使われる)。クライアントは true なら表示有無を選べる。 */
   synthetic?: boolean;
+  /** user メッセージの出自: 'ui' = HeadLenss Web UI から送信、
+   *  'external' = スケジュール実行等の外部注入。undefined = 不明 (transcript 由来等)。 */
+  origin?: 'ui' | 'external';
+  /** メッセージを生成したエージェント: 'claude' | 'codex'。
+   *  assistant メッセージの識別に主に使い、UI でラベル表示する。 */
+  agent?: 'claude' | 'codex';
 };
 
 export type SessionStatus = 'idle' | 'busy' | 'waiting-permission' | 'waiting-question';

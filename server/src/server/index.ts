@@ -18,6 +18,7 @@ import { detectCodexSessions, getCodexHookHealth } from './codex/status.ts';
 import { detectClaudeSessions } from './claude/process-detect.ts';
 import * as claudeStore from './claude/store.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot } from './persist.ts';
+import { recordUiSubmission } from './uiSubmissions.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -308,6 +309,10 @@ app.post('/api/sessions/:name/input', async (c) => {
         /\bOpenAI Codex\b|\bCodex CLI\b|approval policy|Auto Review/i.test(pane) ||
         (await detectCodexSessions()).some((session) => session.tmuxSessionName === name)
       );
+    }
+    // UI 送信を記録: 後続の user-prompt-submit hook で origin 判定に使う
+    if (body.submit === true && body.text.trim()) {
+      recordUiSubmission(name, body.text);
     }
     if (body.submit === true && isCodex) {
       const visiblePaneTail = pane.slice(-3000);

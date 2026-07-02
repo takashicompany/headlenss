@@ -3,6 +3,7 @@ import type { Context } from 'hono';
 import { resolveTmuxSessionName } from '../claude/tmux-resolver.ts';
 import * as store from '../claude/store.ts';
 import { extractLastCodexAssistantText } from './transcript.ts';
+import { matchUiSubmission } from '../uiSubmissions.ts';
 
 export const codexRouter = new Hono();
 
@@ -59,7 +60,10 @@ codexRouter.post('/hooks/codex/user-prompt-submit', async (c) => {
   store.clearStopped(tmuxName);
   const text = (body.prompt ?? '').trim();
   console.log('[codex-hook] user-prompt tmux=' + tmuxName + ' len=' + text.length);
-  if (text) store.appendChat(tmuxName, 'user', text);
+  if (text) {
+    const origin = matchUiSubmission(tmuxName, text) ? 'ui' as const : 'external' as const;
+    store.appendChat(tmuxName, 'user', text, { origin });
+  }
   store.setStatus(tmuxName, 'busy');
   return emptyHookResponse(c);
 });
@@ -73,7 +77,7 @@ codexRouter.post('/hooks/codex/stop', async (c) => {
   const transcriptPath = body.transcript_path ?? '';
   if (transcriptPath) {
     const text = await extractLastCodexAssistantText(transcriptPath);
-    if (text) store.appendChat(tmuxName, 'assistant', text);
+    if (text) store.appendChat(tmuxName, 'assistant', text, { agent: 'codex' });
   }
   store.markStopped(tmuxName);
   store.clearPending(tmuxName);

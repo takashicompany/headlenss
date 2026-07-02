@@ -7,6 +7,7 @@ import type {
   Pending,
   SessionStatus,
 } from './types.ts';
+import { clearUiSubmissions } from '../uiSubmissions.ts';
 
 const sessions = new Map<string, ClaudeSession>();
 const pendingResolvers = new Map<string, (decision: HookDecision) => void>();
@@ -65,13 +66,22 @@ export function removeSession(tmuxName: string): void {
     }
   }
   sessions.delete(tmuxName);
+  clearUiSubmissions(tmuxName);
 }
 
-export function appendChat(tmuxName: string, role: ChatRole, text: string): void {
+export function appendChat(
+  tmuxName: string,
+  role: ChatRole,
+  text: string,
+  opts?: { origin?: 'ui' | 'external'; agent?: 'claude' | 'codex' },
+): void {
   const s = sessions.get(tmuxName);
   if (!s) return;
   if (!text.trim()) return;
-  s.chat.push({ role, text, ts: Date.now() });
+  const item: ChatItem = { role, text, ts: Date.now() };
+  if (opts?.origin) item.origin = opts.origin;
+  if (opts?.agent) item.agent = opts.agent;
+  s.chat.push(item);
   s.lastSeenAt = Date.now();
   // Cap chat history to last 200 items to keep memory bounded
   if (s.chat.length > 200) s.chat.splice(0, s.chat.length - 200);
