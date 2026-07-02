@@ -17,6 +17,27 @@ import type { AskQuestion, HookDecision, RespondInput, SessionStatus } from './t
 
 const exec = promisify(execFile);
 
+/**
+ * tmux pane のフォアグラウンドコマンドが codex かどうかを判定する。
+ * Codex TUI が pane を所有している間に Claude がサブプロセスとして起動された
+ * (例: `claude -p ...`) 場合、pane_current_command は依然 codex を示す。
+ * ユーザが Codex を終了して Claude を起動した場合は claude/node 等になる。
+ * エラー時は false を返す (録画漏れ回避: 迷ったら会話を記録する側に倒す)。
+ */
+async function isCodexForegroundInPane(tmuxNameOrPane: string): Promise<boolean> {
+  try {
+    const { stdout } = await exec('tmux', [
+      'display-message',
+      '-p',
+      '-t', tmuxNameOrPane,
+      '#{pane_current_command}',
+    ]);
+    return /\bcodex\b/i.test(stdout);
+  } catch {
+    return false;
+  }
+}
+
 /** 現在 tmux server 上に存在しているセッション名集合を返す */
 async function liveTmuxSessionNames(): Promise<Set<string>> {
   try {
@@ -79,13 +100,24 @@ type HookPayload = {
 claudeRouter.post('/hooks/session-start', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as HookPayload;
   const tmuxName = await getTmuxName(c);
+  const paneId = c.req.header('X-Tmux-Pane') ?? '';
   console.log(`[hook] session-start tmux=${tmuxName} src=${body.source ?? ''}`);
   if (!tmuxName) return c.json({});
+  const existing = store.getSession(tmuxName);
+  if (existing?.source === 'codex') {
+    if (await isCodexForegroundInPane(paneId || tmuxName)) {
+      // Codex TUI still owns the pane — this is a subprocess Claude; skip.
+      return c.json({});
+    }
+  }
+  // Always upsert (not lazy-create) so that source flips to 'claude'
+  // when the user switches from Codex to Claude in the same pane.
   store.upsertSession({
     ccSessionId: body.session_id ?? '',
-    tmuxPane: c.req.header('X-Tmux-Pane') ?? '',
+    tmuxPane: paneId,
     tmuxSessionName: tmuxName,
     cwd: body.cwd ?? '',
+    source: 'claude',
   });
   return c.json({});
 });
@@ -103,21 +135,33 @@ claudeRouter.post('/hooks/session-end', async (c) => {
 claudeRouter.post('/hooks/user-prompt-submit', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as HookPayload;
   const tmuxName = await getTmuxName(c);
+  const paneId = c.req.header('X-Tmux-Pane') ?? '';
   if (!tmuxName) return c.json({});
   // Lazy-create the session if SessionStart hook never fired
   if (!store.getSession(tmuxName)) {
     store.upsertSession({
       ccSessionId: body.session_id ?? '',
-      tmuxPane: c.req.header('X-Tmux-Pane') ?? '',
+      tmuxPane: paneId,
       tmuxSessionName: tmuxName,
       cwd: body.cwd ?? '',
+      source: 'claude',
     });
   }
   const existing = store.getSession(tmuxName);
   if (existing?.source === 'codex') {
-    // Codex セッション内で検証用に起動した Claude CLI などの hook は、
-    // メイン Codex 会話ではないため chat 履歴には混ぜない。
-    return c.json({});
+    if (await isCodexForegroundInPane(paneId || tmuxName)) {
+      // Codex TUI still owns the pane: this Claude hook is from a subprocess
+      // spawned by Codex (e.g. claude -p) — keep it out of the main chat.
+      return c.json({});
+    }
+    // The user switched this pane from Codex to Claude — reclaim the session.
+    store.upsertSession({
+      ccSessionId: body.session_id ?? '',
+      tmuxPane: paneId,
+      tmuxSessionName: tmuxName,
+      cwd: body.cwd ?? '',
+      source: 'claude',
+    });
   }
   // 新しいターンが始まる: 前ターンの Stop マーカーをクリア
   store.clearStopped(tmuxName);
@@ -130,20 +174,33 @@ claudeRouter.post('/hooks/user-prompt-submit', async (c) => {
 claudeRouter.post('/hooks/stop', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as HookPayload;
   const tmuxName = await getTmuxName(c);
+  const paneId = c.req.header('X-Tmux-Pane') ?? '';
   console.log(`[hook] stop tmux=${tmuxName} transcript=${(body.transcript_path ?? '').slice(-40)}`);
   if (!tmuxName) return c.json({});
   if (!store.getSession(tmuxName)) {
     store.upsertSession({
       ccSessionId: body.session_id ?? '',
-      tmuxPane: c.req.header('X-Tmux-Pane') ?? '',
+      tmuxPane: paneId,
       tmuxSessionName: tmuxName,
       cwd: body.cwd ?? '',
+      source: 'claude',
     });
   }
   const existing = store.getSession(tmuxName);
   if (existing?.source === 'codex') {
-    // Codex セッション内で起動した別 Claude の stop hook はメイン会話ではない。
-    return c.json({});
+    if (await isCodexForegroundInPane(paneId || tmuxName)) {
+      // Codex TUI still owns the pane: this Claude hook is from a subprocess
+      // spawned by Codex (e.g. claude -p) — keep it out of the main chat.
+      return c.json({});
+    }
+    // The user switched this pane from Codex to Claude — reclaim the session.
+    store.upsertSession({
+      ccSessionId: body.session_id ?? '',
+      tmuxPane: paneId,
+      tmuxSessionName: tmuxName,
+      cwd: body.cwd ?? '',
+      source: 'claude',
+    });
   }
   const transcriptPath = body.transcript_path ?? '';
   if (transcriptPath) {
@@ -167,6 +224,7 @@ claudeRouter.post('/hooks/pre-tool-use', async (c) => {
     tool_use_id?: string;
   };
   const tmuxName = await getTmuxName(c);
+  const paneId = c.req.header('X-Tmux-Pane') ?? '';
   const toolName = body.tool_name ?? '';
   const toolInput = (body.tool_input ?? {}) as { questions?: AskQuestion[] };
   const isAskQ = toolName === 'AskUserQuestion' && Array.isArray(toolInput.questions);
@@ -175,9 +233,23 @@ claudeRouter.post('/hooks/pre-tool-use', async (c) => {
   if (!store.getSession(tmuxName)) {
     store.upsertSession({
       ccSessionId: body.session_id ?? '',
-      tmuxPane: c.req.header('X-Tmux-Pane') ?? '',
+      tmuxPane: paneId,
       tmuxSessionName: tmuxName,
       cwd: body.cwd ?? '',
+      source: 'claude',
+    });
+  }
+  const existing = store.getSession(tmuxName);
+  if (existing?.source === 'codex') {
+    if (await isCodexForegroundInPane(paneId || tmuxName)) {
+      return c.json({});
+    }
+    store.upsertSession({
+      ccSessionId: body.session_id ?? '',
+      tmuxPane: paneId,
+      tmuxSessionName: tmuxName,
+      cwd: body.cwd ?? '',
+      source: 'claude',
     });
   }
 
@@ -382,6 +454,7 @@ function startTuiAnswerWatcher(tmuxName: string, toolUseId: string, transcriptPa
 claudeRouter.post('/hooks/permission-request', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as HookPayload;
   const tmuxName = await getTmuxName(c);
+  const paneId = c.req.header('X-Tmux-Pane') ?? '';
   const toolName = body.tool_name ?? '';
   console.log(`[hook] permission-request tmux=${tmuxName} tool=${toolName} hasQs=${Array.isArray((body.tool_input as { questions?: unknown })?.questions)}`);
   if (!tmuxName) return c.json({});
@@ -391,9 +464,23 @@ claudeRouter.post('/hooks/permission-request', async (c) => {
   if (!store.getSession(tmuxName)) {
     store.upsertSession({
       ccSessionId: body.session_id ?? '',
-      tmuxPane: c.req.header('X-Tmux-Pane') ?? '',
+      tmuxPane: paneId,
       tmuxSessionName: tmuxName,
       cwd: body.cwd ?? '',
+      source: 'claude',
+    });
+  }
+  const existing = store.getSession(tmuxName);
+  if (existing?.source === 'codex') {
+    if (await isCodexForegroundInPane(paneId || tmuxName)) {
+      return c.json({});
+    }
+    store.upsertSession({
+      ccSessionId: body.session_id ?? '',
+      tmuxPane: paneId,
+      tmuxSessionName: tmuxName,
+      cwd: body.cwd ?? '',
+      source: 'claude',
     });
   }
 
