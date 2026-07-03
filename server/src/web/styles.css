@@ -186,6 +186,11 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* The parent .session-open is a column flex with align-items: flex-start,
+     so this element's width defaults to its intrinsic (nowrap) content width
+     and overflows the card.  max-width: 100% caps it to the button width so
+     that overflow + text-overflow can kick in. */
+  max-width: 100%;
 }
 
 .cc-indicator {
