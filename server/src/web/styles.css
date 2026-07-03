@@ -13,6 +13,13 @@
   box-sizing: border-box;
 }
 
+html {
+  /* iOS Safari の自動フォント拡大 (font boosting) を無効化。
+     幅制約のない長文テキストで意図しない拡大表示が起きるのを防ぐ。 */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
 html,
 body,
 #root {
