@@ -151,10 +151,16 @@ button {
 
 .session-list li {
   display: flex;
+  flex-direction: column;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 4px;
   overflow: hidden;
+}
+
+.session-row {
+  display: flex;
+  width: 100%;
 }
 
 .session-open {
@@ -187,17 +193,23 @@ button {
 
 .session-last-chat {
   display: block;
+  width: 100%;
   font-size: 0.72rem;
   color: var(--muted);
-  margin-top: 0.15rem;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  /* The parent .session-open is a column flex with align-items: flex-start,
-     so this element's width defaults to its intrinsic (nowrap) content width
-     and overflows the card.  max-width: 100% caps it to the button width so
-     that overflow + text-overflow can kick in. */
-  max-width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--border);
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+  box-sizing: border-box;
+}
+
+.session-last-chat:hover {
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .cc-indicator {
