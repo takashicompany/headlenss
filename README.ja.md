@@ -99,6 +99,8 @@ npm run service:install
 sudo loginctl enable-linger $USER   # ログアウト後も動かす場合のみ、初回1回
 ```
 
+> **アップグレード時の注意:** systemd unit が `npm start` を使っていた旧バージョンからの更新時は、`npm run service:install` を一度再実行してください。これにより `systemctl --user restart headlenss` でポートが正しく解放されるようになります。
+
 詳細(ASRバックエンド選択・APIリファレンス・systemd運用)は [server/README.md](./server/README.md) を参照。
 
 ### 2. Tailscale でPCにアクセスできるようにする
