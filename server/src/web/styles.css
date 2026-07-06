@@ -13,6 +13,13 @@
   box-sizing: border-box;
 }
 
+html {
+  /* iOS Safari の自動フォント拡大 (font boosting) を無効化。
+     幅制約のない長文テキストで意図しない拡大表示が起きるのを防ぐ。 */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
 html,
 body,
 #root {
@@ -144,10 +151,16 @@ button {
 
 .session-list li {
   display: flex;
+  flex-direction: column;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 4px;
   overflow: hidden;
+}
+
+.session-row {
+  display: flex;
+  width: 100%;
 }
 
 .session-open {
@@ -176,6 +189,27 @@ button {
   font-size: 0.8rem;
   color: var(--muted);
   margin-top: 0.2rem;
+}
+
+.session-last-chat {
+  display: block;
+  width: 100%;
+  font-size: 0.72rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--border);
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+  box-sizing: border-box;
+}
+
+.session-last-chat:hover {
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .cc-indicator {

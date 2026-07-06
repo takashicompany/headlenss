@@ -23,6 +23,7 @@ type Session = {
   agent?: 'claude' | 'codex';
   codexHookHealth?: CodexHookHealth;
   codexNeedsHookAttention?: boolean;
+  lastChat?: { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex'; origin?: 'ui' | 'external' };
 };
 
 const STARRED_STORAGE_KEY = 'headlenss_starred_sessions';
@@ -82,6 +83,15 @@ function saveManualOrder(enabled: boolean): void {
 
 function agentLabel(agent: Session['agent']): string {
   switch (agent) {
+    case 'claude': return 'Claude';
+    case 'codex': return 'Codex';
+    default: return 'Agent';
+  }
+}
+
+function lastChatLabel(lc: NonNullable<Session['lastChat']>, t: (key: StringKey) => string): string {
+  if (lc.role === 'user') return lc.origin === 'external' ? t('originExternal') : 'YOU';
+  switch (lc.agent) {
     case 'claude': return 'Claude';
     case 'codex': return 'Codex';
     default: return 'Agent';
@@ -371,38 +381,49 @@ export function SessionList({ onOpen, headerMetrics }: { onOpen: (name: string) 
             const isStarred = starred.has(s.name);
             return (
               <li key={s.name} className={s.released ? 'is-released' : undefined}>
-                {manualOrder && <div className="session-reorder">
-                  <button onClick={() => move(s.name, -1)} aria-label={t('moveUp')} title={t('moveUp')}>↑</button>
-                  <button onClick={() => move(s.name, 1)} aria-label={t('moveDown')} title={t('moveDown')}>↓</button>
-                </div>}
-                <button
-                  className={`session-star${isStarred ? ' is-starred' : ''}`}
-                  onClick={() => toggleStar(s.name)}
-                  aria-label={isStarred ? t('unstarSession') : t('starSession')}
-                  aria-pressed={isStarred}
-                >
-                  {isStarred ? '★' : '☆'}
-                </button>
-                <button className="session-open" onClick={() => open(s)}>
-                  <span className="session-name">{s.name}</span>
-                  <span className="session-meta">
-                    {s.windows} {t(s.windows === 1 ? 'windowUnit' : 'windowUnitPlural')}
-                    {s.attached && ` • ${t('attached')}`}
-                    {s.released && <span className="released-indicator"> • {t('releasedSession')}</span>}
-                    {cc && <span className={`cc-indicator cc-${status}`}> • {cc}</span>}
-                    {agentOnly && <span className="agent-indicator"> • {agentOnly}</span>}
-                    {codexHookLabel && <span className="codex-hook-warning"> • {codexHookLabel}</span>}
-                  </span>
-                </button>
-                <button className="session-action" onClick={() => rename(s.name)} aria-label={t('renameSession')} title={t('renameSession')}>
-                  ✎
-                </button>
-                {!s.released && <button className="session-action" onClick={() => release(s.name)} aria-label={t('releaseSession')} title={t('releaseSession')}>
-                  ⏏
-                </button>}
-                <button className="session-kill" onClick={() => remove(s.name)} aria-label={`delete ${s.name}`} title="Delete">
-                  ✕
-                </button>
+                <div className="session-row">
+                  {manualOrder && <div className="session-reorder">
+                    <button onClick={() => move(s.name, -1)} aria-label={t('moveUp')} title={t('moveUp')}>↑</button>
+                    <button onClick={() => move(s.name, 1)} aria-label={t('moveDown')} title={t('moveDown')}>↓</button>
+                  </div>}
+                  <button
+                    className={`session-star${isStarred ? ' is-starred' : ''}`}
+                    onClick={() => toggleStar(s.name)}
+                    aria-label={isStarred ? t('unstarSession') : t('starSession')}
+                    aria-pressed={isStarred}
+                  >
+                    {isStarred ? '★' : '☆'}
+                  </button>
+                  <button className="session-open" onClick={() => open(s)}>
+                    <span className="session-name">{s.name}</span>
+                    <span className="session-meta">
+                      {s.windows} {t(s.windows === 1 ? 'windowUnit' : 'windowUnitPlural')}
+                      {s.attached && ` • ${t('attached')}`}
+                      {s.released && <span className="released-indicator"> • {t('releasedSession')}</span>}
+                      {cc && <span className={`cc-indicator cc-${status}`}> • {cc}</span>}
+                      {agentOnly && <span className="agent-indicator"> • {agentOnly}</span>}
+                      {codexHookLabel && <span className="codex-hook-warning"> • {codexHookLabel}</span>}
+                    </span>
+                  </button>
+                  <button className="session-action" onClick={() => rename(s.name)} aria-label={t('renameSession')} title={t('renameSession')}>
+                    ✎
+                  </button>
+                  {!s.released && <button className="session-action" onClick={() => release(s.name)} aria-label={t('releaseSession')} title={t('releaseSession')}>
+                    ⏏
+                  </button>}
+                  <button className="session-kill" onClick={() => remove(s.name)} aria-label={`delete ${s.name}`} title="Delete">
+                    ✕
+                  </button>
+                </div>
+                {s.lastChat && (
+                  <button
+                    className="session-last-chat"
+                    onClick={() => open(s)}
+                    title={`${lastChatLabel(s.lastChat, t)}: ${s.lastChat.text}`}
+                  >
+                    {lastChatLabel(s.lastChat, t)}: {s.lastChat.text}
+                  </button>
+                )}
               </li>
             );
           })}

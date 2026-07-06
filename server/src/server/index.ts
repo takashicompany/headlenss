@@ -17,6 +17,7 @@ import { codexRouter } from './codex/router.ts';
 import { detectCodexSessions, getCodexHookHealth } from './codex/status.ts';
 import { detectClaudeSessions } from './claude/process-detect.ts';
 import * as claudeStore from './claude/store.ts';
+import { sanitizeChatText } from './claude/transcript.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot } from './persist.ts';
 import { recordUiSubmission } from './uiSubmissions.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
@@ -112,6 +113,27 @@ function readSystemStatus(): {
 
 app.get('/api/system/status', (c) => c.json(readSystemStatus()));
 
+/** Extract the last non-synthetic chat entry for the session list preview. */
+function buildLastChat(tmuxName: string): { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex'; origin?: 'ui' | 'external' } | undefined {
+  const chat = claudeStore.getChat(tmuxName);
+  for (let i = chat.length - 1; i >= 0; i--) {
+    const item = chat[i];
+    if (item.synthetic) continue;
+    let text = sanitizeChatText(item.text);
+    text = text.replace(/\n/g, ' ');
+    if (text.length > 80) text = text.slice(0, 80) + '…';
+    const entry: { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex'; origin?: 'ui' | 'external' } = {
+      role: item.role,
+      text,
+      ts: item.ts,
+    };
+    if (item.agent) entry.agent = item.agent;
+    if (item.origin) entry.origin = item.origin;
+    return entry;
+  }
+  return undefined;
+}
+
 app.get('/api/sessions', async (c) => {
   const [sessions, detected, codexDetected] = await Promise.all([
     listSessions(),
@@ -131,6 +153,7 @@ app.get('/api/sessions', async (c) => {
       codexStatus: tracked?.source === 'codex' ? tracked.status : codexMap.get(s.name)?.status,
       codexHookHealth: codexMap.get(s.name)?.hookHealth ?? (agent === 'codex' ? getCodexHookHealth(tracked?.cwd) : getCodexHookHealth()),
       codexNeedsHookAttention: codexMap.get(s.name)?.needsHookAttention ?? false,
+      lastChat: buildLastChat(s.name),
     };
   });
   for (const retained of listRetainedSessions(liveNames)) {
@@ -141,6 +164,7 @@ app.get('/api/sessions', async (c) => {
       codexStatus: undefined,
       codexHookHealth: retained.agent === 'codex' ? getCodexHookHealth() : getCodexHookHealth(),
       codexNeedsHookAttention: false,
+      lastChat: undefined,
     });
   }
   return c.json({ sessions: enriched });
