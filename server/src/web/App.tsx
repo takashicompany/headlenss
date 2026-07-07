@@ -174,8 +174,12 @@ export function App() {
     };
   }, []);
 
-  const navigate = (path: string) => {
-    window.history.pushState(null, '', path);
+  const navigate = (path: string, options?: { replace?: boolean }) => {
+    if (options?.replace) {
+      window.history.replaceState(null, '', path);
+    } else {
+      window.history.pushState(null, '', path);
+    }
     setRoute(getRoute());
   };
 
@@ -193,10 +197,16 @@ export function App() {
     });
   };
 
+  const isSplitActive = isWide && splitEnabled && route.name === 'session';
+
+  // Keep latest clamped ratio in a ref so pointerup/cancel can persist without reading the DOM (fix 3)
+  const latestRatioRef = useRef(splitRatio);
+
   const handleDividerPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
     const divider = e.currentTarget;
-    divider.setPointerCapture(e.pointerId);
+    const pointerId = e.pointerId;
+    divider.setPointerCapture(pointerId);
     isDraggingRef.current = true;
     divider.classList.add('dragging');
     document.body.style.userSelect = 'none';
@@ -207,33 +217,82 @@ export function App() {
       const rect = container.getBoundingClientRect();
       const x = ev.clientX - rect.left;
       const pct = Math.min(80, Math.max(20, (x / rect.width) * 100));
+      latestRatioRef.current = pct;
       setSplitRatio(pct);
     };
 
-    const onPointerUp = () => {
+    const cleanup = (ev?: PointerEvent) => {
       isDraggingRef.current = false;
       divider.classList.remove('dragging');
       document.body.style.userSelect = '';
       divider.removeEventListener('pointermove', onPointerMove);
-      divider.removeEventListener('pointerup', onPointerUp);
-      // Persist on release
-      const container = splitContainerRef.current;
-      if (container) {
-        // Read the current ratio from state via the left pane width
-        const leftPane = container.querySelector('.split-left') as HTMLElement | null;
-        if (leftPane) {
-          const rect = container.getBoundingClientRect();
-          const ratio = (leftPane.offsetWidth / rect.width) * 100;
-          writeSplitRatio(Math.min(80, Math.max(20, ratio)));
-        }
+      divider.removeEventListener('pointerup', cleanup);
+      divider.removeEventListener('pointercancel', cleanup);
+      divider.removeEventListener('lostpointercapture', cleanup);
+      // Release pointer capture explicitly (fix 6)
+      if (ev) {
+        try {
+          if (divider.hasPointerCapture(ev.pointerId)) {
+            divider.releasePointerCapture(ev.pointerId);
+          }
+        } catch { /* ignore */ }
       }
+      // Persist from ref, not the DOM (fix 3)
+      writeSplitRatio(latestRatioRef.current);
     };
 
     divider.addEventListener('pointermove', onPointerMove);
-    divider.addEventListener('pointerup', onPointerUp);
+    divider.addEventListener('pointerup', cleanup);
+    divider.addEventListener('pointercancel', cleanup);        // fix 2
+    divider.addEventListener('lostpointercapture', cleanup);   // fix 2
+  }, []);
+
+  // Fix 1: clean up userSelect if split container unmounts mid-drag
+  useEffect(() => {
+    if (!isSplitActive) {
+      // Split just became inactive (viewport crossed below 1024px, toggle off, or navigated to list)
+      if (isDraggingRef.current) {
+        isDraggingRef.current = false;
+        document.body.style.userSelect = '';
+      }
+    }
+    return () => {
+      // Component unmount: also clean up
+      if (isDraggingRef.current) {
+        isDraggingRef.current = false;
+        document.body.style.userSelect = '';
+      }
+    };
+  }, [isSplitActive]);
+
+  // Fix 4: keyboard handler for divider accessibility
+  const handleDividerKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+    const step = 2;
+    let newRatio: number | null = null;
+    switch (e.key) {
+      case 'ArrowLeft':
+        newRatio = Math.max(20, latestRatioRef.current - step);
+        break;
+      case 'ArrowRight':
+        newRatio = Math.min(80, latestRatioRef.current + step);
+        break;
+      case 'Home':
+        newRatio = 20;
+        break;
+      case 'End':
+        newRatio = 80;
+        break;
+      default:
+        return;
+    }
+    e.preventDefault();
+    latestRatioRef.current = newRatio;
+    setSplitRatio(newRatio);
+    writeSplitRatio(newRatio);
   }, []);
 
   const handleDividerDoubleClick = useCallback(() => {
+    latestRatioRef.current = DEFAULT_SPLIT_RATIO;
     setSplitRatio(DEFAULT_SPLIT_RATIO);
     writeSplitRatio(DEFAULT_SPLIT_RATIO);
   }, []);
@@ -253,8 +312,6 @@ export function App() {
     </label>
   ) : null;
 
-  const isSplitActive = isWide && splitEnabled && route.name === 'session';
-
   if (isSplitActive) {
     const rightPane = route.mode === 'chat'
       ? <ChatView key={route.sessionName} sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
@@ -264,7 +321,7 @@ export function App() {
       <div className="split-container" ref={splitContainerRef}>
         <div className="split-left" style={{ width: `calc(${splitRatio}% - 3px)` }}>
           <SessionList
-            onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`)}
+            onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`, { replace: true })}
             headerMetrics={metrics as ReactNode}
             activeSession={route.sessionName}
             splitToggle={splitToggle}
@@ -273,8 +330,15 @@ export function App() {
         <div
           className="split-divider"
           title={t('splitDividerTitle')}
+          role="separator"
+          aria-orientation="vertical"
+          aria-valuenow={Math.round(splitRatio)}
+          aria-valuemin={20}
+          aria-valuemax={80}
+          tabIndex={0}
           onPointerDown={handleDividerPointerDown}
           onDoubleClick={handleDividerDoubleClick}
+          onKeyDown={handleDividerKeyDown}
         />
         <div className="split-right">
           {rightPane}

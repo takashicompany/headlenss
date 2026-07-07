@@ -105,7 +105,6 @@ const STRINGS = {
   splitView:              { en: 'Split view', ja: '分割表示' },
   splitDividerTitle:      { en: 'Drag to resize / double-click to reset', ja: 'ドラッグで幅を調整 / ダブルクリックでリセット' },
 
-
   // ── SessionView ──
   attachImageTitleDnd:    { en: 'Attach image (paste, drag & drop also work)',
                             ja: '画像を添付 (ペースト・ドラッグ&ドロップもOK)' },

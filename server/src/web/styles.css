@@ -1203,7 +1203,9 @@ button {
 
 .split-left {
   flex: 0 0 auto;
+  min-width: 0;
   overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .split-left .page {

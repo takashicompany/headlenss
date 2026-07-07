@@ -113,7 +113,14 @@ function claudeIndicator(
   }
 }
 
-export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle }: { onOpen: (name: string) => void; headerMetrics?: ReactNode; activeSession?: string; splitToggle?: ReactNode }) {
+type Props = {
+  onOpen: (name: string) => void;
+  headerMetrics?: ReactNode;
+  activeSession?: string;
+  splitToggle?: ReactNode;
+};
+
+export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle }: Props) {
   const { t, language, setLanguage } = useLanguage();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [newName, setNewName] = useState('');
