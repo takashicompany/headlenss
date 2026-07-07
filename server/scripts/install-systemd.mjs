@@ -11,7 +11,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_DIR = resolve(__dirname, '..');
 const TEMPLATE_PATH = resolve(__dirname, 'headlenss.service.template');
 const USER_SYSTEMD_DIR = resolve(homedir(), '.config/systemd/user');
-const UNIT_PATH = resolve(USER_SYSTEMD_DIR, 'headlenss.service');
+
+// Support --name for test units (e.g. --name headlenss-test)
+const args = process.argv.slice(2);
+const nameIdx = args.indexOf('--name');
+const UNIT_NAME = nameIdx !== -1 && args[nameIdx + 1] ? args[nameIdx + 1] : 'headlenss';
+const UNIT_PATH = resolve(USER_SYSTEMD_DIR, `${UNIT_NAME}.service`);
 
 function step(msg) {
   console.log(`\n==> ${msg}`);
@@ -28,6 +33,11 @@ function run(cmd, args, opts = {}) {
   if (r.status !== 0) {
     throw new Error(`failed: ${cmd} ${args.join(' ')} (exit ${r.status})`);
   }
+}
+
+function tryRun(cmd, args, opts = {}) {
+  console.log(`  $ ${cmd} ${args.join(' ')} (ignore failure)`);
+  spawnSync(cmd, args, { stdio: 'inherit', ...opts });
 }
 
 if (process.platform !== 'linux') {
@@ -55,15 +65,33 @@ try {
   process.exit(1);
 }
 
-step('locating npm');
-const npmPath = which('npm') ?? 'npm';
-console.log(`  npm: ${npmPath}`);
+step('resolving paths');
+const nodePath = process.execPath;
+console.log(`  node: ${nodePath}`);
+
+// Resolve npm's CLI entry point (the .js file, not the shell wrapper) so
+// ExecStartPre can call it via the absolute node path.
+const npmBin = which('npm') ?? 'npm';
+let npmCliPath = npmBin;
+try {
+  // npm's bin wrapper is usually a shell script; resolve the real JS entry via realpath
+  const r = spawnSync('realpath', [npmBin], { encoding: 'utf8' });
+  if (r.status === 0 && r.stdout.trim()) {
+    npmCliPath = r.stdout.trim();
+  }
+} catch { /* keep npmBin */ }
+console.log(`  npm cli: ${npmCliPath}`);
+
+const defaultPort = process.env.PORT ?? '3000';
+console.log(`  port: ${defaultPort}`);
 
 step('rendering unit file');
 const template = readFileSync(TEMPLATE_PATH, 'utf8');
 const unit = template
   .replaceAll('{{SERVER_DIR}}', SERVER_DIR)
-  .replaceAll('{{NPM}}', npmPath)
+  .replaceAll('{{NODE}}', nodePath)
+  .replaceAll('{{NPM_CLI}}', npmCliPath)
+  .replaceAll('{{PORT}}', defaultPort)
   .replaceAll('{{PATH}}', process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin');
 
 mkdirSync(USER_SYSTEMD_DIR, { recursive: true });
@@ -72,25 +100,29 @@ console.log(`  wrote: ${UNIT_PATH}`);
 
 step('reloading systemd and enabling unit');
 run(systemctl, ['--user', 'daemon-reload']);
-run(systemctl, ['--user', 'enable', 'headlenss.service']);
+run(systemctl, ['--user', 'enable', `${UNIT_NAME}.service`]);
 
 step('starting service');
 try {
-  run(systemctl, ['--user', 'restart', 'headlenss.service']);
+  // Stop first (ignore failure if not running), then start.
+  // This avoids the old npm-wrapper issue where `restart` sends SIGTERM to npm
+  // but the node server keeps holding the port.
+  tryRun(systemctl, ['--user', 'stop', `${UNIT_NAME}.service`]);
+  run(systemctl, ['--user', 'start', `${UNIT_NAME}.service`]);
 } catch {
   console.error('\nstart failed. check logs:');
-  console.error('  journalctl --user -u headlenss -n 50 --no-pager');
+  console.error(`  journalctl --user -u ${UNIT_NAME} -n 50 --no-pager`);
   process.exit(1);
 }
 
 step('done');
-console.log('  service installed, enabled, and started.');
+console.log(`  service ${UNIT_NAME} installed, enabled, and started.`);
 console.log('\nuseful commands:');
-console.log('  npm run service:status     # systemctl --user status headlenss');
-console.log('  npm run service:logs       # journalctl --user -u headlenss -f');
-console.log('  systemctl --user restart headlenss');
-console.log('  systemctl --user stop headlenss');
-console.log('  systemctl --user disable headlenss');
+console.log(`  npm run service:status     # systemctl --user status ${UNIT_NAME}`);
+console.log(`  npm run service:logs       # journalctl --user -u ${UNIT_NAME} -f`);
+console.log(`  systemctl --user restart ${UNIT_NAME}`);
+console.log(`  systemctl --user stop ${UNIT_NAME}`);
+console.log(`  systemctl --user disable ${UNIT_NAME}`);
 
 const lingerPath = `/var/lib/systemd/linger/${process.env.USER ?? ''}`;
 if (process.env.USER && !existsSync(lingerPath)) {

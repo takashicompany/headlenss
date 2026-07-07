@@ -215,3 +215,10 @@ export function startPeriodicSnapshot(intervalMs = 30000): void {
     void saveSnapshot();
   }, intervalMs);
 }
+
+export function stopPeriodicSnapshot(): void {
+  if (persistTimer) {
+    clearInterval(persistTimer);
+    persistTimer = null;
+  }
+}
