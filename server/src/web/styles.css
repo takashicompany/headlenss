@@ -1202,10 +1202,8 @@ button {
 }
 
 .split-left {
-  flex: 1 1 50%;
-  min-width: 320px;
+  flex: 0 0 auto;
   overflow-y: auto;
-  border-right: 1px solid var(--border);
 }
 
 .split-left .page {
@@ -1213,7 +1211,7 @@ button {
 }
 
 .split-right {
-  flex: 1 1 50%;
+  flex: 1 1 0%;
   min-width: 0;
   overflow: hidden;
   display: flex;
@@ -1224,6 +1222,20 @@ button {
   height: 100%;
 }
 
+
+/* Split divider (draggable) */
+.split-divider {
+  flex: 0 0 6px;
+  cursor: col-resize;
+  background: var(--border);
+  transition: background 0.15s;
+  touch-action: none;
+}
+
+.split-divider:hover,
+.split-divider.dragging {
+  background: var(--accent);
+}
 
 /* Active session highlight in split mode */
 .session-list li.session-active {

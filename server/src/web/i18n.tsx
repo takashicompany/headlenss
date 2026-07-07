@@ -103,6 +103,7 @@ const STRINGS = {
 
   // ── Split view ──
   splitView:              { en: 'Split view', ja: '分割表示' },
+  splitDividerTitle:      { en: 'Drag to resize / double-click to reset', ja: 'ドラッグで幅を調整 / ダブルクリックでリセット' },
 
 
   // ── SessionView ──

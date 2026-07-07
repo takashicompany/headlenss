@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { SessionList } from './pages/SessionList.tsx';
 import { SessionView } from './pages/SessionView.tsx';
 import { ChatView } from './pages/ChatView.tsx';
@@ -106,6 +106,27 @@ function writeSplitEnabled(enabled: boolean): void {
   } catch { /* ignore */ }
 }
 
+const SPLIT_RATIO_STORAGE_KEY = 'headlenss_split_ratio';
+const DEFAULT_SPLIT_RATIO = 50;
+
+function readSplitRatio(): number {
+  try {
+    const v = localStorage.getItem(SPLIT_RATIO_STORAGE_KEY);
+    if (v == null) return DEFAULT_SPLIT_RATIO;
+    const n = Number(v);
+    if (Number.isFinite(n) && n >= 20 && n <= 80) return n;
+    return DEFAULT_SPLIT_RATIO;
+  } catch {
+    return DEFAULT_SPLIT_RATIO;
+  }
+}
+
+function writeSplitRatio(ratio: number): void {
+  try {
+    localStorage.setItem(SPLIT_RATIO_STORAGE_KEY, String(ratio));
+  } catch { /* ignore */ }
+}
+
 function formatBytes(value: number): string {
   if (!Number.isFinite(value)) return '-';
   const gb = value / 1024 / 1024 / 1024;
@@ -118,6 +139,9 @@ export function App() {
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [isWide, setIsWide] = useState(() => window.matchMedia('(min-width: 1024px)').matches);
   const [splitEnabled, setSplitEnabled] = useState(readSplitEnabled);
+  const [splitRatio, setSplitRatio] = useState(readSplitRatio);
+  const splitContainerRef = useRef<HTMLDivElement>(null);
+  const isDraggingRef = useRef(false);
 
   useEffect(() => {
     const onPop = () => setRoute(getRoute());
@@ -169,6 +193,51 @@ export function App() {
     });
   };
 
+  const handleDividerPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const divider = e.currentTarget;
+    divider.setPointerCapture(e.pointerId);
+    isDraggingRef.current = true;
+    divider.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+
+    const onPointerMove = (ev: PointerEvent) => {
+      const container = splitContainerRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const pct = Math.min(80, Math.max(20, (x / rect.width) * 100));
+      setSplitRatio(pct);
+    };
+
+    const onPointerUp = () => {
+      isDraggingRef.current = false;
+      divider.classList.remove('dragging');
+      document.body.style.userSelect = '';
+      divider.removeEventListener('pointermove', onPointerMove);
+      divider.removeEventListener('pointerup', onPointerUp);
+      // Persist on release
+      const container = splitContainerRef.current;
+      if (container) {
+        // Read the current ratio from state via the left pane width
+        const leftPane = container.querySelector('.split-left') as HTMLElement | null;
+        if (leftPane) {
+          const rect = container.getBoundingClientRect();
+          const ratio = (leftPane.offsetWidth / rect.width) * 100;
+          writeSplitRatio(Math.min(80, Math.max(20, ratio)));
+        }
+      }
+    };
+
+    divider.addEventListener('pointermove', onPointerMove);
+    divider.addEventListener('pointerup', onPointerUp);
+  }, []);
+
+  const handleDividerDoubleClick = useCallback(() => {
+    setSplitRatio(DEFAULT_SPLIT_RATIO);
+    writeSplitRatio(DEFAULT_SPLIT_RATIO);
+  }, []);
+
   const metrics = systemStatus ? (
     <div className="header-metrics" aria-label="PC usage">
       CPU {systemStatus.cpuPercent == null ? '-' : systemStatus.cpuPercent.toFixed(0) + '%'}
@@ -192,8 +261,8 @@ export function App() {
       : <SessionView key={route.sessionName} sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />;
 
     return (
-      <div className="split-container">
-        <div className="split-left">
+      <div className="split-container" ref={splitContainerRef}>
+        <div className="split-left" style={{ width: `calc(${splitRatio}% - 3px)` }}>
           <SessionList
             onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`)}
             headerMetrics={metrics as ReactNode}
@@ -201,6 +270,12 @@ export function App() {
             splitToggle={splitToggle}
           />
         </div>
+        <div
+          className="split-divider"
+          title={t('splitDividerTitle')}
+          onPointerDown={handleDividerPointerDown}
+          onDoubleClick={handleDividerDoubleClick}
+        />
         <div className="split-right">
           {rightPane}
         </div>
