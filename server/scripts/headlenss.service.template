@@ -7,9 +7,23 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory={{SERVER_DIR}}
 EnvironmentFile=-{{SERVER_DIR}}/.env
-ExecStart={{NPM}} start
+
+# Safety net: kill any stale process holding PORT before starting.
+# The '-' prefix makes failure non-fatal (e.g. nothing on that port, fuser missing).
+ExecStartPre=-/usr/bin/fuser -k {{PORT}}/tcp
+
+# Build the web UI (replaces the lost `prestart: vite build` that npm would have run).
+ExecStartPre={{NODE}} {{NPM_CLI}} run build
+
+# Run node directly so MainPID = the process binding the port.
+# tsx CLI spawns a child node (signal-forwarding wrapper), which recreates the npm
+# problem (SIGTERM only reaches the wrapper, not the server). Using --require and
+# --import registers the tsx loader in-process without re-spawning.
+ExecStart={{NODE}} --require tsx/preflight --import tsx src/server/index.ts
+
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=15
 StandardOutput=journal
 StandardError=journal
 

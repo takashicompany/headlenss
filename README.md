@@ -120,6 +120,8 @@ npm run service:install
 sudo loginctl enable-linger $USER   # only once, if you want it to survive logout
 ```
 
+> **Migration note:** If you are upgrading from a version that used `npm start` in the systemd unit, re-run `npm run service:install` once to regenerate the unit file. This ensures `systemctl --user restart headlenss` releases the port correctly.
+
 For details (ASR backend selection, API reference, systemd operation) see [server/README.md](./server/README.md).
 
 ### 2. Reach the PC via Tailscale

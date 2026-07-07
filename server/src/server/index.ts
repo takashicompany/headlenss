@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { cpus, freemem, loadavg, tmpdir, totalmem } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { captureOutput, createSession, getSessionCwd, killSession, listSessions, renameSession, sendKey, sendKeys } from './tmux.ts';
-import { handlePtyConnection } from './pty.ts';
+import { cleanupAllHeadlessEntries, handlePtyConnection } from './pty.ts';
 import { getBackendName, isAsrReady, transcribePcm16, transcribeWav } from './asr/index.ts';
 import { claudeRouter } from './claude/router.ts';
 import { codexRouter } from './codex/router.ts';
@@ -18,7 +18,7 @@ import { detectCodexSessions, getCodexHookHealth } from './codex/status.ts';
 import { detectClaudeSessions } from './claude/process-detect.ts';
 import * as claudeStore from './claude/store.ts';
 import { sanitizeChatText } from './claude/transcript.ts';
-import { restoreSessions, saveSnapshot, startPeriodicSnapshot } from './persist.ts';
+import { restoreSessions, saveSnapshot, startPeriodicSnapshot, stopPeriodicSnapshot } from './persist.ts';
 import { recordUiSubmission } from './uiSubmissions.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
 
@@ -586,3 +586,63 @@ server.on('upgrade', (req, socket, head) => {
   const name = decodeURIComponent(m[1]);
   wss.handleUpgrade(req, socket, head, (ws) => handlePtyConnection(ws, name));
 });
+
+// ───────── Graceful shutdown ─────────
+//
+// SIGTERM (systemd stop) / SIGINT (Ctrl-C) を受けたらリソースを順番に解放し、
+// ポートを確実に手放してから exit する。systemd KillMode=process の下で
+// restart しても EADDRINUSE にならないための仕組み。
+
+let shuttingDown = false;
+
+async function gracefulShutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  const HARD_DEADLINE_MS = 8000;
+  const deadlineTimer = setTimeout(() => {
+    console.error(`[shutdown] hard deadline (${HARD_DEADLINE_MS}ms) reached — forcing exit`);
+    process.exit(1);
+  }, HARD_DEADLINE_MS);
+  // unref so the timer alone doesn't keep the process alive
+  deadlineTimer.unref();
+
+  console.log(`[shutdown] received ${signal}, starting graceful shutdown...`);
+
+  // 1. Stop accepting new connections
+  console.log('[shutdown] closing HTTP server...');
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    // Destroy active WebSocket connections so server.close() can complete
+    for (const client of wss.clients) {
+      try { client.close(1001, 'server shutting down'); } catch { /* ignore */ }
+      try { client.terminate(); } catch { /* ignore */ }
+    }
+  });
+  console.log('[shutdown] HTTP server closed');
+
+  // 2. Stop periodic snapshot timer
+  console.log('[shutdown] stopping periodic snapshot...');
+  stopPeriodicSnapshot();
+
+  // 3. Final snapshot write
+  console.log('[shutdown] saving final snapshot...');
+  try {
+    await saveSnapshot();
+    console.log('[shutdown] snapshot saved');
+  } catch (e) {
+    console.warn(`[shutdown] saveSnapshot failed: ${(e as Error).message}`);
+  }
+
+  // 4. Clean up tmux -CC control-mode clients (does NOT kill tmux sessions)
+  console.log('[shutdown] cleaning up headless entries...');
+  cleanupAllHeadlessEntries();
+  console.log('[shutdown] headless entries cleaned');
+
+  console.log('[shutdown] complete');
+  clearTimeout(deadlineTimer);
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
