@@ -1232,6 +1232,15 @@ button {
   background: var(--border);
   transition: background 0.15s;
   touch-action: none;
+  position: relative;
+}
+
+/* Expand touch/click hit area to ~20px without changing visual 6px bar */
+.split-divider::before {
+  content: '';
+  position: absolute;
+  inset: 0 -7px;
+  cursor: col-resize;
 }
 
 .split-divider:hover,

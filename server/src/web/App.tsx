@@ -93,10 +93,12 @@ const SPLIT_VIEW_STORAGE_KEY = 'headlenss_split_view';
 function readSplitEnabled(): boolean {
   try {
     const v = localStorage.getItem(SPLIT_VIEW_STORAGE_KEY);
+    if (v === 'true') return true;
     if (v === 'false') return false;
-    return true; // default enabled
+    // No stored value: default ON for fine pointer (PC), OFF for coarse pointer (touch)
+    return !window.matchMedia('(pointer: coarse)').matches;
   } catch {
-    return true;
+    return !window.matchMedia('(pointer: coarse)').matches;
   }
 }
 
