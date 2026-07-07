@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { SessionList } from './pages/SessionList.tsx';
 import { SessionView } from './pages/SessionView.tsx';
 import { ChatView } from './pages/ChatView.tsx';
+import { useLanguage } from './i18n.tsx';
 
 type Mode = 'tmux' | 'chat';
 
@@ -87,6 +88,24 @@ function setMode(sessionName: string, mode: Mode): void {
   window.history.replaceState(null, '', url.toString());
 }
 
+const SPLIT_VIEW_STORAGE_KEY = 'headlenss_split_view';
+
+function readSplitEnabled(): boolean {
+  try {
+    const v = localStorage.getItem(SPLIT_VIEW_STORAGE_KEY);
+    if (v === 'false') return false;
+    return true; // default enabled
+  } catch {
+    return true;
+  }
+}
+
+function writeSplitEnabled(enabled: boolean): void {
+  try {
+    localStorage.setItem(SPLIT_VIEW_STORAGE_KEY, enabled ? 'true' : 'false');
+  } catch { /* ignore */ }
+}
+
 function formatBytes(value: number): string {
   if (!Number.isFinite(value)) return '-';
   const gb = value / 1024 / 1024 / 1024;
@@ -94,13 +113,23 @@ function formatBytes(value: number): string {
 }
 
 export function App() {
+  const { t } = useLanguage();
   const [route, setRoute] = useState<Route>(getRoute);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
+  const [isWide, setIsWide] = useState(() => window.matchMedia('(min-width: 1024px)').matches);
+  const [splitEnabled, setSplitEnabled] = useState(readSplitEnabled);
 
   useEffect(() => {
     const onPop = () => setRoute(getRoute());
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
+  useEffect(() => {
+    const mql = window.matchMedia('(min-width: 1024px)');
+    const onChange = (e: MediaQueryListEvent) => setIsWide(e.matches);
+    mql.addEventListener('change', onChange);
+    return () => mql.removeEventListener('change', onChange);
   }, []);
 
   useEffect(() => {
@@ -132,6 +161,14 @@ export function App() {
     setRoute(getRoute());
   };
 
+  const toggleSplit = () => {
+    setSplitEnabled((prev) => {
+      const next = !prev;
+      writeSplitEnabled(next);
+      return next;
+    });
+  };
+
   const metrics = systemStatus ? (
     <div className="header-metrics" aria-label="PC usage">
       CPU {systemStatus.cpuPercent == null ? '-' : systemStatus.cpuPercent.toFixed(0) + '%'}
@@ -139,11 +176,46 @@ export function App() {
     </div>
   ) : null;
 
+  // Split view toggle: only rendered on wide viewports
+  const splitToggle = isWide ? (
+    <label className="split-toggle">
+      <input type="checkbox" checked={splitEnabled} onChange={toggleSplit} />
+      {t('splitView')}
+    </label>
+  ) : null;
+
+  const isSplitActive = isWide && splitEnabled;
+
+  if (isSplitActive) {
+    const rightPane = route.name === 'session'
+      ? route.mode === 'chat'
+        ? <ChatView key={route.sessionName} sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
+        : <SessionView key={route.sessionName} sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
+      : <div className="split-empty">{t('splitViewHint')}</div>;
+
+    return (
+      <div className="split-container">
+        <div className="split-left">
+          <SessionList
+            onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`)}
+            headerMetrics={metrics as ReactNode}
+            activeSession={route.name === 'session' ? route.sessionName : undefined}
+            splitToggle={splitToggle}
+          />
+        </div>
+        <div className="split-right">
+          {rightPane}
+        </div>
+      </div>
+    );
+  }
+
+  // Classic mode
   const page = route.name === 'session'
     ? route.mode === 'chat'
       ? <ChatView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
       : <SessionView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
-    : <SessionList onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`)} headerMetrics={metrics as ReactNode} />;
+    : <SessionList onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`)} headerMetrics={metrics as ReactNode} splitToggle={splitToggle} />;
 
   return page;
 }

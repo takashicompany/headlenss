@@ -101,6 +101,10 @@ const STRINGS = {
                             ja: 'メッセージを入力 (PCはEnter送信/Shift+Enter改行、スマホは送信ボタン)' },
   attachImageTitlePaste:  { en: 'Attach image (paste also works)', ja: '画像を添付 (ペーストもOK)' },
 
+  // ── Split view ──
+  splitView:              { en: 'Split view', ja: '分割表示' },
+  splitViewHint:          { en: 'Select a session from the list', ja: 'リストからセッションを選択してください' },
+
   // ── SessionView ──
   attachImageTitleDnd:    { en: 'Attach image (paste, drag & drop also work)',
                             ja: '画像を添付 (ペースト・ドラッグ&ドロップもOK)' },
