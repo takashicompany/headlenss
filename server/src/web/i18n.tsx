@@ -103,7 +103,7 @@ const STRINGS = {
 
   // ── Split view ──
   splitView:              { en: 'Split view', ja: '分割表示' },
-  splitViewHint:          { en: 'Select a session from the list', ja: 'リストからセッションを選択してください' },
+
 
   // ── SessionView ──
   attachImageTitleDnd:    { en: 'Attach image (paste, drag & drop also work)',

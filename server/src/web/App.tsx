@@ -184,14 +184,12 @@ export function App() {
     </label>
   ) : null;
 
-  const isSplitActive = isWide && splitEnabled;
+  const isSplitActive = isWide && splitEnabled && route.name === 'session';
 
   if (isSplitActive) {
-    const rightPane = route.name === 'session'
-      ? route.mode === 'chat'
-        ? <ChatView key={route.sessionName} sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
-        : <SessionView key={route.sessionName} sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
-      : <div className="split-empty">{t('splitViewHint')}</div>;
+    const rightPane = route.mode === 'chat'
+      ? <ChatView key={route.sessionName} sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
+      : <SessionView key={route.sessionName} sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />;
 
     return (
       <div className="split-container">
@@ -199,7 +197,7 @@ export function App() {
           <SessionList
             onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`)}
             headerMetrics={metrics as ReactNode}
-            activeSession={route.name === 'session' ? route.sessionName : undefined}
+            activeSession={route.sessionName}
             splitToggle={splitToggle}
           />
         </div>

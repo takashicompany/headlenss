@@ -1224,14 +1224,6 @@ button {
   height: 100%;
 }
 
-.split-empty {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-  color: var(--muted);
-  font-size: 0.9rem;
-}
 
 /* Active session highlight in split mode */
 .session-list li.session-active {
