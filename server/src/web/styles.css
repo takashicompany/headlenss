@@ -1195,6 +1195,74 @@ button {
   font-weight: 500;
 }
 
+/* ── Split view (PC two-pane layout) ── */
+.split-container {
+  display: flex;
+  height: 100%;
+}
+
+.split-left {
+  flex: 0 0 auto;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.split-left .page {
+  max-width: none;
+}
+
+.split-right {
+  flex: 1 1 0%;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.split-right .page-session {
+  height: 100%;
+}
+
+
+/* Split divider (draggable) */
+.split-divider {
+  flex: 0 0 6px;
+  cursor: col-resize;
+  background: var(--border);
+  transition: background 0.15s;
+  touch-action: none;
+  position: relative;
+}
+
+/* Expand touch/click hit area to ~20px without changing visual 6px bar */
+.split-divider::before {
+  content: '';
+  position: absolute;
+  inset: 0 -7px;
+  cursor: col-resize;
+}
+
+.split-divider:hover,
+.split-divider.dragging {
+  background: var(--accent);
+}
+
+/* Active session highlight in split mode */
+.session-list li.session-active {
+  border-color: var(--accent);
+}
+
+/* Split view toggle */
+.split-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+
 @media (max-width: 640px) {
   .page-header-row {
     align-items: flex-start;

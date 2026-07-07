@@ -113,7 +113,14 @@ function claudeIndicator(
   }
 }
 
-export function SessionList({ onOpen, headerMetrics }: { onOpen: (name: string) => void; headerMetrics?: ReactNode }) {
+type Props = {
+  onOpen: (name: string) => void;
+  headerMetrics?: ReactNode;
+  activeSession?: string;
+  splitToggle?: ReactNode;
+};
+
+export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle }: Props) {
   const { t, language, setLanguage } = useLanguage();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [newName, setNewName] = useState('');
@@ -301,16 +308,19 @@ export function SessionList({ onOpen, headerMetrics }: { onOpen: (name: string) 
           </div>
           {headerMetrics}
         </div>
-        <label className="lang-select">
-          {t('language')}:
-          <select
-            value={language}
-            onChange={(e) => setLanguage(e.target.value as Language)}
-          >
-            <option value="en">English</option>
-            <option value="ja">日本語</option>
-          </select>
-        </label>
+        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+          <label className="lang-select" style={{ marginBottom: 0 }}>
+            {t('language')}:
+            <select
+              value={language}
+              onChange={(e) => setLanguage(e.target.value as Language)}
+            >
+              <option value="en">English</option>
+              <option value="ja">日本語</option>
+            </select>
+          </label>
+          {splitToggle}
+        </div>
       </header>
 
       <form className="create-form" onSubmit={create}>
@@ -380,7 +390,7 @@ export function SessionList({ onOpen, headerMetrics }: { onOpen: (name: string) 
               : s.agent === 'codex' && s.codexNeedsHookAttention ? t('codexHooksNeedTrust') : '';
             const isStarred = starred.has(s.name);
             return (
-              <li key={s.name} className={s.released ? 'is-released' : undefined}>
+              <li key={s.name} className={[s.released && 'is-released', activeSession === s.name && 'session-active'].filter(Boolean).join(' ') || undefined}>
                 <div className="session-row">
                   {manualOrder && <div className="session-reorder">
                     <button onClick={() => move(s.name, -1)} aria-label={t('moveUp')} title={t('moveUp')}>↑</button>
