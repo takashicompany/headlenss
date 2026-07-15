@@ -43,6 +43,7 @@ const STRINGS = {
   recConnecting:       { en: 'Connecting…',                     ja: '接続中…' },
   recStartedHint:      { en: 'Recording — please speak',        ja: '録音開始 — お話しください' },
   chatNoMsg:           { en: '(no messages yet)',               ja: '(まだ発言なし)' },
+  chatLoading:         { en: 'Loading...',                      ja: '読み込み中...' },
   noticeQuestion:      { en: '? Question waiting (tap to answer)',    ja: '? 質問待ち (clickで回答)' },
   noticePermission:    { en: '⏸ Permission waiting (tap to respond)', ja: '⏸ 承認待ち (clickで応答)' },
   rootListEmpty:       { en: '(no agent session)\n\nStart agent or Codex inside tmux',

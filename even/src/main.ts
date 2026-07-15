@@ -216,7 +216,7 @@ let outputFetchOkLogged = false
 let scrollOffset = 0  // chat の末尾から何行戻ったか (0=ライブ末尾)
 let scrollAnimPending = 0  // アニメーションでまだ消化していない残り行数。正=back, 負=forward
 let scrollAnimTimer: ReturnType<typeof setTimeout> | null = null
-let rootCursor = 0    // rootlist 内のカーソル位置 (claudeSessions[index])
+let rootCursorName: string | null = null  // rootlist 内のカーソルが指すセッション名 (index ではなく名前で追跡)
 let rootListStart = 0 // rootlist 表示窓の先頭 index。カーソル追従方式で cursor が窓外に出た時だけスライドする
 let ccListStart = 0   // cc-response 画面の表示窓の先頭行 index (rootlist と同じカーソル追従方式)
 
@@ -250,7 +250,14 @@ let claudeSessions: ClaudeSessionInfo[] = []     // 起動中Claude Codeを持�
 let claudeChat: ChatItem[] = []                  // 現在選択中セッションのチャット履歴
 let currentAgentSource: AgentSource | undefined = undefined
 let claudePending: Pending | null = null         // 現在選択中セッションの承認/質問待ち
+let claudeChatLoading = false                    // セッション切替直後のロード中フラグ
 let claudePollTimer: ReturnType<typeof setInterval> | null = null
+// refreshClaudeData の非同期レース防止: 実行中の fetch を abort し、完了時にセッション名を検証する
+let refreshAbortCtrl: AbortController | null = null
+/** 実行中の refreshClaudeData fetch を中断する (セッション切替時に呼ぶ) */
+function abortInFlightRefresh(): void {
+  if (refreshAbortCtrl) { refreshAbortCtrl.abort(); refreshAbortCtrl = null }
+}
 let respondCursor = 0                            // cc-response 画面のカーソル位置(現在質問の行 index)
 let respondQIdx = 0                              // 複数質問時、現在表示中の質問 index
 // AskUserQuestion 回答ビルド用: 各質問について構築中の回答を保持
@@ -340,14 +347,20 @@ function recomputePhase(): void {
   updatePendingUI()
 }
 
-/** lastSessions に対して rootCursor が指す要素を、現在の選択 (settings.sessionName) に合わせる */
-function syncRootCursor(): void {
-  if (claudeSessions.length === 0) {
-    rootCursor = 0
-    return
+/** rootCursorName を claudeSessions 内の index に解決する。名前が消えた場合はクランプして名前も更新する */
+function resolveRootCursorIndex(): number {
+  if (claudeSessions.length === 0) return 0
+  if (rootCursorName) {
+    const idx = claudeSessions.findIndex((s) => s.tmuxSessionName === rootCursorName)
+    if (idx >= 0) return idx
   }
-  const idx = claudeSessions.findIndex((s) => s.tmuxSessionName === settings.sessionName)
-  rootCursor = idx >= 0 ? idx : 0
+  // 名前が見つからない (一覧から消えた) → 先頭にフォールバックし名前も更新
+  rootCursorName = claudeSessions[0]?.tmuxSessionName ?? null
+  return 0
+}
+/** lastSessions に対して rootCursorName を現在の選択 (settings.sessionName) に合わせる */
+function syncRootCursor(): void {
+  rootCursorName = settings.sessionName || (claudeSessions[0]?.tmuxSessionName ?? null)
 }
 
 /** Claude Code セッションの待機状態を1文字記号にする */
@@ -391,7 +404,7 @@ function buildG2Content(): string {
       // かかって切れる時、この空行を犠牲にして実テキストを安全域へ逃がす。
       return settings.chatBottomSpacer ? body + '\n' : body
     }
-    return `[${settings.sessionName || 'no session'}]\n${t('chatNoMsg')}`
+    return `[${settings.sessionName || 'no session'}]\n${claudeChatLoading ? t('chatLoading') : t('chatNoMsg')}`
   }
 
   // Claude Code 承認/質問 待ちへの応答画面
@@ -457,6 +470,7 @@ function buildRootListView(): string {
     return t('rootListEmpty')
   }
   const total = items.length
+  const rootCursor = resolveRootCursorIndex()
 
   // カーソル追従方式: 窓の中にカーソルがいる間はスライドしない、はみ出した時だけ最小限スライドする。
   if (rootCursor < rootListStart) {
@@ -772,7 +786,7 @@ function buildG2Footer(): string {
   switch (phase) {
     case 'rootlist':
       if (claudeSessions.length === 0) return t('g2NoSessionsBrief')
-      return `${t('g2FootRoot')} (${rootCursor + 1}/${claudeSessions.length})`
+      return `${t('g2FootRoot')} (${resolveRootCursorIndex() + 1}/${claudeSessions.length})`
     case 'cc-response':
       // multi-select 中の Submit 行を強調するため、multi-select 質問のときは別文言
       if (currentRespondQuestionIsMulti()) return t('g2FootCcRespMulti')
@@ -883,13 +897,17 @@ sessionPillsEl.addEventListener('click', (e) => {
   }
   if (action === 'select') {
     if (settings.sessionName === name) return
+    abortInFlightRefresh()
     settings.sessionName = name
     void persistSettings()
+    claudeChat = []
+    claudeChatLoading = true
     renderSessionPills()
     recomputePhase()
     tmuxOutput = ''
     resetScroll()
     void refreshClaudeData()
+    startOutputPolling()  // ポーリングタイマーをリセット
   }
 })
 
@@ -910,13 +928,12 @@ async function reloadSessions(verbose = false): Promise<void> {
     lastSessions = await client.listSessions()
     if (verbose) log(`sessions: ${lastSessions.map((s) => s.name).join(', ') || '(none)'}`)
     if (lastSessions.length > 0 && !lastSessions.some((s) => s.name === settings.sessionName)) {
+      abortInFlightRefresh()
       settings.sessionName = lastSessions[0].name
       void persistSettings()
     }
-    // rootlist のカーソル位置がオーバーランしないようクランプ
-    if (rootCursor >= lastSessions.length) {
-      rootCursor = Math.max(0, lastSessions.length - 1)
-    }
+    // rootlist のカーソル位置がオーバーランしないよう名前解決でクランプ
+    resolveRootCursorIndex()
     renderSessionPills()
     paintStatus()
     if (phase === 'rootlist') void refreshG2(true)
@@ -933,6 +950,7 @@ async function createAndSelectSession(name: string): Promise<void> {
   try {
     await client.createSession(name)
     log(`created session: ${name}`)
+    abortInFlightRefresh()
     settings.sessionName = name
     await persistSettings()
     newSessionInput.value = ''
@@ -963,9 +981,8 @@ async function reloadClaudeSessions(): Promise<void> {
       next.length !== claudeSessions.length ||
       next.some((s, i) => s.tmuxSessionName !== claudeSessions[i]?.tmuxSessionName || s.status !== claudeSessions[i]?.status)
     claudeSessions = next
-    if (rootCursor >= claudeSessions.length) {
-      rootCursor = Math.max(0, claudeSessions.length - 1)
-    }
+    // rootCursorName の指すセッションが消えた場合、名前解決内でクランプされる
+    resolveRootCursorIndex()
     // WebView の一覧は毎回更新 (active 切り替えなど含む)
     renderClaudeSessionsList()
     // rootlist を見ている間は中身が変わったら即レンズ再描画
@@ -985,13 +1002,21 @@ async function refreshClaudeData(): Promise<void> {
     setOutputDisplay('(no session selected)', 'muted')
     return
   }
+  // 前回の in-flight fetch を abort し、新しい AbortController を用意する
+  abortInFlightRefresh()
+  const ctrl = new AbortController()
+  refreshAbortCtrl = ctrl
+  // fetch 開始時点のセッション名を保持。完了時にセッションが切り替わっていたら結果を捨てる
+  const targetSession = settings.sessionName
   try {
     const [chatResponse, pending] = await Promise.all([
-      client.getClaudeChat(settings.sessionName),
-      client.getClaudePending(settings.sessionName),
+      client.getClaudeChat(targetSession, ctrl.signal, 20),
+      client.getClaudePending(targetSession, ctrl.signal),
     ])
+    // ── セッション切替ガード: fetch 中にユーザがセッションを変えた場合は結果を破棄 ──
+    if (settings.sessionName !== targetSession) return
     const chat = chatResponse.chat
-    currentAgentSource = chatResponse.source ?? claudeSessions.find((s) => s.tmuxSessionName === settings.sessionName)?.source
+    currentAgentSource = chatResponse.source ?? claudeSessions.find((s) => s.tmuxSessionName === targetSession)?.source
     // chat: scrollback 中なら新着分だけオフセット繰り上げ
     if (scrollOffset > 0) {
       const oldLen = formatChatLines(claudeChat, CHAT_WRAP_PX).length
@@ -1003,6 +1028,7 @@ async function refreshClaudeData(): Promise<void> {
       }
     }
     claudeChat = chat
+    claudeChatLoading = false
     claudePending = pending
     if (chat.length > 0) {
       const lastUser = [...chat].reverse().find((c) => c.role === 'user')?.text ?? ''
@@ -1014,16 +1040,20 @@ async function refreshClaudeData(): Promise<void> {
         'ok',
       )
       if (!outputFetchOkLogged) {
-        log(`getClaudeChat ok: ${chat.length} items from "${settings.sessionName}"`)
+        log(`getClaudeChat ok: ${chat.length} items from "${targetSession}"`)
         outputFetchOkLogged = true
       }
     } else {
-      setOutputDisplay(`(no chat yet for "${settings.sessionName}")`, 'muted')
+      setOutputDisplay(`(no chat yet for "${targetSession}")`, 'muted')
     }
     if (phase === 'idle' || phase === 'cc-response') void refreshG2(true)
     // chat を実際に取得して描画している = ユーザは見ている前提なので既読化
-    if (phase === 'idle' || phase === 'cc-response') markAsRead(settings.sessionName)
+    if (phase === 'idle' || phase === 'cc-response') markAsRead(targetSession)
   } catch (e) {
+    // AbortError はセッション切替による意図的キャンセルなので無視する
+    if ((e as DOMException).name === 'AbortError') return
+    // エラーでも現在セッション向けのフェッチならローディング解除
+    if (settings.sessionName === targetSession) claudeChatLoading = false
     const msg = (e as Error).message
     setOutputDisplay(`error: ${msg}`, 'err')
     log(`refreshClaudeData error: ${msg}`)
@@ -1053,6 +1083,7 @@ async function killSession(name: string): Promise<void> {
     await client.killSession(name)
     log(`killed session: ${name}`)
     if (settings.sessionName === name) {
+      abortInFlightRefresh()
       const remaining = lastSessions.filter((s) => s.name !== name)
       if (remaining.length > 0) {
         settings.sessionName = remaining[0].name
@@ -1371,8 +1402,10 @@ async function finishOnboarding(): Promise<void> {
     if (sessions.length === 0) {
       log('Auto-creating session "main"')
       await client.createSession('main')
+      abortInFlightRefresh()
       settings.sessionName = 'main'
     } else if (!sessions.some((s) => s.name === settings.sessionName)) {
+      abortInFlightRefresh()
       settings.sessionName = sessions[0].name
     }
     await persistSettings()
@@ -1767,18 +1800,26 @@ async function toggleRecording(): Promise<void> {
 function moveRootCursor(delta: number): void {
   if (phase !== 'rootlist') return
   if (claudeSessions.length === 0) return
-  rootCursor = (rootCursor + delta + claudeSessions.length) % claudeSessions.length
+  const cur = resolveRootCursorIndex()
+  const next = (cur + delta + claudeSessions.length) % claudeSessions.length
+  rootCursorName = claudeSessions[next]?.tmuxSessionName ?? null
   void refreshG2(true)
 }
 
 function openSelectedFromRoot(): void {
   if (phase !== 'rootlist') return
-  const sel = claudeSessions[rootCursor]
+  // カーソル名からセッションを検索 (index ではなく名前ベース)
+  const sel = rootCursorName
+    ? claudeSessions.find((s) => s.tmuxSessionName === rootCursorName)
+    : claudeSessions[0]
   if (!sel) return
+  // セッション切替: 前回の in-flight fetch を中断してから新セッションに切替
+  abortInFlightRefresh()
   settings.sessionName = sel.tmuxSessionName
   void persistSettings()
   log(`Opened Agent session: ${sel.tmuxSessionName}`)
   claudeChat = []
+  claudeChatLoading = true
   currentAgentSource = sel.source
   claudePending = null
   resetScroll()
@@ -1788,6 +1829,7 @@ function openSelectedFromRoot(): void {
   updateRecordButton()
   renderClaudeSessionsList()  // WebView 側のハイライトを更新
   void refreshClaudeData()
+  startOutputPolling()  // ポーリングタイマーをリセットし、次 tick を 1 interval 先に置く
 }
 
 function moveRespondCursor(delta: number): void {
@@ -2063,15 +2105,15 @@ claudeSessionsListEl.addEventListener('click', (e) => {
   }
   // 通常クリック → 選択 (settings.sessionName を更新)
   if (settings.sessionName !== name) {
+    abortInFlightRefresh()
     settings.sessionName = name
     void persistSettings()
     renderClaudeSessionsList()
     renderSessionPills()
     log(`Active session set: ${name}`)
     if (phase === 'rootlist') {
-      // rootlist のカーソル位置も合わせる
-      const idx = claudeSessions.findIndex((s) => s.tmuxSessionName === name)
-      if (idx >= 0) rootCursor = idx
+      // rootlist のカーソル名も合わせる
+      rootCursorName = name
       void refreshG2(true)
     }
   }
@@ -2183,8 +2225,7 @@ async function submitNewClaudeSession(e: Event): Promise<void> {
 
     if (appeared) {
       // 検出成功: rootlist のカーソルを新セッションに合わせて、レンズへ即反映
-      const idx = claudeSessions.findIndex((s) => s.tmuxSessionName === name)
-      if (idx >= 0) rootCursor = idx
+      rootCursorName = name
       setNewClaudeStatus('ok', `${t('newClaudeOk')} (${name})`)
       log(`Agent session "${name}" detected (took ${Date.now() - startedAt}ms)`)
     } else {
@@ -2385,6 +2426,7 @@ async function boot(): Promise<void> {
             log(`re-render error: ${err}`)
           }
           void refreshClaudeData()
+          startOutputPolling()  // ポーリングタイマーをリセット
         })()
       },
       onForegroundExit: () => {
