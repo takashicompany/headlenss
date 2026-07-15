@@ -24,11 +24,42 @@ type RegistryEntry = {
   status?: string;
 };
 
+// ── TTL cache + singleflight for detectClaudeSessions ──
+const DETECT_TTL_MS = 2500;
+let claudeDetectCache: { result: DetectedSession[]; expiresAt: number } | null = null;
+let claudeDetectInFlight: Promise<DetectedSession[]> | null = null;
+
+/** Invalidate the detect cache so the next call triggers a fresh scan. */
+export function invalidateClaudeDetectCache(): void {
+  claudeDetectCache = null;
+}
+
 /**
  * `~/.claude/sessions/<PID>.json` レジストリ(undocumented but reliable)を読んで
  * 生きている Claude Code プロセスを検出し、tmux session 名と紐付ける。
  */
 export async function detectClaudeSessions(): Promise<DetectedSession[]> {
+  const now = Date.now();
+  if (claudeDetectCache && now < claudeDetectCache.expiresAt) {
+    return claudeDetectCache.result;
+  }
+  if (claudeDetectInFlight) return claudeDetectInFlight;
+  claudeDetectInFlight = detectClaudeSessionsUncached().then(
+    (result) => {
+      claudeDetectCache = { result, expiresAt: Date.now() + DETECT_TTL_MS };
+      claudeDetectInFlight = null;
+      return result;
+    },
+    (err) => {
+      claudeDetectInFlight = null;
+      throw err;
+    },
+  );
+  return claudeDetectInFlight;
+}
+
+async function detectClaudeSessionsUncached(): Promise<DetectedSession[]> {
+  console.log('[detect] scan claude');
   const dir = resolve(homedir(), '.claude/sessions');
   if (!existsSync(dir)) return [];
 

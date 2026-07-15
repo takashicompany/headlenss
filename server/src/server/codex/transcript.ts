@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { sanitizeChatText } from '../claude/transcript.ts';
+import { sanitizeChatText, readTailLines } from '../claude/transcript.ts';
 
 type CodexTranscriptLine = {
   timestamp?: string;
@@ -70,17 +70,26 @@ function extractMessage(line: CodexTranscriptLine): { role: 'user' | 'assistant'
 export async function extractCodexChatFromTranscript(
   transcriptPath: string,
   limit = 200,
+  tailMode = false,
 ): Promise<Array<{ role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' }>> {
   if (!transcriptPath) return [];
-  let raw: string;
-  try {
-    raw = await readFile(transcriptPath, 'utf-8');
-  } catch {
-    return [];
+
+  let lines: string[];
+  if (tailMode) {
+    lines = await readTailLines(transcriptPath, limit);
+  } else {
+    let raw: string;
+    try {
+      raw = await readFile(transcriptPath, 'utf-8');
+    } catch {
+      return [];
+    }
+    lines = raw.split('\n').filter((l) => l.trim());
   }
+
   const items: Array<{ role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' }> = [];
   const seen = new Set<string>();
-  for (const line of raw.split('\n')) {
+  for (const line of lines) {
     if (!line.trim()) continue;
     let parsed: CodexTranscriptLine;
     try {

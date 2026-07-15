@@ -1,4 +1,66 @@
-import { readFile } from 'node:fs/promises';
+import { open, readFile, stat } from 'node:fs/promises';
+
+/**
+ * Read the tail of a file efficiently: instead of reading the whole file,
+ * read only the last chunk, discard the first partial line, and return the
+ * remaining complete lines. Grows the chunk if fewer than `minLines` lines
+ * are found, up to a maximum of ~2MB total read.
+ */
+export async function readTailLines(
+  filePath: string,
+  minLines: number,
+): Promise<string[]> {
+  const MAX_READ = 2 * 1024 * 1024; // 2MB cap
+  let chunkSize = 256 * 1024; // start at 256KB
+
+  let fileSize: number;
+  try {
+    const st = await stat(filePath);
+    fileSize = st.size;
+  } catch {
+    return [];
+  }
+
+  if (fileSize === 0) return [];
+
+  // If file is small enough, just read the whole thing
+  if (fileSize <= chunkSize) {
+    try {
+      const raw = await readFile(filePath, 'utf-8');
+      return raw.split('\n').filter((l) => l.trim());
+    } catch {
+      return [];
+    }
+  }
+
+  while (chunkSize <= MAX_READ) {
+    const readStart = Math.max(0, fileSize - chunkSize);
+    const readLen = fileSize - readStart;
+    let buf: Buffer;
+    try {
+      const fh = await open(filePath, 'r');
+      try {
+        buf = Buffer.alloc(readLen);
+        await fh.read(buf, 0, readLen, readStart);
+      } finally {
+        await fh.close();
+      }
+    } catch {
+      return [];
+    }
+    const raw = buf.toString('utf-8');
+    // Discard the first partial line (unless we read from the start of the file)
+    const lines = raw.split('\n');
+    const completeLines = readStart > 0 ? lines.slice(1) : lines;
+    const nonEmpty = completeLines.filter((l) => l.trim());
+    if (nonEmpty.length >= minLines || chunkSize >= MAX_READ || readStart === 0) {
+      return nonEmpty;
+    }
+    // Grow chunk and retry
+    chunkSize = Math.min(chunkSize * 2, MAX_READ);
+  }
+  return [];
+}
 
 type TranscriptLine = {
   type?: string;
@@ -87,16 +149,26 @@ function isNonMainAgentTranscriptEntry(parsed: TranscriptLine, text: string): bo
 export async function extractChatFromTranscript(
   transcriptPath: string,
   limit = 200,
+  tailMode = false,
 ): Promise<Array<{ role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' }>> {
   if (!transcriptPath) return [];
-  let raw: string;
-  try {
-    raw = await readFile(transcriptPath, 'utf-8');
-  } catch {
-    return [];
+
+  let lines: string[];
+  if (tailMode) {
+    // Efficient tail read: only read the last portion of the file
+    lines = await readTailLines(transcriptPath, limit);
+  } else {
+    let raw: string;
+    try {
+      raw = await readFile(transcriptPath, 'utf-8');
+    } catch {
+      return [];
+    }
+    lines = raw.split('\n').filter((l) => l.trim());
   }
+
   const items: Array<{ role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' }> = [];
-  for (const line of raw.split('\n')) {
+  for (const line of lines) {
     if (!line.trim()) continue;
     let parsed: TranscriptLine & { isSidechain?: boolean; timestamp?: string };
     try {

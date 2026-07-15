@@ -607,27 +607,54 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   await clearStaleCodexPermissionIfTmuxNoLongerAsking(tmuxName);
   const session = store.getSession(tmuxName);
 
-  // 現在動いてる Claude Code / Codex を registry や tmux から探す
-  const [detected, codexDetected] = await Promise.all([
-    detectClaudeSessions(),
-    detectCodexSessions().catch(() => []),
-  ]);
-  const det = detected.find((d) => d.tmuxSessionName === tmuxName);
-  const codexDet = codexDetected.find((d) => d.tmuxSessionName === tmuxName);
+  // ── Store-first: avoid detect scans when the store has source + fields ──
+  // For hook-active sessions the store already has everything we need.
+  // Detect functions are only called as fallback (and they are now cached).
+  type DetResult = Awaited<ReturnType<typeof detectClaudeSessions>>[number] | undefined;
+  type CodexDetResult = Awaited<ReturnType<typeof detectCodexSessions>>[number] | undefined;
+  let det: DetResult = undefined;
+  let codexDet: CodexDetResult = undefined;
+
+  const storeHasSource = session && session.source;
+  if (!storeHasSource) {
+    // No hook data: fall back to (cached) detect
+    const [detected, codexDetected] = await Promise.all([
+      detectClaudeSessions(),
+      detectCodexSessions().catch(() => []),
+    ]);
+    det = detected.find((d) => d.tmuxSessionName === tmuxName);
+    codexDet = codexDetected.find((d) => d.tmuxSessionName === tmuxName);
+  }
 
   // hook 経由で記録された chat
   const hookChat = session?.chat ?? [];
 
+  // Parse tail query param (clamped 1..200)
+  const tailParam = c.req.query('tail');
+  const tailN = tailParam ? Math.max(1, Math.min(200, Math.floor(Number(tailParam)))) : undefined;
+  const transcriptLimit = tailN ?? 200;
+
   // transcript を読んで履歴を補完 (hook では取りこぼす過去分も拾える)。
-  // Claude は registry から transcript path を推定し、Codex は hook payload の
-  // transcript_path をセッションに保存して使う。
+  // Store-first: Claude sessions use store's cwd/ccSessionId when available;
+  // only fall back to detect results when the store lacks them.
   let transcriptChat: ChatItem[] = [];
   if (session?.source === 'codex' && session.transcriptPath && existsSync(session.transcriptPath)) {
-    transcriptChat = await extractCodexChatFromTranscript(session.transcriptPath, 200);
-  } else if (det && det.cwd && det.ccSessionId) {
-    const path = transcriptPathFor(det.cwd, det.ccSessionId);
-    if (existsSync(path)) {
-      transcriptChat = await extractChatFromTranscript(path, 200);
+    transcriptChat = await extractCodexChatFromTranscript(session.transcriptPath, transcriptLimit, tailN ? true : false);
+  } else {
+    // Resolve cwd/ccSessionId: prefer store, fall back to detect
+    const cwd = session?.cwd || det?.cwd || '';
+    const ccSessionId = session?.ccSessionId || det?.ccSessionId || '';
+    if (cwd && ccSessionId) {
+      const path = transcriptPathFor(cwd, ccSessionId);
+      if (existsSync(path)) {
+        transcriptChat = await extractChatFromTranscript(path, transcriptLimit, tailN ? true : false);
+      }
+    } else if (!session?.source && det?.cwd && det?.ccSessionId) {
+      // Truly hookless session: use detect result
+      const path = transcriptPathFor(det.cwd, det.ccSessionId);
+      if (existsSync(path)) {
+        transcriptChat = await extractChatFromTranscript(path, transcriptLimit, tailN ? true : false);
+      }
     }
   }
 
@@ -674,6 +701,11 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
     }
   }
   merged.sort((a, b) => a.ts - b.ts);
+
+  // tail: return only the last N entries (before synthetic status injection)
+  if (tailN && merged.length > tailN) {
+    merged.splice(0, merged.length - tailN);
+  }
 
   if (merged.length === 0 && !session && !codexDet) {
     return c.json({ error: 'not found' }, 404);
