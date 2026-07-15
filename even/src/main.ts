@@ -328,11 +328,13 @@ function isReady(): boolean {
 
 function recomputePhase(): void {
   // pendingは「ユーザの判断待ち」なので自動で抜けない
+  // cc-response も応答操作中なので自動で抜けない
   if (
     phase === 'recording' ||
     phase === 'finalizing' ||
     phase === 'pending' ||
-    phase === 'sending'
+    phase === 'sending' ||
+    phase === 'cc-response'
   ) return
   if (!isReady()) {
     phase = 'unconfigured'
@@ -730,14 +732,14 @@ function scrollForward(): void {
  *  スクロール速度が 0 の時はアニメーションせず、pending を一括消化して 1 回だけ再描画する。 */
 function startScrollAnimation(): void {
   if (scrollAnimTimer) return  // 既に走っているなら何もしない (pending が増えただけ)
-  // 速度 0: アニメ無し。目的位置へ一気に移動して updateContent も 1 回だけ。
+  // 速度 0: アニメ無し。目的位置へ一気に移動して content 更新も 1 回だけ。
   if (scrollAnimTickMs() <= 0) {
     if (phase !== 'idle') { scrollAnimPending = 0; return }
     const next = Math.max(0, Math.min(maxChatScrollOffset(), scrollOffset + scrollAnimPending))
     scrollAnimPending = 0
     if (next !== scrollOffset) {
       scrollOffset = next
-      void updateContent(buildG2Content())
+      void sendContentOnly(buildG2Content())
     }
     return
   }
@@ -755,7 +757,7 @@ function startScrollAnimation(): void {
       if (next !== scrollOffset) { scrollOffset = next; changed = true }
       scrollAnimPending++
     }
-    if (changed) void updateContent(buildG2Content())  // fire-and-forget で SDK 往復を待たない
+    if (changed) void sendContentOnly(buildG2Content())  // 直列化ロック経由で SDK 送信
     if (scrollAnimPending !== 0) scrollAnimTimer = setTimeout(() => { void tick() }, scrollAnimTickMs())
   }
   scrollAnimTimer = setTimeout(() => { void tick() }, scrollAnimTickMs())
@@ -836,6 +838,20 @@ function buildG2Header(): string {
   }
 }
 
+// ─── G2 レンダリング直列化 ──────────────────────────────────────────────
+// SDK 送信は一度に 1 シーケンスのみ実行する。実行中に要求が来たら pending フラグを
+// 立て、完了後に最新状態で 1 回だけ再描画する (latest-wins coalescing)。
+// scroll アニメの content-only 更新も同じロックを共有し、full render との
+// インターリーブを防ぐ。
+let g2SendLock = false            // SDK 送信中 (full render or content-only)
+let g2RenderPending = false       // full render の待機要求あり
+let g2RenderPendingForce = false  // 待機要求の force を OR で蓄積
+
+/**
+ * G2 レンズの全面更新 (header + content + footer) を要求する。
+ * 同時に 1 つしか実行されず、実行中の要求は coalesce されて完了後に 1 回だけ再描画。
+ * force=false の場合はスロットル (G2_REFRESH_THROTTLE_MS) が適用される。
+ */
 async function refreshG2(force = false): Promise<void> {
   if (!bridge) {
     console.log('[refreshG2] bailed: no bridge')
@@ -846,14 +862,101 @@ async function refreshG2(force = false): Promise<void> {
     console.log(`[refreshG2] throttled (Δ=${(now - g2RefreshLastAt).toFixed(0)}ms)`)
     return
   }
-  g2RefreshLastAt = now
+  // ロック中なら pending に積む (latest-wins: 実行完了後に最新状態で 1 回だけ再描画)
+  if (g2SendLock) {
+    g2RenderPending = true
+    g2RenderPendingForce = g2RenderPendingForce || force
+    console.log(`[refreshG2] queued (force=${force})`)
+    return
+  }
+  await executeFullRender(force)
+}
+
+/**
+ * full render 実行ループ。pending がある間は完了後にもう 1 回実行する。
+ * ロックの取得/解放とエラーハンドリングを 1 箇所に集約する。
+ */
+async function executeFullRender(force: boolean): Promise<void> {
+  g2SendLock = true
   try {
-    console.log(`[refreshG2] firing (phase=${phase}, force=${force})`)
-    await updateHeader(buildG2Header())
-    await updateContent(buildG2Content())
-    await updateFooter(buildG2Footer())
+    // ── render loop: pending がある限り最新状態で再描画 ──
+    let currentForce = force
+    do {
+      // pending フラグをクリア (この render 中に新しい要求が来たら再度立つ)
+      g2RenderPending = false
+      g2RenderPendingForce = false
+      g2RefreshLastAt = performance.now()
+      // header / content / footer を同期的に一括ビルド (同一 phase スナップショット)
+      const header = buildG2Header()
+      const content = buildG2Content()
+      const footer = buildG2Footer()
+      try {
+        console.log(`[refreshG2] firing (phase=${phase}, force=${currentForce})`)
+        await updateHeader(header)
+        await updateContent(content)
+        await updateFooter(footer)
+      } catch (err) {
+        log(`G2 refresh error: ${err}`)
+      }
+      // pending が溜まっていたら次のイテレーションへ
+      currentForce = g2RenderPendingForce
+    } while (g2RenderPending)
+  } finally {
+    g2SendLock = false
+  }
+}
+
+/**
+ * content-only の SDK 送信 (scroll アニメ用)。full render と同じロックを共有し、
+ * full render 実行中には content-only 送信をスキップする (full render の方が
+ * 包括的に最新状態を描画するため)。
+ */
+async function sendContentOnly(content: string): Promise<void> {
+  if (g2SendLock) {
+    // full render (または別の content-only) が実行中。full render の方が最新状態を
+    // 包括的に描画するため、content-only はドロップしても画面は最新になる。
+    console.log('[sendContentOnly] skipped: send lock held')
+    return
+  }
+  g2SendLock = true
+  try {
+    await updateContent(content)
   } catch (err) {
-    log(`G2 refresh error: ${err}`)
+    log(`G2 content-only error: ${err}`)
+  } finally {
+    g2SendLock = false
+    // content-only 完了後に pending full render があれば実行する
+    if (g2RenderPending) {
+      const force = g2RenderPendingForce
+      g2RenderPending = false
+      g2RenderPendingForce = false
+      void executeFullRender(force)
+    }
+  }
+}
+
+/**
+ * showScreen (rebuildPageContainer) をロック経由で呼ぶ。
+ * boot / foreground 再入場 / 言語切替などページ全体再構築時に使う。
+ * ロック中ならページ再構築が終わるまで待つ (ドロップではなくキューイング)。
+ */
+async function sendShowScreen(header: string, content: string, footer: string): Promise<void> {
+  // ロック取得を待つ: 他の SDK 送信が完了するまでスピンしない Promise で待機
+  while (g2SendLock) {
+    await new Promise((r) => setTimeout(r, 16))
+  }
+  g2SendLock = true
+  try {
+    await showScreen(header, content, footer)
+  } finally {
+    g2SendLock = false
+    // showScreen 完了後に pending full render があれば実行する
+    if (g2RenderPending) {
+      const force = g2RenderPendingForce
+      g2RenderPending = false
+      g2RenderPendingForce = false
+      void executeFullRender(force)
+    }
   }
 }
 
@@ -2341,7 +2444,7 @@ async function changeLanguage(lang: Language): Promise<void> {
   // G2 レンズも「言語切替」を 1 つの画面遷移と扱って rebuildPageContainer で再描画。
   if (bridge) {
     try {
-      await showScreen(buildG2Header(), buildG2Content(), buildG2Footer())
+      await sendShowScreen(buildG2Header(), buildG2Content(), buildG2Footer())
     } catch (err) {
       log(`G2 re-render on lang change error: ${err}`)
     }
@@ -2421,7 +2524,7 @@ async function boot(): Promise<void> {
         resetPageState()
         void (async () => {
           try {
-            await showScreen(buildG2Header(), buildG2Content(), buildG2Footer())
+            await sendShowScreen(buildG2Header(), buildG2Content(), buildG2Footer())
           } catch (err) {
             log(`re-render error: ${err}`)
           }
@@ -2436,7 +2539,7 @@ async function boot(): Promise<void> {
       onLog: (msg) => log(msg),
     })
     try {
-      await showScreen(buildG2Header(), buildG2Content(), buildG2Footer())
+      await sendShowScreen(buildG2Header(), buildG2Content(), buildG2Footer())
       bridge.onEvenHubEvent(onEvenHubEvent)
     } catch (err) {
       log(`G2 initial render error: ${err}`)
@@ -2486,7 +2589,7 @@ async function boot(): Promise<void> {
   // resetPageState は呼ばない (createStartUpPageContainer の二重発行を避ける)。
   if (bridge) {
     try {
-      await showScreen(buildG2Header(), buildG2Content(), buildG2Footer())
+      await sendShowScreen(buildG2Header(), buildG2Content(), buildG2Footer())
       log(`G2 lens rendered (phase=${phase})`)
     } catch (err) {
       log(`G2 final render error: ${err}`)
