@@ -163,8 +163,9 @@ export class HeadlenssClient {
     return data.sessions
   }
 
-  async getClaudeChat(name: string, signal?: AbortSignal): Promise<ClaudeChatResponse> {
-    const res = await fetch(this.url(`/api/claude/sessions/${encodeURIComponent(name)}/chat`), { signal })
+  async getClaudeChat(name: string, signal?: AbortSignal, tail?: number): Promise<ClaudeChatResponse> {
+    const qs = tail != null && tail > 0 ? `?tail=${tail}` : ''
+    const res = await fetch(this.url(`/api/claude/sessions/${encodeURIComponent(name)}/chat${qs}`), { signal })
     if (res.status === 404) return { chat: [] }
     if (!res.ok) throw new Error(`getClaudeChat HTTP ${res.status}`)
     const data = (await res.json()) as ClaudeChatResponse

@@ -250,6 +250,7 @@ let claudeSessions: ClaudeSessionInfo[] = []     // 起動中Claude Codeを持�
 let claudeChat: ChatItem[] = []                  // 現在選択中セッションのチャット履歴
 let currentAgentSource: AgentSource | undefined = undefined
 let claudePending: Pending | null = null         // 現在選択中セッションの承認/質問待ち
+let claudeChatLoading = false                    // セッション切替直後のロード中フラグ
 let claudePollTimer: ReturnType<typeof setInterval> | null = null
 // refreshClaudeData の非同期レース防止: 実行中の fetch を abort し、完了時にセッション名を検証する
 let refreshAbortCtrl: AbortController | null = null
@@ -403,7 +404,7 @@ function buildG2Content(): string {
       // かかって切れる時、この空行を犠牲にして実テキストを安全域へ逃がす。
       return settings.chatBottomSpacer ? body + '\n' : body
     }
-    return `[${settings.sessionName || 'no session'}]\n${t('chatNoMsg')}`
+    return `[${settings.sessionName || 'no session'}]\n${claudeChatLoading ? t('chatLoading') : t('chatNoMsg')}`
   }
 
   // Claude Code 承認/質問 待ちへの応答画面
@@ -899,11 +900,14 @@ sessionPillsEl.addEventListener('click', (e) => {
     abortInFlightRefresh()
     settings.sessionName = name
     void persistSettings()
+    claudeChat = []
+    claudeChatLoading = true
     renderSessionPills()
     recomputePhase()
     tmuxOutput = ''
     resetScroll()
     void refreshClaudeData()
+    startOutputPolling()  // ポーリングタイマーをリセット
   }
 })
 
@@ -1006,7 +1010,7 @@ async function refreshClaudeData(): Promise<void> {
   const targetSession = settings.sessionName
   try {
     const [chatResponse, pending] = await Promise.all([
-      client.getClaudeChat(targetSession, ctrl.signal),
+      client.getClaudeChat(targetSession, ctrl.signal, 20),
       client.getClaudePending(targetSession, ctrl.signal),
     ])
     // ── セッション切替ガード: fetch 中にユーザがセッションを変えた場合は結果を破棄 ──
@@ -1024,6 +1028,7 @@ async function refreshClaudeData(): Promise<void> {
       }
     }
     claudeChat = chat
+    claudeChatLoading = false
     claudePending = pending
     if (chat.length > 0) {
       const lastUser = [...chat].reverse().find((c) => c.role === 'user')?.text ?? ''
@@ -1047,6 +1052,8 @@ async function refreshClaudeData(): Promise<void> {
   } catch (e) {
     // AbortError はセッション切替による意図的キャンセルなので無視する
     if ((e as DOMException).name === 'AbortError') return
+    // エラーでも現在セッション向けのフェッチならローディング解除
+    if (settings.sessionName === targetSession) claudeChatLoading = false
     const msg = (e as Error).message
     setOutputDisplay(`error: ${msg}`, 'err')
     log(`refreshClaudeData error: ${msg}`)
@@ -1812,6 +1819,7 @@ function openSelectedFromRoot(): void {
   void persistSettings()
   log(`Opened Agent session: ${sel.tmuxSessionName}`)
   claudeChat = []
+  claudeChatLoading = true
   currentAgentSource = sel.source
   claudePending = null
   resetScroll()
@@ -1821,6 +1829,7 @@ function openSelectedFromRoot(): void {
   updateRecordButton()
   renderClaudeSessionsList()  // WebView 側のハイライトを更新
   void refreshClaudeData()
+  startOutputPolling()  // ポーリングタイマーをリセットし、次 tick を 1 interval 先に置く
 }
 
 function moveRespondCursor(delta: number): void {
@@ -2417,6 +2426,7 @@ async function boot(): Promise<void> {
             log(`re-render error: ${err}`)
           }
           void refreshClaudeData()
+          startOutputPolling()  // ポーリングタイマーをリセット
         })()
       },
       onForegroundExit: () => {
