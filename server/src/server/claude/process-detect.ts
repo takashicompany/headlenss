@@ -28,9 +28,15 @@ type RegistryEntry = {
 const DETECT_TTL_MS = 2500;
 let claudeDetectCache: { result: DetectedSession[]; expiresAt: number } | null = null;
 let claudeDetectInFlight: Promise<DetectedSession[]> | null = null;
+// Generation counter: incremented on invalidation. An in-flight scan captures
+// the generation at start and only writes its result to the cache when the
+// generation still matches — preventing a stale scan that started before an
+// invalidation from overwriting the (now-null) cache after it.
+let claudeDetectGeneration = 0;
 
 /** Invalidate the detect cache so the next call triggers a fresh scan. */
 export function invalidateClaudeDetectCache(): void {
+  claudeDetectGeneration++;
   claudeDetectCache = null;
 }
 
@@ -44,9 +50,13 @@ export async function detectClaudeSessions(): Promise<DetectedSession[]> {
     return claudeDetectCache.result;
   }
   if (claudeDetectInFlight) return claudeDetectInFlight;
+  const genAtStart = claudeDetectGeneration;
   claudeDetectInFlight = detectClaudeSessionsUncached().then(
     (result) => {
-      claudeDetectCache = { result, expiresAt: Date.now() + DETECT_TTL_MS };
+      // Only cache if no invalidation occurred since scan started
+      if (claudeDetectGeneration === genAtStart) {
+        claudeDetectCache = { result, expiresAt: Date.now() + DETECT_TTL_MS };
+      }
       claudeDetectInFlight = null;
       return result;
     },

@@ -76,7 +76,11 @@ export async function extractCodexChatFromTranscript(
 
   let lines: string[];
   if (tailMode) {
-    lines = await readTailLines(transcriptPath, limit);
+    // Transcript JSONL lines are not 1:1 with visible chat items (tool_use,
+    // internal events, etc. are skipped), so request a margin so that
+    // tail=10 reliably yields 10 visible items on typical transcripts.
+    const minLines = Math.min(600, limit * 3);
+    lines = await readTailLines(transcriptPath, minLines);
   } else {
     let raw: string;
     try {

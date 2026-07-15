@@ -52,7 +52,12 @@ function isOriginAllowed(origin: string | undefined | null): boolean {
   return ALLOWED_ORIGINS.includes(origin);
 }
 
-/** Invalidate both detect caches so next request triggers a fresh scan. */
+/** Invalidate both detect caches so next request triggers a fresh scan.
+ *
+ * Note: hook endpoints (claude/router.ts, codex/router.ts) intentionally do NOT
+ * invalidate detect caches. Hooks update the store directly; detect staleness
+ * within the TTL window is acceptable. Only session lifecycle endpoints (create,
+ * delete, release, mount, rename) call this function. */
 function invalidateDetectCaches(): void {
   invalidateClaudeDetectCache();
   invalidateCodexDetectCache();

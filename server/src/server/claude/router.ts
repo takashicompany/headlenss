@@ -607,31 +607,30 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   await clearStaleCodexPermissionIfTmuxNoLongerAsking(tmuxName);
   const session = store.getSession(tmuxName);
 
-  // ── Store-first: avoid detect scans when the store has source + fields ──
-  // For hook-active sessions the store already has everything we need.
-  // Detect functions are only called as fallback (and they are now cached).
+  // ── Always call (cached) detect for status resolution ──
+  // Claude hooks never call store.setStatus('busy') — busy status comes ONLY
+  // from the registry via detectClaudeSessions(). Detect functions are cached
+  // (TTL + singleflight) so cache hits are memory-only and the perf win is
+  // preserved. Store-first logic is kept ONLY for transcript-path resolution
+  // (store cwd/ccSessionId preferred, detect as fallback).
   type DetResult = Awaited<ReturnType<typeof detectClaudeSessions>>[number] | undefined;
   type CodexDetResult = Awaited<ReturnType<typeof detectCodexSessions>>[number] | undefined;
-  let det: DetResult = undefined;
-  let codexDet: CodexDetResult = undefined;
-
-  const storeHasSource = session && session.source;
-  if (!storeHasSource) {
-    // No hook data: fall back to (cached) detect
-    const [detected, codexDetected] = await Promise.all([
-      detectClaudeSessions(),
-      detectCodexSessions().catch(() => []),
-    ]);
-    det = detected.find((d) => d.tmuxSessionName === tmuxName);
-    codexDet = codexDetected.find((d) => d.tmuxSessionName === tmuxName);
-  }
+  const [detected, codexDetected] = await Promise.all([
+    detectClaudeSessions(),
+    detectCodexSessions().catch(() => []),
+  ]);
+  const det: DetResult = detected.find((d) => d.tmuxSessionName === tmuxName);
+  const codexDet: CodexDetResult = codexDetected.find((d) => d.tmuxSessionName === tmuxName);
 
   // hook 経由で記録された chat
   const hookChat = session?.chat ?? [];
 
-  // Parse tail query param (clamped 1..200)
+  // Parse tail query param (clamped 1..200, NaN-safe)
   const tailParam = c.req.query('tail');
-  const tailN = tailParam ? Math.max(1, Math.min(200, Math.floor(Number(tailParam)))) : undefined;
+  const raw = Number(tailParam);
+  const tailN = tailParam && Number.isFinite(raw) && raw > 0
+    ? Math.max(1, Math.min(200, Math.floor(raw)))
+    : undefined;
   const transcriptLimit = tailN ?? 200;
 
   // transcript を読んで履歴を補完 (hook では取りこぼす過去分も拾える)。
@@ -639,7 +638,7 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   // only fall back to detect results when the store lacks them.
   let transcriptChat: ChatItem[] = [];
   if (session?.source === 'codex' && session.transcriptPath && existsSync(session.transcriptPath)) {
-    transcriptChat = await extractCodexChatFromTranscript(session.transcriptPath, transcriptLimit, tailN ? true : false);
+    transcriptChat = await extractCodexChatFromTranscript(session.transcriptPath, transcriptLimit, !!tailN);
   } else {
     // Resolve cwd/ccSessionId: prefer store, fall back to detect
     const cwd = session?.cwd || det?.cwd || '';
@@ -647,13 +646,7 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
     if (cwd && ccSessionId) {
       const path = transcriptPathFor(cwd, ccSessionId);
       if (existsSync(path)) {
-        transcriptChat = await extractChatFromTranscript(path, transcriptLimit, tailN ? true : false);
-      }
-    } else if (!session?.source && det?.cwd && det?.ccSessionId) {
-      // Truly hookless session: use detect result
-      const path = transcriptPathFor(det.cwd, det.ccSessionId);
-      if (existsSync(path)) {
-        transcriptChat = await extractChatFromTranscript(path, transcriptLimit, tailN ? true : false);
+        transcriptChat = await extractChatFromTranscript(path, transcriptLimit, !!tailN);
       }
     }
   }
@@ -666,7 +659,13 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
     .filter((m) => m.text.length > 0);
   // 補完は cleanedHookChat から (Codex+transcript は従来どおり全捨て)、
   // enrichment だけは全 hookChat から行う。
-  const cleanedHookChat = session?.source === 'codex' && transcriptChat.length > 0 ? [] : allCleanedHookChat;
+  let cleanedHookChat = session?.source === 'codex' && transcriptChat.length > 0 ? [] : allCleanedHookChat;
+
+  // In tail mode, pre-cut cleanedHookChat to its last tailN entries so a large
+  // hookChat can't crowd out newer transcript entries after the final splice.
+  if (tailN && cleanedHookChat.length > tailN) {
+    cleanedHookChat = cleanedHookChat.slice(-tailN);
+  }
 
   // hookChat の origin / agent を role:text キーで引けるルックアップを作成。
   // transcript 側のエントリが重複排除で勝つ際に、hook 側の origin / agent を引き継ぐ。

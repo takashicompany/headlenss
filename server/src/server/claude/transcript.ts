@@ -5,6 +5,11 @@ import { open, readFile, stat } from 'node:fs/promises';
  * read only the last chunk, discard the first partial line, and return the
  * remaining complete lines. Grows the chunk if fewer than `minLines` lines
  * are found, up to a maximum of ~2MB total read.
+ *
+ * Note: when reading from a mid-file offset, the first partial line may be
+ * broken at a multi-byte UTF-8 boundary. This is safe because slice(1)
+ * discards that partial line, and any remaining malformed lines are caught
+ * by the caller's JSON.parse try/catch.
  */
 export async function readTailLines(
   filePath: string,
@@ -33,33 +38,40 @@ export async function readTailLines(
     }
   }
 
-  while (chunkSize <= MAX_READ) {
-    const readStart = Math.max(0, fileSize - chunkSize);
-    const readLen = fileSize - readStart;
-    let buf: Buffer;
-    try {
-      const fh = await open(filePath, 'r');
+  // Open the file handle once before the grow-retry loop; close in finally.
+  let fh: Awaited<ReturnType<typeof open>>;
+  try {
+    fh = await open(filePath, 'r');
+  } catch {
+    return [];
+  }
+
+  try {
+    while (chunkSize <= MAX_READ) {
+      const readStart = Math.max(0, fileSize - chunkSize);
+      const readLen = fileSize - readStart;
+      let buf: Buffer;
       try {
         buf = Buffer.alloc(readLen);
         await fh.read(buf, 0, readLen, readStart);
-      } finally {
-        await fh.close();
+      } catch {
+        return [];
       }
-    } catch {
-      return [];
+      const raw = buf.toString('utf-8');
+      // Discard the first partial line (unless we read from the start of the file)
+      const lines = raw.split('\n');
+      const completeLines = readStart > 0 ? lines.slice(1) : lines;
+      const nonEmpty = completeLines.filter((l) => l.trim());
+      if (nonEmpty.length >= minLines || chunkSize >= MAX_READ || readStart === 0) {
+        return nonEmpty;
+      }
+      // Grow chunk and retry
+      chunkSize = Math.min(chunkSize * 2, MAX_READ);
     }
-    const raw = buf.toString('utf-8');
-    // Discard the first partial line (unless we read from the start of the file)
-    const lines = raw.split('\n');
-    const completeLines = readStart > 0 ? lines.slice(1) : lines;
-    const nonEmpty = completeLines.filter((l) => l.trim());
-    if (nonEmpty.length >= minLines || chunkSize >= MAX_READ || readStart === 0) {
-      return nonEmpty;
-    }
-    // Grow chunk and retry
-    chunkSize = Math.min(chunkSize * 2, MAX_READ);
+    return [];
+  } finally {
+    await fh.close();
   }
-  return [];
 }
 
 type TranscriptLine = {
@@ -155,8 +167,12 @@ export async function extractChatFromTranscript(
 
   let lines: string[];
   if (tailMode) {
-    // Efficient tail read: only read the last portion of the file
-    lines = await readTailLines(transcriptPath, limit);
+    // Efficient tail read: only read the last portion of the file.
+    // Transcript JSONL lines are not 1:1 with visible chat items (tool_use,
+    // sidechain, meta lines are skipped), so request a margin so that
+    // tail=10 reliably yields 10 visible items on typical transcripts.
+    const minLines = Math.min(600, limit * 3);
+    lines = await readTailLines(transcriptPath, minLines);
   } else {
     let raw: string;
     try {
