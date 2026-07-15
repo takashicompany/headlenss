@@ -147,7 +147,49 @@ export function codexPaneNeedsHookAttention(paneText: string): boolean {
   return /\/hooks|hook.+review|review.+hook|trust.+hook|hook.+trust|not trusted|skipped.+hook/i.test(paneText);
 }
 
+// ── TTL cache + singleflight for detectCodexSessions ──
+const DETECT_TTL_MS = 2500;
+let codexDetectCache: { result: DetectedCodexSession[]; expiresAt: number } | null = null;
+let codexDetectInFlight: Promise<DetectedCodexSession[]> | null = null;
+// Generation counter: incremented on invalidation. An in-flight scan captures
+// the generation at start and only writes its result to the cache when the
+// generation still matches — preventing a stale scan that started before an
+// invalidation from overwriting the (now-null) cache after it.
+let codexDetectGeneration = 0;
+
+/** Invalidate the detect cache so the next call triggers a fresh scan. */
+export function invalidateCodexDetectCache(): void {
+  codexDetectGeneration++;
+  codexDetectCache = null;
+}
+
 export async function detectCodexSessions(): Promise<DetectedCodexSession[]> {
+  const now = Date.now();
+  if (codexDetectCache && now < codexDetectCache.expiresAt) {
+    return codexDetectCache.result;
+  }
+  if (codexDetectInFlight) return codexDetectInFlight;
+  const genAtStart = codexDetectGeneration;
+  codexDetectInFlight = detectCodexSessionsUncached().then(
+    (result) => {
+      // Only cache if no invalidation occurred since scan started
+      if (codexDetectGeneration === genAtStart) {
+        codexDetectCache = { result, expiresAt: Date.now() + DETECT_TTL_MS };
+      }
+      codexDetectInFlight = null;
+      return result;
+    },
+    (err) => {
+      codexDetectInFlight = null;
+      throw err;
+    },
+  );
+  return codexDetectInFlight;
+}
+
+async function detectCodexSessionsUncached(): Promise<DetectedCodexSession[]> {
+  console.log('[detect] scan codex');
+
   let stdout = '';
   try {
     const result = await exec('tmux', [

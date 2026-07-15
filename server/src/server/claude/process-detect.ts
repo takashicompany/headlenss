@@ -24,11 +24,52 @@ type RegistryEntry = {
   status?: string;
 };
 
+// ── TTL cache + singleflight for detectClaudeSessions ──
+const DETECT_TTL_MS = 2500;
+let claudeDetectCache: { result: DetectedSession[]; expiresAt: number } | null = null;
+let claudeDetectInFlight: Promise<DetectedSession[]> | null = null;
+// Generation counter: incremented on invalidation. An in-flight scan captures
+// the generation at start and only writes its result to the cache when the
+// generation still matches — preventing a stale scan that started before an
+// invalidation from overwriting the (now-null) cache after it.
+let claudeDetectGeneration = 0;
+
+/** Invalidate the detect cache so the next call triggers a fresh scan. */
+export function invalidateClaudeDetectCache(): void {
+  claudeDetectGeneration++;
+  claudeDetectCache = null;
+}
+
 /**
  * `~/.claude/sessions/<PID>.json` レジストリ(undocumented but reliable)を読んで
  * 生きている Claude Code プロセスを検出し、tmux session 名と紐付ける。
  */
 export async function detectClaudeSessions(): Promise<DetectedSession[]> {
+  const now = Date.now();
+  if (claudeDetectCache && now < claudeDetectCache.expiresAt) {
+    return claudeDetectCache.result;
+  }
+  if (claudeDetectInFlight) return claudeDetectInFlight;
+  const genAtStart = claudeDetectGeneration;
+  claudeDetectInFlight = detectClaudeSessionsUncached().then(
+    (result) => {
+      // Only cache if no invalidation occurred since scan started
+      if (claudeDetectGeneration === genAtStart) {
+        claudeDetectCache = { result, expiresAt: Date.now() + DETECT_TTL_MS };
+      }
+      claudeDetectInFlight = null;
+      return result;
+    },
+    (err) => {
+      claudeDetectInFlight = null;
+      throw err;
+    },
+  );
+  return claudeDetectInFlight;
+}
+
+async function detectClaudeSessionsUncached(): Promise<DetectedSession[]> {
+  console.log('[detect] scan claude');
   const dir = resolve(homedir(), '.claude/sessions');
   if (!existsSync(dir)) return [];
 

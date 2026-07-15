@@ -607,27 +607,47 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   await clearStaleCodexPermissionIfTmuxNoLongerAsking(tmuxName);
   const session = store.getSession(tmuxName);
 
-  // 現在動いてる Claude Code / Codex を registry や tmux から探す
+  // ── Always call (cached) detect for status resolution ──
+  // Claude hooks never call store.setStatus('busy') — busy status comes ONLY
+  // from the registry via detectClaudeSessions(). Detect functions are cached
+  // (TTL + singleflight) so cache hits are memory-only and the perf win is
+  // preserved. Store-first logic is kept ONLY for transcript-path resolution
+  // (store cwd/ccSessionId preferred, detect as fallback).
+  type DetResult = Awaited<ReturnType<typeof detectClaudeSessions>>[number] | undefined;
+  type CodexDetResult = Awaited<ReturnType<typeof detectCodexSessions>>[number] | undefined;
   const [detected, codexDetected] = await Promise.all([
     detectClaudeSessions(),
     detectCodexSessions().catch(() => []),
   ]);
-  const det = detected.find((d) => d.tmuxSessionName === tmuxName);
-  const codexDet = codexDetected.find((d) => d.tmuxSessionName === tmuxName);
+  const det: DetResult = detected.find((d) => d.tmuxSessionName === tmuxName);
+  const codexDet: CodexDetResult = codexDetected.find((d) => d.tmuxSessionName === tmuxName);
 
   // hook 経由で記録された chat
   const hookChat = session?.chat ?? [];
 
+  // Parse tail query param (clamped 1..200, NaN-safe)
+  const tailParam = c.req.query('tail');
+  const raw = Number(tailParam);
+  const tailN = tailParam && Number.isFinite(raw) && raw > 0
+    ? Math.max(1, Math.min(200, Math.floor(raw)))
+    : undefined;
+  const transcriptLimit = tailN ?? 200;
+
   // transcript を読んで履歴を補完 (hook では取りこぼす過去分も拾える)。
-  // Claude は registry から transcript path を推定し、Codex は hook payload の
-  // transcript_path をセッションに保存して使う。
+  // Store-first: Claude sessions use store's cwd/ccSessionId when available;
+  // only fall back to detect results when the store lacks them.
   let transcriptChat: ChatItem[] = [];
   if (session?.source === 'codex' && session.transcriptPath && existsSync(session.transcriptPath)) {
-    transcriptChat = await extractCodexChatFromTranscript(session.transcriptPath, 200);
-  } else if (det && det.cwd && det.ccSessionId) {
-    const path = transcriptPathFor(det.cwd, det.ccSessionId);
-    if (existsSync(path)) {
-      transcriptChat = await extractChatFromTranscript(path, 200);
+    transcriptChat = await extractCodexChatFromTranscript(session.transcriptPath, transcriptLimit, !!tailN);
+  } else {
+    // Resolve cwd/ccSessionId: prefer store, fall back to detect
+    const cwd = session?.cwd || det?.cwd || '';
+    const ccSessionId = session?.ccSessionId || det?.ccSessionId || '';
+    if (cwd && ccSessionId) {
+      const path = transcriptPathFor(cwd, ccSessionId);
+      if (existsSync(path)) {
+        transcriptChat = await extractChatFromTranscript(path, transcriptLimit, !!tailN);
+      }
     }
   }
 
@@ -639,7 +659,13 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
     .filter((m) => m.text.length > 0);
   // 補完は cleanedHookChat から (Codex+transcript は従来どおり全捨て)、
   // enrichment だけは全 hookChat から行う。
-  const cleanedHookChat = session?.source === 'codex' && transcriptChat.length > 0 ? [] : allCleanedHookChat;
+  let cleanedHookChat = session?.source === 'codex' && transcriptChat.length > 0 ? [] : allCleanedHookChat;
+
+  // In tail mode, pre-cut cleanedHookChat to its last tailN entries so a large
+  // hookChat can't crowd out newer transcript entries after the final splice.
+  if (tailN && cleanedHookChat.length > tailN) {
+    cleanedHookChat = cleanedHookChat.slice(-tailN);
+  }
 
   // hookChat の origin / agent を role:text キーで引けるルックアップを作成。
   // transcript 側のエントリが重複排除で勝つ際に、hook 側の origin / agent を引き継ぐ。
@@ -674,6 +700,11 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
     }
   }
   merged.sort((a, b) => a.ts - b.ts);
+
+  // tail: return only the last N entries (before synthetic status injection)
+  if (tailN && merged.length > tailN) {
+    merged.splice(0, merged.length - tailN);
+  }
 
   if (merged.length === 0 && !session && !codexDet) {
     return c.json({ error: 'not found' }, 404);

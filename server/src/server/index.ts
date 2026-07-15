@@ -14,8 +14,8 @@ import { cleanupAllHeadlessEntries, handlePtyConnection } from './pty.ts';
 import { getBackendName, isAsrReady, transcribePcm16, transcribeWav } from './asr/index.ts';
 import { claudeRouter } from './claude/router.ts';
 import { codexRouter } from './codex/router.ts';
-import { detectCodexSessions, getCodexHookHealth } from './codex/status.ts';
-import { detectClaudeSessions } from './claude/process-detect.ts';
+import { detectCodexSessions, getCodexHookHealth, invalidateCodexDetectCache } from './codex/status.ts';
+import { detectClaudeSessions, invalidateClaudeDetectCache } from './claude/process-detect.ts';
 import * as claudeStore from './claude/store.ts';
 import { sanitizeChatText } from './claude/transcript.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot, stopPeriodicSnapshot } from './persist.ts';
@@ -50,6 +50,17 @@ function isOriginAllowed(origin: string | undefined | null): boolean {
   if (ALLOW_ALL_ORIGINS) return true;
   if (!origin) return false;
   return ALLOWED_ORIGINS.includes(origin);
+}
+
+/** Invalidate both detect caches so next request triggers a fresh scan.
+ *
+ * Note: hook endpoints (claude/router.ts, codex/router.ts) intentionally do NOT
+ * invalidate detect caches. Hooks update the store directly; detect staleness
+ * within the TTL window is acceptable. Only session lifecycle endpoints (create,
+ * delete, release, mount, rename) call this function. */
+function invalidateDetectCaches(): void {
+  invalidateClaudeDetectCache();
+  invalidateCodexDetectCache();
 }
 
 const app = new Hono();
@@ -191,6 +202,7 @@ app.post('/api/sessions', async (c) => {
         source,
       });
     }
+    invalidateDetectCaches();
     // 直近の tmux 状態をスナップショットに反映 (再起動越しの復元に効く)
     void saveSnapshot();
     return c.json({ ok: true });
@@ -225,6 +237,7 @@ app.patch('/api/sessions/:name', async (c) => {
         transcriptPath: tracked.transcriptPath,
       });
     }
+    invalidateDetectCaches();
     void saveSnapshot();
     return c.json({ ok: true });
   } catch (e) {
@@ -243,6 +256,7 @@ app.post('/api/sessions/:name/release', async (c) => {
     retainSession({ ...live, cwd: cwd ?? tracked?.cwd ?? process.cwd(), agent: tracked?.source });
     await killSession(name);
     claudeStore.removeSession(name);
+    invalidateDetectCaches();
     void saveSnapshot();
     return c.json({ ok: true });
   } catch (e) {
@@ -273,6 +287,7 @@ app.post('/api/sessions/:name/mount', async (c) => {
         source: retained.agent,
       });
     }
+    invalidateDetectCaches();
     void saveSnapshot();
     return c.json({ ok: true });
   } catch (e) {
@@ -289,6 +304,7 @@ app.delete('/api/sessions/:name', async (c) => {
     // hook 経由で記録された Claude セッションエントリも合わせて削除する。
     // これをやらないと /api/claude/sessions に死んだ tmux セッションが残り続ける。
     claudeStore.removeSession(name);
+    invalidateDetectCaches();
     void saveSnapshot();
     return c.json({ ok: true });
   } catch (e) {
