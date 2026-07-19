@@ -104,12 +104,11 @@ const ChatMessageItem = React.memo(function ChatMessageItem({
   t: (key: import('../i18n.tsx').StringKey) => string;
 }) {
   const renderedText = useMemo(() => inlineUploadedImages(message.text), [message.text]);
-  const isExternal = message.role === 'user' && message.origin === 'external';
 
-  // ラベル: user = 'YOU' / 'EXTERNAL'(外部入力)、assistant = agent 名 / 'Agent'(fallback)
+  // ラベル: user = 'YOU'、assistant = agent 名 / 'Agent'(fallback)
   let roleLabel: string;
   if (message.role === 'user') {
-    roleLabel = isExternal ? t('originExternal') : 'YOU';
+    roleLabel = 'YOU';
   } else {
     roleLabel = message.agent === 'claude' ? 'Claude'
               : message.agent === 'codex' ? 'Codex'
@@ -118,7 +117,7 @@ const ChatMessageItem = React.memo(function ChatMessageItem({
 
   return (
     <div
-      className={`chat-msg chat-msg-${message.role}${isPending ? ' chat-msg-pending' : ''}${isExternal ? ' chat-msg-external' : ''}`}
+      className={`chat-msg chat-msg-${message.role}${isPending ? ' chat-msg-pending' : ''}`}
     >
       <div className="chat-msg-role">{roleLabel}</div>
       <div className="chat-msg-bubble markdown-body">
@@ -218,10 +217,18 @@ export function ChatView({
     keyboardHeight > 0 ? `${keyboardHeight + chatInputHeight}px` : undefined;
 
   // 表示は server + pending を順に並べる(pending は常に末尾、ts 順)。
+  // origin==='external' の user メッセージは web chat では非表示。
   // 初期表示は直近分だけに絞り、必要に応じて上部ボタンで過去分を追加する。
+  const isExternalUser = (m: ChatMessage) => m.role === 'user' && m.origin === 'external';
   const displayChat = useMemo(() => {
-    return [...serverChat, ...pending];
+    return [...serverChat, ...pending].filter((m) => !isExternalUser(m));
   }, [serverChat, pending]);
+  // pending (楽観的投稿) は origin==='external' にならないので、
+  // filteredServerCount が displayChat 内の server 由来メッセージ数と一致する。
+  const filteredServerCount = useMemo(
+    () => serverChat.filter((m) => !isExternalUser(m)).length,
+    [serverChat],
+  );
   const visibleStart = Math.max(0, displayChat.length - visibleLimit);
   const visibleChat = useMemo(() => {
     return displayChat.slice(visibleStart);
@@ -654,7 +661,7 @@ export function ChatView({
             )}
             {visibleChat.map((m, i) => {
               const globalIndex = visibleStart + i;
-              const isPending = globalIndex >= serverChat.length;
+              const isPending = globalIndex >= filteredServerCount;
               return (
                 <ChatMessageItem
                   key={m.role + ':' + m.ts + ':' + globalIndex + ':' + m.text.slice(0, 32)}
