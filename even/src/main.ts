@@ -725,6 +725,17 @@ function scrollForward(): void {
   startScrollAnimation()
 }
 
+/** scroll アニメ終了時に延期された full render を発火する */
+function flushDeferredRender(): void {
+  g2RenderDeferredAt = null
+  if (g2RenderPending) {
+    const force = g2RenderPendingForce
+    g2RenderPending = false
+    g2RenderPendingForce = false
+    void refreshG2(force)
+  }
+}
+
 /** 1 行ずつ scrollOffset を進めるアニメーションループ。
  *  scrollAnimPending を 0 に向けて消化する。新たに scroll イベントが来たら自動で延長される。
  *  refreshG2 を await することで SDK レンダリングを 1 行ごとに必ず確定させる
@@ -745,7 +756,7 @@ function startScrollAnimation(): void {
   }
   const tick = async (): Promise<void> => {
     scrollAnimTimer = null
-    if (phase !== 'idle') { scrollAnimPending = 0; return }
+    if (phase !== 'idle') { scrollAnimPending = 0; flushDeferredRender(); return }
     let changed = false
     if (scrollAnimPending > 0) {
       const max = maxChatScrollOffset()
@@ -758,7 +769,12 @@ function startScrollAnimation(): void {
       scrollAnimPending++
     }
     if (changed) void sendContentOnly(buildG2Content())  // 直列化ロック経由で SDK 送信
-    if (scrollAnimPending !== 0) scrollAnimTimer = setTimeout(() => { void tick() }, scrollAnimTickMs())
+    if (scrollAnimPending !== 0) {
+      scrollAnimTimer = setTimeout(() => { void tick() }, scrollAnimTickMs())
+    } else {
+      // アニメーション終了 — 延期された full render があれば発火する
+      flushDeferredRender()
+    }
   }
   scrollAnimTimer = setTimeout(() => { void tick() }, scrollAnimTickMs())
 }
@@ -839,13 +855,17 @@ function buildG2Header(): string {
 }
 
 // ─── G2 レンダリング直列化 ──────────────────────────────────────────────
-// SDK 送信は一度に 1 シーケンスのみ実行する。実行中に要求が来たら pending フラグを
-// 立て、完了後に最新状態で 1 回だけ再描画する (latest-wins coalescing)。
-// scroll アニメの content-only 更新も同じロックを共有し、full render との
-// インターリーブを防ぐ。
+// SDK 送信は一度に 1 シーケンスのみ実行する (at most one in-flight)。
+// content-only (scroll): ロック中は g2ContentPending に最新値を保持し、送信完了後に
+//   drain する (latest-wins coalesce)。フレームドロップなし。
+// full render: scroll アニメ中は延期し、アニメ終了時にまとめて実行する。
+//   2000ms 安全弁で長期ブロックを防ぐ。full render と content-only は同じロックで
+//   インターリーブしない。
 let g2SendLock = false            // SDK 送信中 (full render or content-only)
 let g2RenderPending = false       // full render の待機要求あり
 let g2RenderPendingForce = false  // 待機要求の force を OR で蓄積
+let g2ContentPending: string | null = null  // content-only の latest-wins バッファ
+let g2RenderDeferredAt: number | null = null  // scroll 中の full render 延期開始時刻
 
 /**
  * G2 レンズの全面更新 (header + content + footer) を要求する。
@@ -861,6 +881,21 @@ async function refreshG2(force = false): Promise<void> {
   if (!force && now - g2RefreshLastAt < G2_REFRESH_THROTTLE_MS) {
     console.log(`[refreshG2] throttled (Δ=${(now - g2RefreshLastAt).toFixed(0)}ms)`)
     return
+  }
+  // scroll アニメ中は full render を延期する (content-only で十分)。
+  // ただし 2000ms 安全弁を超えたら強制実行する。
+  // speed-0 パスは timer を使わないので scrollAnimTimer === null → 延期しない。
+  if (scrollAnimTimer !== null) {
+    if (g2RenderDeferredAt === null) g2RenderDeferredAt = now
+    if (now - g2RenderDeferredAt < 2000) {
+      g2RenderPending = true
+      g2RenderPendingForce = g2RenderPendingForce || force
+      console.log(`[refreshG2] deferred: scroll anim active (force=${force})`)
+      return
+    }
+    // 安全弁: 2000ms 超過 — 延期解除して実行する
+    console.log('[refreshG2] safety valve: deferred >2000ms, executing')
+    g2RenderDeferredAt = null
   }
   // ロック中なら pending に積む (latest-wins: 実行完了後に最新状態で 1 回だけ再描画)
   if (g2SendLock) {
@@ -885,6 +920,8 @@ async function executeFullRender(force: boolean): Promise<void> {
       // pending フラグをクリア (この render 中に新しい要求が来たら再度立つ)
       g2RenderPending = false
       g2RenderPendingForce = false
+      // full render は content-only より新しい状態を描画する → stale 送信を防ぐ
+      g2ContentPending = null
       g2RefreshLastAt = performance.now()
       // header / content / footer を同期的に一括ビルド (同一 phase スナップショット)
       const header = buildG2Header()
@@ -903,26 +940,45 @@ async function executeFullRender(force: boolean): Promise<void> {
     } while (g2RenderPending)
   } finally {
     g2SendLock = false
+    // full render 完了後、scroll tick が await 中に新しい content を積んでいた場合は
+    // flush する。full render の最終 await 後に来た content は full render より新しいため送信が必要。
+    if (g2ContentPending !== null) {
+      const pending = g2ContentPending
+      g2ContentPending = null
+      void sendContentOnly(pending)
+    }
   }
 }
 
 /**
- * content-only の SDK 送信 (scroll アニメ用)。full render と同じロックを共有し、
- * full render 実行中には content-only 送信をスキップする (full render の方が
- * 包括的に最新状態を描画するため)。
+ * content-only の SDK 送信 (scroll アニメ用)。full render と同じロックを共有する。
+ * ロック中は g2ContentPending に最新値を保持し (latest-wins)、送信側が drain する。
+ * フレームドロップなし — 最悪でも最新の 1 フレームが必ず送信される。
  */
 async function sendContentOnly(content: string): Promise<void> {
   if (g2SendLock) {
-    // full render (または別の content-only) が実行中。full render の方が最新状態を
-    // 包括的に描画するため、content-only はドロップしても画面は最新になる。
-    console.log('[sendContentOnly] skipped: send lock held')
+    // ロック保持者 (full render or 別の content-only) が drain する
+    g2ContentPending = content
+    console.log('[sendContentOnly] coalesced: send lock held')
     return
   }
   g2SendLock = true
   try {
-    await updateContent(content)
-  } catch (err) {
-    log(`G2 content-only error: ${err}`)
+    // drain loop: 送信中に新しい content が積まれたら最新値を再送信する
+    let current: string | null = content
+    while (current !== null) {
+      const toSend = current
+      current = null
+      // drain 前に pending をクリア (await 中に新しい値が来たら g2ContentPending に積まれる)
+      g2ContentPending = null
+      try {
+        await updateContent(toSend)
+      } catch (err) {
+        log(`G2 content-only error: ${err}`)
+      }
+      // await 中に積まれた最新値を取得して次のイテレーションへ
+      current = g2ContentPending
+    }
   } finally {
     g2SendLock = false
     // content-only 完了後に pending full render があれば実行する
