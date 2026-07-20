@@ -151,6 +151,30 @@ Speechmatics のエンドポイントを書く必要がある (詳細: [even/REA
 - **G2 から**: クリックで録音開始/停止 → 上スワイプで tmux 送信 / 下スワイプで破棄。
   Idle中はtmux画面末尾がレンズに表示される。
 
+## トラブルシューティング (Even/G2 から繋がらない時)
+
+「サーバーは起動しているのに Even/G2 アプリから繋がらない」— 一番多いのは
+**`ALLOWED_ORIGINS` の絞りすぎ**。接続は次の **2つのゲートを両方通す**必要がある:
+
+1. **Even WebView の whitelist** (`even/app.json`) — Server base URL がここに
+   一致しないと端末内でブロックされ、サーバーに到達すらしない。
+2. **サーバーの Origin 許可** (`server/.env` の `ALLOWED_ORIGINS`) — WebView は
+   Origin ヘッダに `null` や `http://localhost` を送るため、`https://<host>` 等
+   だけに絞ると **CORS で 403** になる。
+
+対処 (簡単な順):
+
+- tailnet 内限定運用なら **`ALLOWED_ORIGINS=*`(既定)のまま**にする。接続元は
+  Tailscale ACL / ファイアウォールで絞れば十分守れる。
+- どうしても絞りたい場合は WebView の origin も列挙する:
+  `ALLOWED_ORIGINS=null,http://localhost,https://<host>.<tailnet>.ts.net`
+
+切り分けのコツ: `curl` は Origin を送らないので絞っていても 200 で通ってしまう。
+`-H "Origin: null"` を付けて叩くと、ブラウザ/WebView と同じ 403 を再現できる。
+絞った状態で弾かれると、サーバーログに `[cors] ⚠ ... 拒否しました` が出る。
+
+詳細は [server/README.md](./server/README.md#接続できない-cors--origin-の-ハマりどころ) を参照。
+
 ## ライセンス
 
 MIT License — 詳細は [LICENSE](./LICENSE) を参照。

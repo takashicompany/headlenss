@@ -52,6 +52,25 @@ function isOriginAllowed(origin: string | undefined | null): boolean {
   return ALLOWED_ORIGINS.includes(origin);
 }
 
+// Origin を弾いたときに一度だけ警告を出す。ポーリングで氾濫させないよう
+// distinct な origin ごとに 1 回に絞る。ALLOWED_ORIGINS を絞った人が
+// 「サーバーには届いているのに 403 で無言で弾かれている」状況に気付けるようにする。
+// (今回の実例: Even/G2 アプリの WebView は Origin=null / http://localhost 等を送るため、
+//  https://<host> だけを allowlist に入れると G2 から一切繋がらない。)
+const warnedRejectedOrigins = new Set<string>();
+function warnRejectedOrigin(origin: string, channel: 'http' | 'ws'): void {
+  if (warnedRejectedOrigins.has(origin)) return;
+  warnedRejectedOrigins.add(origin);
+  console.warn(
+    `[cors] ⚠ ${channel} リクエストを origin "${origin}" から拒否しました ` +
+      `(現在の ALLOWED_ORIGINS: ${ALLOWED_ORIGINS.join(', ')})。\n` +
+      `      Even/G2 アプリや一部 WebView は Origin=null / http://localhost を送るため、` +
+      `allowlist を絞ると弾かれます。\n` +
+      `      繋ぎたい場合は ALLOWED_ORIGINS にこの origin を追加するか、` +
+      `ALLOWED_ORIGINS=* (tailnet 内限定なら実質安全) にしてください。`,
+  );
+}
+
 /** Invalidate both detect caches so next request triggers a fresh scan.
  *
  * Note: hook endpoints (claude/router.ts, codex/router.ts) intentionally do NOT
@@ -73,6 +92,7 @@ const app = new Hono();
 app.use('/api/*', async (c, next) => {
   const origin = c.req.header('origin');
   if (origin && !isOriginAllowed(origin)) {
+    warnRejectedOrigin(origin, 'http');
     return c.json({ error: 'forbidden: origin not allowed' }, 403);
   }
   await next();
@@ -596,6 +616,7 @@ server.on('upgrade', (req, socket, head) => {
   //  同一 origin で開かれるので許可される)。
   const origin = req.headers.origin;
   if (!isOriginAllowed(origin)) {
+    if (origin) warnRejectedOrigin(origin, 'ws');
     socket.destroy();
     return;
   }
