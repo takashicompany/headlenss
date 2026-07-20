@@ -542,7 +542,9 @@ claudeRouter.get('/claude/sessions', async (c) => {
 
   // ~/.claude/sessions/ レジストリから検出 (プラグインなしでも検出可)
   const [detected, codexDetected] = await Promise.all([
-    detectClaudeSessions(),
+    // 検出失敗時は 500 にせず [] に倒す (process-detect 側が throttle 付きで warn 済み)。
+    // hook/store 追跡分は保持されるので、検出のみのセッションが一時的に欠けるだけ。
+    detectClaudeSessions().catch(() => []),
     detectCodexSessions().catch(() => []),
   ]);
 
@@ -616,7 +618,9 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   type DetResult = Awaited<ReturnType<typeof detectClaudeSessions>>[number] | undefined;
   type CodexDetResult = Awaited<ReturnType<typeof detectCodexSessions>>[number] | undefined;
   const [detected, codexDetected] = await Promise.all([
-    detectClaudeSessions(),
+    // 検出失敗時は 500 にせず [] に倒す (process-detect 側が throttle 付きで warn 済み)。
+    // hook/store 追跡分は保持されるので、検出のみのセッションが一時的に欠けるだけ。
+    detectClaudeSessions().catch(() => []),
     detectCodexSessions().catch(() => []),
   ]);
   const det: DetResult = detected.find((d) => d.tmuxSessionName === tmuxName);
@@ -706,7 +710,10 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
     merged.splice(0, merged.length - tailN);
   }
 
-  if (merged.length === 0 && !session && !codexDet) {
+  // det (process-detect で見つかった Claude セッション) も 404 判定に含める。
+  // これが抜けていると、検出済みだが transcript がまだ空の Claude セッションを
+  // 開いたときに 404 → チャットが空表示になってしまう。
+  if (merged.length === 0 && !session && !det && !codexDet) {
     return c.json({ error: 'not found' }, 404);
   }
   // Claude Code の動作状態 (idle / busy / waiting-*) を一緒に返して、
