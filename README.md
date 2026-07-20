@@ -169,6 +169,30 @@ You also need to add your PC hostname and the Speechmatics endpoints to the `net
 - **From the Web UI**: open `http://<PC hostname>:3000/`, create a tmux session, and operate it.
 - **From G2**: tap to start / stop recording → swipe up to send to tmux / swipe down to discard. While idle the tail of the tmux screen is mirrored on the lens.
 
+## Troubleshooting (can't connect from Even/G2)
+
+"The server is running but the Even/G2 app won't connect" — the most common cause is
+**over-restricting `ALLOWED_ORIGINS`**. A connection must pass **two independent gates**:
+
+1. **Even WebView whitelist** (`even/app.json`) — if the Server base URL doesn't match an
+   entry, the request is blocked on the device and never reaches the server.
+2. **Server Origin allowlist** (`ALLOWED_ORIGINS` in `server/.env`) — the WebView sends
+   an `Origin` header of `null` or `http://localhost`, so restricting it to only
+   `https://<host>` returns **403** (CORS).
+
+Fixes (easiest first):
+
+- For tailnet-only use, keep **`ALLOWED_ORIGINS=*` (the default)** and restrict who can
+  reach the server via Tailscale ACLs / firewall instead.
+- If you must restrict it, also list the WebView origins:
+  `ALLOWED_ORIGINS=null,http://localhost,https://<host>.<tailnet>.ts.net`
+
+Debugging tip: `curl` sends no `Origin` header, so it returns 200 even when the allowlist
+is restrictive — only browsers/WebViews get 403. Reproduce it with `-H "Origin: null"`.
+When a request is rejected, the server logs `[cors] ⚠ ... 拒否しました`.
+
+See [server/README.md](./server/README.md#接続できない-cors--origin-の-ハマりどころ) for details.
+
 ## License
 
 MIT License — see [LICENSE](./LICENSE).

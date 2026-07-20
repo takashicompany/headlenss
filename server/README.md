@@ -111,7 +111,8 @@ npm run dev
 | 変数 | デフォルト | 説明 |
 |---|---|---|
 | `PORT` | `3000` | リッスンポート |
-| `HOST` | `0.0.0.0` | バインドアドレス。`127.0.0.1`にすればローカル限定 |
+| `HOST` | `127.0.0.1` | バインドアドレス。他端末から触らせるなら `0.0.0.0` を明示指定 |
+| `ALLOWED_ORIGINS` | `*` (全許可) | CORS/WS の許可 Origin を CSV 指定。**絞ると Even/G2 アプリが繋がらなくなる場合あり** ([下記](#接続できない-cors--origin-の-ハマりどころ)) |
 
 ### ASR(音声認識)バックエンド選択
 | 変数 | デフォルト | 説明 |
@@ -157,6 +158,38 @@ tailscale ip -4
 # http://<このマシンのhostname>:3000/        (MagicDNS)
 # http://<hostname>.<tailnet>.ts.net:3000/   (FQDN)
 ```
+
+### 接続できない (CORS / Origin の ハマりどころ)
+
+Even/G2 アプリや Web UI から「サーバーは起動しているのに繋がらない」場合、
+`ALLOWED_ORIGINS` の絞りすぎが原因のことが多い。**接続は2つの独立したゲートを
+両方通す必要がある**:
+
+1. **Even WebView の whitelist** (`even/app.json` の `network` permission) —
+   Server base URL がここに一致しないと端末内でブロックされ、サーバーに到達すらしない。
+2. **サーバーの Origin allowlist** (`ALLOWED_ORIGINS`) — WebView が送る Origin
+   (`null` や `http://localhost`) を弾くと **403** になる。
+
+症状での切り分け:
+
+| 症状 | 疑うゲート | 対処 |
+|---|---|---|
+| サーバーログに何も出ない / リクエストが1件も届かない | ① whitelist or tailnet 到達性 | `even/app.json` の whitelist に base URL を合わせる。tailnet 疎通を確認 |
+| サーバーログに `[cors] ⚠ ... 拒否しました` が出る | ② `ALLOWED_ORIGINS` | `ALLOWED_ORIGINS=*` に戻す、または `null,http://localhost` を追記 |
+
+`curl` は Origin ヘッダを送らないため常に通ってしまい、ブラウザ/WebView だけが
+403 になる。**疎通確認は Origin 付きで**行うと再現できる:
+
+```bash
+# Origin 無し (curl 既定) → allowlist を絞っていても 200 で通ってしまう
+curl -s -o /dev/null -w "%{http_code}\n" http://<host>:3000/api/health
+
+# WebView を模した Origin=null → 絞っていると 403 が返る (これが実際の失敗)
+curl -s -o /dev/null -w "%{http_code}\n" -H "Origin: null" http://<host>:3000/api/health
+```
+
+tailnet 内限定で運用しているなら、`ALLOWED_ORIGINS=*` のままにして
+接続元は Tailscale ACL / ファイアウォールで絞るのが最も簡単で安全。
 
 ### HTTPS化したい場合 (任意)
 

@@ -96,6 +96,17 @@ G2マイク (PCM 16kHz S16LE)
 
 `wss://` を許容するかどうかなどは G2 アプリ側の挙動を実機で確認する必要あり。
 
+### 繋がらない時 (whitelist と サーバー CORS の2ゲート)
+
+このアプリからサーバーに繋ぐには **2つのゲートを両方通す**必要がある:
+
+1. **この `whitelist`** — Server base URL がここに一致しないと WebView が通信を
+   ブロックし、サーバーに到達すらしない。base URL を変えたら whitelist も合わせる。
+2. **サーバー側の `ALLOWED_ORIGINS`** (`server/.env`) — この WebView は Origin ヘッダに
+   `null` / `http://localhost` を送るため、サーバーがそれを許可していないと **403**。
+   tailnet 内限定なら `ALLOWED_ORIGINS=*` のままが簡単で安全
+   (詳細: [server/README.md](../server/README.md#接続できない-cors--origin-の-ハマりどころ))。
+
 ## ファイル構成
 
 ```
