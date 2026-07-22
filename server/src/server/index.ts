@@ -16,6 +16,7 @@ import { claudeRouter } from './claude/router.ts';
 import { codexRouter } from './codex/router.ts';
 import { detectCodexSessions, getCodexHookHealth, invalidateCodexDetectCache } from './codex/status.ts';
 import { detectClaudeSessions, invalidateClaudeDetectCache } from './claude/process-detect.ts';
+import { detectLiveOwners, invalidateLiveOwnerCache } from './claude/live-owner.ts';
 import * as claudeStore from './claude/store.ts';
 import { sanitizeChatText } from './claude/transcript.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot, stopPeriodicSnapshot } from './persist.ts';
@@ -61,6 +62,7 @@ function isOriginAllowed(origin: string | undefined | null): boolean {
 function invalidateDetectCaches(): void {
   invalidateClaudeDetectCache();
   invalidateCodexDetectCache();
+  invalidateLiveOwnerCache();
 }
 
 const app = new Hono();
@@ -146,25 +148,35 @@ function buildLastChat(tmuxName: string): { role: 'user' | 'assistant'; text: st
 }
 
 app.get('/api/sessions', async (c) => {
-  const [sessions, detected, codexDetected] = await Promise.all([
+  const [sessions, detected, codexDetected, liveOwners] = await Promise.all([
     listSessions(),
     detectClaudeSessions().catch(() => []),
     detectCodexSessions().catch(() => []),
+    // live owner (今その画面を握っている本人)。失敗時は null → sticky フォールバック。
+    detectLiveOwners().catch(() => null),
   ]);
   const detectedMap = new Map(detected.map((d) => [d.tmuxSessionName, d]));
   const codexMap = new Map(codexDetected.map((d) => [d.tmuxSessionName, d]));
   const liveNames = new Set(sessions.map((s) => s.name));
   const enriched = sessions.map((s) => {
     const tracked = claudeStore.getSession(s.name);
-    const agent = tracked?.source ?? (codexMap.has(s.name) ? 'codex' : detectedMap.has(s.name) ? 'claude' : undefined);
+    // agent は live owner を最優先 → store → 検出。owner 不明時は sticky。
+    const live = liveOwners?.get(s.name)?.source;
+    const agent = live ?? tracked?.source ?? (codexMap.has(s.name) ? 'codex' : detectedMap.has(s.name) ? 'claude' : undefined);
+    // store が現在の主と別 agent の残骸なら、その status/chat は別ランのものなので使わない。
+    const storeMatches = !tracked?.source || tracked.source === agent;
     return {
       ...s,
-      claudeStatus: tracked?.source === 'claude' ? tracked.status : detectedMap.get(s.name)?.status,
+      claudeStatus: agent === 'claude'
+        ? (storeMatches && tracked?.source === 'claude' ? tracked.status : detectedMap.get(s.name)?.status)
+        : undefined,
       agent,
-      codexStatus: tracked?.source === 'codex' ? tracked.status : codexMap.get(s.name)?.status,
+      codexStatus: agent === 'codex'
+        ? (storeMatches && tracked?.source === 'codex' ? tracked.status : codexMap.get(s.name)?.status)
+        : undefined,
       codexHookHealth: codexMap.get(s.name)?.hookHealth ?? (agent === 'codex' ? getCodexHookHealth(tracked?.cwd) : getCodexHookHealth()),
-      codexNeedsHookAttention: codexMap.get(s.name)?.needsHookAttention ?? false,
-      lastChat: buildLastChat(s.name),
+      codexNeedsHookAttention: (agent === 'codex' && codexMap.get(s.name)?.needsHookAttention) ?? false,
+      lastChat: storeMatches ? buildLastChat(s.name) : undefined,
     };
   });
   for (const retained of listRetainedSessions(liveNames)) {
