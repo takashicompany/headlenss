@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import { setTimeout as wait } from 'node:timers/promises';
 import { detectClaudeSessions } from './process-detect.ts';
 import { detectPaneOwners } from '../paneOwner.ts';
+import { resolveSessionStatus } from '../sessionStatus.ts';
 import * as store from './store.ts';
 import { resolveTmuxSessionName } from './tmux-resolver.ts';
 import { captureOutput } from '../tmux.ts';
@@ -261,6 +262,7 @@ claudeRouter.post('/hooks/pre-tool-use', async (c) => {
   store.createPending(tmuxName, {
     kind: 'question',
     hookEvent: 'PreToolUse',
+    source: 'claude',
     toolName,
     toolInput,
     questions: toolInput.questions,
@@ -495,6 +497,7 @@ claudeRouter.post('/hooks/permission-request', async (c) => {
   const pending = store.createPending(tmuxName, {
     kind: isAskQ ? 'question' : 'permission',
     hookEvent: 'PermissionRequest',
+    source: 'claude',
     toolName,
     toolInput,
     questions: isAskQ ? toolInput.questions : undefined,
@@ -588,13 +591,13 @@ claudeRouter.get('/claude/sessions', async (c) => {
     if (effSource === 'claude') {
       // store が別 agent (codex 残骸) の場合はその cwd/status を使わない。live 検出優先。
       const storeClaude = st?.source === 'claude' ? st : undefined;
-      // status: registry 由来の busy + store 由来の waiting-* をマージ (どちらか一方が
-      // 他方を隠さないように)。Stop 直後は busy を抑止。
-      let status: SessionStatus = cd?.status === 'busy' ? 'busy' : 'idle';
-      if (storeClaude && (storeClaude.status === 'waiting-permission' || storeClaude.status === 'waiting-question')) {
-        status = storeClaude.status;
-      }
-      if (status === 'busy' && storeClaude?.lastStopAt) status = 'idle';
+      const status = resolveSessionStatus({
+        effSource: 'claude',
+        storeMatched: !!storeClaude,
+        storeStatus: storeClaude?.status,
+        storeLastStopAt: storeClaude?.lastStopAt,
+        claudeBusy: cd?.status === 'busy',
+      });
       merged.push({
         tmuxSessionName: name,
         cwd: cd?.cwd || storeClaude?.cwd || '',
@@ -606,9 +609,13 @@ claudeRouter.get('/claude/sessions', async (c) => {
     } else {
       const storeCodex = st?.source === 'codex' ? st : undefined;
       const cwd = storeCodex?.cwd || xd?.cwd || '';
-      // status: store の非 idle (waiting-*/busy) を優先し、無ければ検出の waiting。
-      let status: SessionStatus = xd?.status === 'waiting-permission' ? 'waiting-permission' : 'idle';
-      if (storeCodex && storeCodex.status !== 'idle') status = storeCodex.status;
+      const status = resolveSessionStatus({
+        effSource: 'codex',
+        storeMatched: !!storeCodex,
+        storeStatus: storeCodex?.status,
+        storeLastStopAt: storeCodex?.lastStopAt,
+        codexWaitingPermission: xd?.status === 'waiting-permission',
+      });
       merged.push({
         tmuxSessionName: name,
         cwd,
@@ -763,19 +770,16 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   //   - 'idle' はそれ以外
   // hook session.status は常に 'idle' か 'waiting-*' (busy になる経路がない)ため、
   // 単純な ?? チェーンでは registry 由来の 'busy' が永遠に拾われない。merge する。
-  // status も実効ソースに合わせる。別 agent の store 由来 status は混ぜない。
-  let status: SessionStatus = 'idle';
-  if (effSource !== 'codex' && det?.status === 'busy') status = 'busy';
-  if (effSource === 'codex' && codexDet?.status === 'waiting-permission') status = 'waiting-permission';
-  if (storeMatchesEff && (session?.status === 'waiting-permission' || session?.status === 'waiting-question')) {
-    status = session.status;
-  }
-  // Stop hook が直近で発火していれば「ターン終了済み」なので busy を抑止。
-  // 次の user-prompt-submit が来るまではこのフラグが残り続け、registry が
-  // idle に追いつくまでの数秒間に「考え中」が残ってしまう問題を消す。
-  if (status === 'busy' && storeMatchesEff && session?.lastStopAt) {
-    status = 'idle';
-  }
+  // status は web 一覧・G2 一覧・chat で共通のリゾルバを使い、表示を一致させる。
+  // 別 agent の store 由来 status は混ぜない (storeMatchesEff)。
+  const status = resolveSessionStatus({
+    effSource,
+    storeMatched: storeMatchesEff && !!session,
+    storeStatus: session?.status,
+    storeLastStopAt: session?.lastStopAt,
+    claudeBusy: det?.status === 'busy',
+    codexWaitingPermission: codexDet?.status === 'waiting-permission',
+  });
 
   // G2 アプリは status フィールドを読まない(描画は chat 配列だけ)ので、
   // 状態を 1 行のメッセージとして合成 chat 末尾に注入。`synthetic: true` を立てて
@@ -811,6 +815,15 @@ claudeRouter.get('/claude/sessions/:tmuxName/pending', async (c) => {
   await clearStaleCodexPermissionIfTmuxNoLongerAsking(tmuxName);
   const pending = store.getPending(tmuxName);
   if (!pending) return c.json({ pending: null });
+  // pending を記録した agent と、今この pane を握っている本人が食い違う場合は
+  // 出さない (古い agent の承認待ちを G2 に表示し続けない)。owner 不明時は従来どおり。
+  const session = store.getSession(tmuxName);
+  const pendingSource = pending.source ?? session?.source;
+  const owner = (await detectPaneOwners().catch(() => []))
+    .find((o) => o.tmuxSessionName === tmuxName)?.source;
+  if (owner && pendingSource && owner !== pendingSource) {
+    return c.json({ pending: null });
+  }
   return c.json({ pending });
 });
 
@@ -824,9 +837,10 @@ claudeRouter.post('/claude/sessions/:tmuxName/respond', async (c) => {
   // Claude の pane に矢印+Enter を撃ち込む事故を防ぐ)。owner 不明時は従来どおり通す。
   // 鮮度が重要なのでキャッシュを使わず即時スキャンする (force=true)。
   const respondSession = store.getSession(tmuxName);
+  const pendingSource = pending.source ?? respondSession?.source;
   const respondOwner = (await detectPaneOwners(true).catch(() => []))
     .find((o) => o.tmuxSessionName === tmuxName)?.source;
-  if (respondOwner && respondSession?.source && respondOwner !== respondSession.source) {
+  if (respondOwner && pendingSource && respondOwner !== pendingSource) {
     return c.json(
       { error: 'owner changed: this pending belongs to a previous agent in this tmux' },
       409,

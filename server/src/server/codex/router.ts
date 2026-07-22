@@ -4,8 +4,22 @@ import { resolveTmuxSessionName } from '../claude/tmux-resolver.ts';
 import * as store from '../claude/store.ts';
 import { extractLastCodexAssistantText } from './transcript.ts';
 import { matchUiSubmission } from '../uiSubmissions.ts';
+import { detectPaneOwners } from '../paneOwner.ts';
 
 export const codexRouter = new Hono();
+
+// このフックが「今その pane を実際に握っている Codex 本人」由来か判定する。
+// 既存セッションが別 agent (Claude) のもので、かつ pane の owner が Codex でない
+// (= ヘッドレスの Codex サブエージェント等) の場合は take-over させない。
+// owner 不明時 / 新規 / 既に codex の場合は通す (sticky)。
+async function codexHookIsOwner(tmuxName: string): Promise<boolean> {
+  const existing = store.getSession(tmuxName);
+  if (!existing || existing.source === 'codex') return true;
+  const owner = (await detectPaneOwners().catch(() => []))
+    .find((o) => o.tmuxSessionName === tmuxName)?.source;
+  if (!owner) return true;
+  return owner === 'codex';
+}
 
 
 type CodexHookPayload = {
@@ -45,6 +59,7 @@ codexRouter.post('/hooks/codex/session-start', async (c) => {
   const tmuxName = await getTmuxName(c);
   console.log('[codex-hook] session-start tmux=' + tmuxName + ' src=' + (body.source ?? ''));
   if (!tmuxName) return emptyHookResponse(c);
+  if (!(await codexHookIsOwner(tmuxName))) return emptyHookResponse(c);
   upsertCodexSession(tmuxName, c, body);
   store.setStatus(tmuxName, 'idle');
   return emptyHookResponse(c);
@@ -54,6 +69,7 @@ codexRouter.post('/hooks/codex/user-prompt-submit', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as CodexHookPayload;
   const tmuxName = await getTmuxName(c);
   if (!tmuxName) return emptyHookResponse(c);
+  if (!(await codexHookIsOwner(tmuxName))) return emptyHookResponse(c);
   // Always upsert (not lazy-create) so that source flips to 'codex'
   // when the user switches from Claude to Codex in the same pane.
   upsertCodexSession(tmuxName, c, body);
@@ -73,6 +89,7 @@ codexRouter.post('/hooks/codex/stop', async (c) => {
   const tmuxName = await getTmuxName(c);
   console.log('[codex-hook] stop tmux=' + tmuxName + ' transcript=' + (body.transcript_path ?? '').slice(-40));
   if (!tmuxName) return emptyHookResponse(c);
+  if (!(await codexHookIsOwner(tmuxName))) return emptyHookResponse(c);
   upsertCodexSession(tmuxName, c, body);
   const transcriptPath = body.transcript_path ?? '';
   if (transcriptPath) {
@@ -89,6 +106,7 @@ codexRouter.post('/hooks/codex/post-tool-use', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as CodexHookPayload;
   const tmuxName = await getTmuxName(c);
   if (!tmuxName) return emptyHookResponse(c);
+  if (!(await codexHookIsOwner(tmuxName))) return emptyHookResponse(c);
   upsertCodexSession(tmuxName, c, body);
   store.clearPending(tmuxName);
   return emptyHookResponse(c);
@@ -97,7 +115,7 @@ codexRouter.post('/hooks/codex/post-tool-use', async (c) => {
 codexRouter.post('/hooks/codex/pre-tool-use', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as CodexHookPayload;
   const tmuxName = await getTmuxName(c);
-  if (tmuxName) upsertCodexSession(tmuxName, c, body);
+  if (tmuxName && (await codexHookIsOwner(tmuxName))) upsertCodexSession(tmuxName, c, body);
   // Codex PreToolUse is a policy hook. headlenss only needs approvals/questions,
   // so allow Codex to continue to its normal PermissionRequest flow.
   return emptyHookResponse(c);
@@ -109,6 +127,7 @@ codexRouter.post('/hooks/codex/permission-request', async (c) => {
   const toolName = body.tool_name ?? '';
   console.log('[codex-hook] permission-request tmux=' + tmuxName + ' tool=' + toolName);
   if (!tmuxName) return emptyHookResponse(c);
+  if (!(await codexHookIsOwner(tmuxName))) return emptyHookResponse(c);
   upsertCodexSession(tmuxName, c, body);
 
   store.createPending(tmuxName, {

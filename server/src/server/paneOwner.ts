@@ -52,8 +52,13 @@ function warnScanFailed(message: string): void {
 const TTL_MS = 2500;
 let cache: { result: PaneOwner[]; expiresAt: number } | null = null;
 let inFlight: Promise<PaneOwner[]> | null = null;
+// 世代カウンタ: force スキャンや invalidate で ++ する。開始時の世代と食い違ったら
+// (= 途中で新しい force が走ったら) その scan は cache を上書きしない。古い通常 scan が
+// 新しい force scan の結果を潰すのを防ぐ。
+let generation = 0;
 
 export function invalidatePaneOwnerCache(): void {
+  generation++;
   cache = null;
 }
 
@@ -64,16 +69,19 @@ export function invalidatePaneOwnerCache(): void {
  */
 export async function detectPaneOwners(force = false): Promise<PaneOwner[]> {
   if (force) {
+    generation++;
+    const myGen = generation;
     const result = await detectPaneOwnersUncached();
-    cache = { result, expiresAt: Date.now() + TTL_MS };
+    if (generation === myGen) cache = { result, expiresAt: Date.now() + TTL_MS };
     return result;
   }
   const now = Date.now();
   if (cache && now < cache.expiresAt) return cache.result;
   if (inFlight) return inFlight;
+  const genAtStart = generation;
   inFlight = detectPaneOwnersUncached().then(
     (result) => {
-      cache = { result, expiresAt: Date.now() + TTL_MS };
+      if (generation === genAtStart) cache = { result, expiresAt: Date.now() + TTL_MS };
       inFlight = null;
       return result;
     },

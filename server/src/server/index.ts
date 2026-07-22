@@ -17,6 +17,7 @@ import { codexRouter } from './codex/router.ts';
 import { detectCodexSessions, getCodexHookHealth, invalidateCodexDetectCache } from './codex/status.ts';
 import { detectClaudeSessions, invalidateClaudeDetectCache } from './claude/process-detect.ts';
 import { detectPaneOwners } from './paneOwner.ts';
+import { resolveSessionStatus } from './sessionStatus.ts';
 import * as claudeStore from './claude/store.ts';
 import { sanitizeChatText } from './claude/transcript.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot, stopPeriodicSnapshot } from './persist.ts';
@@ -166,15 +167,20 @@ app.get('/api/sessions', async (c) => {
       ?? (detectedMap.has(s.name) ? 'claude' : codexMap.has(s.name) ? 'codex' : undefined);
     // store が現在の主と別 agent の場合、その store の status/chat は別ランのものなので使わない。
     const storeMatches = !tracked?.source || tracked.source === agent;
+    // status は G2 一覧・chat と同じリゾルバで解決してエンドポイント間の食い違いを防ぐ。
+    const status = resolveSessionStatus({
+      effSource: agent,
+      storeMatched: storeMatches && !!tracked,
+      storeStatus: tracked?.status,
+      storeLastStopAt: tracked?.lastStopAt,
+      claudeBusy: detectedMap.get(s.name)?.status === 'busy',
+      codexWaitingPermission: codexMap.get(s.name)?.status === 'waiting-permission',
+    });
     return {
       ...s,
-      claudeStatus: agent === 'claude'
-        ? (storeMatches && tracked?.source === 'claude' ? tracked.status : detectedMap.get(s.name)?.status)
-        : undefined,
+      claudeStatus: agent === 'claude' ? status : undefined,
       agent,
-      codexStatus: agent === 'codex'
-        ? (storeMatches && tracked?.source === 'codex' ? tracked.status : codexMap.get(s.name)?.status)
-        : undefined,
+      codexStatus: agent === 'codex' ? status : undefined,
       codexHookHealth: codexMap.get(s.name)?.hookHealth ?? (agent === 'codex' ? getCodexHookHealth(tracked?.cwd) : getCodexHookHealth()),
       codexNeedsHookAttention: (agent === 'codex' && codexMap.get(s.name)?.needsHookAttention) ?? false,
       lastChat: storeMatches ? buildLastChat(s.name) : undefined,

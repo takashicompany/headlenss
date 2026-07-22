@@ -31,32 +31,15 @@ export function upsertSession(input: {
   const existing = sessions.get(input.tmuxSessionName);
   const now = Date.now();
   if (existing) {
-    // 主 (agent) が別物に変わった = 別ランが同じ tmux 名を使い始めた。前の agent の
-    // 会話 / 承認待ち / transcript を引き継ぐと混線・誤送信の元になるのでクリアする
-    // (出所の不変性: chat/pending は常に現在の source のものだけになる)。
-    const sourceChanged = !!input.source && !!existing.source && input.source !== existing.source;
+    // NOTE: source が別 agent に変わっても chat/pending は破壊的にクリアしない
+    // (ヘッドレスの非 owner フックが生きているセッション状態を消す事故を防ぐ)。
+    // 「今の主」に合わせた表示・pending 抑止は read 時に paneOwner ベースで行う。
+    // source の書き換え自体もフック側で owner ゲートしている。
     existing.ccSessionId = input.ccSessionId;
     existing.tmuxPane = input.tmuxPane;
     existing.cwd = input.cwd;
     if (input.source) existing.source = input.source;
-    if (sourceChanged) {
-      existing.chat = [];
-      existing.transcriptPath = input.transcriptPath;
-      existing.lastStopAt = undefined;
-      existing.startedAt = now;
-      if (existing.pending) {
-        const resolver = pendingResolvers.get(existing.pending.id);
-        if (resolver) {
-          resolver({ event: 'PreToolUse', permissionDecision: 'deny', reason: 'agent-changed' });
-          pendingResolvers.delete(existing.pending.id);
-        }
-        existing.pending = undefined;
-      }
-      existing.status = 'idle';
-      clearUiSubmissions(input.tmuxSessionName);
-    } else if (input.transcriptPath) {
-      existing.transcriptPath = input.transcriptPath;
-    }
+    if (input.transcriptPath) existing.transcriptPath = input.transcriptPath;
     existing.lastSeenAt = now;
     return existing;
   }
