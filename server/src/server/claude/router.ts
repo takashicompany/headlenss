@@ -573,12 +573,17 @@ claudeRouter.get('/claude/sessions', async (c) => {
   for (const name of names) {
     if (liveTmux && !liveTmux.has(name)) continue;
     const st = trackedByName.get(name);
-    const cd = claudeByName.get(name);
+    const ownerEntry = liveOwners?.get(name);
+    // Claude が owner のときは owner PID 一致の det「のみ」を使う (fail-closed)。
+    // 同名 last-wins でヘッドレス claude の cwd/status を出さないため。
+    const cd = ownerEntry?.source === 'claude'
+      ? detected.find((d) => d.pid === ownerEntry.pid)
+      : claudeByName.get(name);
     const xd = codexByName.get(name);
 
     // 実効ソース: live owner を最優先 → store → 検出。owner 不明時は sticky。
     const effSource: 'claude' | 'codex' | undefined =
-      liveOwners?.get(name)?.source ?? st?.source ?? (cd ? 'claude' : xd ? 'codex' : undefined);
+      ownerEntry?.source ?? st?.source ?? (cd ? 'claude' : xd ? 'codex' : undefined);
     if (!effSource) continue;
 
     // store が実効ソースと別 agent (残骸) の場合、その cwd/status は使わない。
@@ -638,11 +643,13 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   ]);
   // live owner (今その画面を握っている本人) を source の権威にする。
   const owner = liveOwners?.get(tmuxName);
-  // Claude の det は、複数 claude プロセスがある場合 owner の PID に一致するものを優先する
-  // (対話 claude が claude -p を呼んでいるとき、サブプロセスの transcript を選ばないため)。
-  const det: DetResult =
-    (owner?.source === 'claude' ? detected.find((d) => d.pid === owner.pid) : undefined)
-    ?? detected.find((d) => d.tmuxSessionName === tmuxName);
+  // Claude が owner のときは owner の PID に一致する det「のみ」を使う (fail-closed)。
+  // 名前フォールバックすると、対話 claude の registry がまだ出ていない一瞬に、
+  // 同名で拾える別の claude det (claude -p 等) の会話を出す恐れがあるため。
+  // owner が codex / 不明のときは従来どおり名前一致で解決する。
+  const det: DetResult = owner?.source === 'claude'
+    ? detected.find((d) => d.pid === owner.pid)
+    : detected.find((d) => d.tmuxSessionName === tmuxName);
   const codexDet: CodexDetResult = codexDetected.find((d) => d.tmuxSessionName === tmuxName);
 
   // 実効ソース: live owner を最優先 → store → 検出。owner 不明時は sticky。
@@ -786,9 +793,10 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   }
   // pending (PreToolUse / PermissionRequest 待ち) も同梱して、
   // chat UI で許可応答 / 質問回答の UI を出せるようにする。
-  const codexHookHealth = effSource === 'codex' && !storeIsStale && session?.cwd
-    ? getCodexHookHealth(session.cwd)
-    : codexDet?.hookHealth;
+  // codex health は effSource=codex のときのみ。claude セッションに codex 情報が漏れないように。
+  const codexHookHealth = effSource === 'codex'
+    ? (!storeIsStale && session?.cwd ? getCodexHookHealth(session.cwd) : codexDet?.hookHealth)
+    : undefined;
   return c.json({
     chat: merged,
     status,

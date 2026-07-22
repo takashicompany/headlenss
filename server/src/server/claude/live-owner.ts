@@ -35,6 +35,18 @@ function classifyComm(comm: string): AgentSource | null {
   return null;
 }
 
+// ── 失敗時の throttle 付き警告 ──
+// 消費側は .catch(()=>null) で sticky に倒すため、警告が無いと「ps が tpgid 非対応の
+// ホスト等で無言のまま永久に効かない」事故が起きうる (#57 と同じ轍)。throttle して残す。
+const WARN_INTERVAL_MS = 30_000;
+let lastWarnAt = 0;
+function warnScanFailed(message: string): void {
+  const now = Date.now();
+  if (now - lastWarnAt < WARN_INTERVAL_MS) return;
+  lastWarnAt = now;
+  console.warn(message);
+}
+
 // ── TTL cache + singleflight + generation (process-detect と同じ作法) ──
 const TTL_MS = 2500;
 let cache: { result: Map<string, LiveOwner>; expiresAt: number } | null = null;
@@ -79,6 +91,7 @@ async function detectLiveOwnersUncached(): Promise<Map<string, LiveOwner>> {
     // tmux サーバ不在 = 正常な「pane 0 件」。それ以外の失敗は throw して「不明」扱いに。
     const stderr = String((e as { stderr?: unknown }).stderr ?? '');
     if (/no server running|no current (client|session)|error connecting/i.test(stderr)) return new Map();
+    warnScanFailed(`[live-owner] ⚠ tmux list-panes に失敗: ${(e as Error).message}`);
     throw e;
   }
   const ptsToSession = new Map<string, string>(); // "pts/N" -> session
@@ -92,10 +105,16 @@ async function detectLiveOwnersUncached(): Promise<Map<string, LiveOwner>> {
 
   // 各プロセスの (pid, tty, tpgid, comm)。tty が対象 pane で、かつ前面グループの主
   // (pid == tpgid) のプロセスだけを owner 候補にする。
-  const { stdout: psOut } = await exec('ps', ['-eo', 'pid=,tty=,tpgid=,comm='], {
-    timeout: 5_000,
-    maxBuffer: 8 * 1024 * 1024,
-  });
+  let psOut: string;
+  try {
+    ({ stdout: psOut } = await exec('ps', ['-eo', 'pid=,tty=,tpgid=,comm='], {
+      timeout: 5_000,
+      maxBuffer: 8 * 1024 * 1024,
+    }));
+  } catch (e) {
+    warnScanFailed(`[live-owner] ⚠ ps に失敗 (tpgid 非対応ホスト等の可能性): ${(e as Error).message}`);
+    throw e;
+  }
   const owners = new Map<string, LiveOwner>();
   for (const line of psOut.split('\n')) {
     const trimmed = line.trim();
