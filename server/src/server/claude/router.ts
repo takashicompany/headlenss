@@ -539,7 +539,6 @@ claudeRouter.get('/claude/sessions', async (c) => {
 
   // 掃除後の tracked 一覧を取り直す
   const trackedAlive = liveTmux ? store.listSessions() : tracked;
-  const trackedNames = new Set(trackedAlive.map((s) => s.tmuxSessionName));
 
   // ~/.claude/sessions/ レジストリ等から検出 (プラグインなしでも検出可) + pane owner。
   // 検出/owner の失敗時は 500 にせず [] に倒す (それぞれ throttle 付きで warn 済み)。
@@ -587,12 +586,19 @@ claudeRouter.get('/claude/sessions', async (c) => {
     if (!effSource) continue;
 
     if (effSource === 'claude') {
-      // store が別 agent (codex 残骸) の場合はその cwd を使わない。live 検出を優先。
+      // store が別 agent (codex 残骸) の場合はその cwd/status を使わない。live 検出優先。
       const storeClaude = st?.source === 'claude' ? st : undefined;
+      // status: registry 由来の busy + store 由来の waiting-* をマージ (どちらか一方が
+      // 他方を隠さないように)。Stop 直後は busy を抑止。
+      let status: SessionStatus = cd?.status === 'busy' ? 'busy' : 'idle';
+      if (storeClaude && (storeClaude.status === 'waiting-permission' || storeClaude.status === 'waiting-question')) {
+        status = storeClaude.status;
+      }
+      if (status === 'busy' && storeClaude?.lastStopAt) status = 'idle';
       merged.push({
         tmuxSessionName: name,
         cwd: cd?.cwd || storeClaude?.cwd || '',
-        status: cd?.status ?? storeClaude?.status ?? 'idle',
+        status,
         startedAt: storeClaude?.startedAt ?? cd?.startedAt ?? 0,
         lastSeenAt: storeClaude?.lastSeenAt ?? cd?.startedAt ?? 0,
         source: 'claude',
@@ -600,10 +606,13 @@ claudeRouter.get('/claude/sessions', async (c) => {
     } else {
       const storeCodex = st?.source === 'codex' ? st : undefined;
       const cwd = storeCodex?.cwd || xd?.cwd || '';
+      // status: store の非 idle (waiting-*/busy) を優先し、無ければ検出の waiting。
+      let status: SessionStatus = xd?.status === 'waiting-permission' ? 'waiting-permission' : 'idle';
+      if (storeCodex && storeCodex.status !== 'idle') status = storeCodex.status;
       merged.push({
         tmuxSessionName: name,
         cwd,
-        status: xd?.status ?? storeCodex?.status ?? 'idle',
+        status,
         startedAt: storeCodex?.startedAt ?? xd?.startedAt ?? 0,
         lastSeenAt: storeCodex?.lastSeenAt ?? xd?.lastSeenAt ?? 0,
         source: 'codex',
@@ -644,7 +653,7 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   // store → 検出 フォールバック (主を見失っても勝手に切り替えない)。
   const ownerSource = paneOwners.find((o) => o.tmuxSessionName === tmuxName)?.source;
   const effSource: 'claude' | 'codex' | undefined =
-    ownerSource ?? session?.source ?? (codexDet ? 'codex' : det ? 'claude' : undefined);
+    ownerSource ?? session?.source ?? (det ? 'claude' : codexDet ? 'codex' : undefined);
   // store が現在の主と別 agent の場合、その store 由来の chat / pending は別ランの
   // ものなので現在の会話に混ぜない。
   const storeMatchesEff = !session?.source || session.source === effSource;
@@ -813,8 +822,9 @@ claudeRouter.post('/claude/sessions/:tmuxName/respond', async (c) => {
   // 安全ガード: pending を記録した agent と、今この pane の端末を握っている本人が
   // 食い違う場合は tmux へキー注入しない (古い Codex の承認応答が、その後起動した
   // Claude の pane に矢印+Enter を撃ち込む事故を防ぐ)。owner 不明時は従来どおり通す。
+  // 鮮度が重要なのでキャッシュを使わず即時スキャンする (force=true)。
   const respondSession = store.getSession(tmuxName);
-  const respondOwner = (await detectPaneOwners().catch(() => []))
+  const respondOwner = (await detectPaneOwners(true).catch(() => []))
     .find((o) => o.tmuxSessionName === tmuxName)?.source;
   if (respondOwner && respondSession?.source && respondOwner !== respondSession.source) {
     return c.json(

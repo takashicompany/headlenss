@@ -16,6 +16,7 @@ import { claudeRouter } from './claude/router.ts';
 import { codexRouter } from './codex/router.ts';
 import { detectCodexSessions, getCodexHookHealth, invalidateCodexDetectCache } from './codex/status.ts';
 import { detectClaudeSessions, invalidateClaudeDetectCache } from './claude/process-detect.ts';
+import { detectPaneOwners } from './paneOwner.ts';
 import * as claudeStore from './claude/store.ts';
 import { sanitizeChatText } from './claude/transcript.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot, stopPeriodicSnapshot } from './persist.ts';
@@ -146,25 +147,37 @@ function buildLastChat(tmuxName: string): { role: 'user' | 'assistant'; text: st
 }
 
 app.get('/api/sessions', async (c) => {
-  const [sessions, detected, codexDetected] = await Promise.all([
+  const [sessions, detected, codexDetected, paneOwners] = await Promise.all([
     listSessions(),
     detectClaudeSessions().catch(() => []),
     detectCodexSessions().catch(() => []),
+    detectPaneOwners().catch(() => []),
   ]);
   const detectedMap = new Map(detected.map((d) => [d.tmuxSessionName, d]));
   const codexMap = new Map(codexDetected.map((d) => [d.tmuxSessionName, d]));
+  // pane owner (今その端末を握っている本人) を agent の権威にする。owner 不明時は
+  // 従来どおり store → 検出 フォールバック。
+  const ownerMap = new Map(paneOwners.map((o) => [o.tmuxSessionName, o.source]));
   const liveNames = new Set(sessions.map((s) => s.name));
   const enriched = sessions.map((s) => {
     const tracked = claudeStore.getSession(s.name);
-    const agent = tracked?.source ?? (codexMap.has(s.name) ? 'codex' : detectedMap.has(s.name) ? 'claude' : undefined);
+    const agent = ownerMap.get(s.name)
+      ?? tracked?.source
+      ?? (detectedMap.has(s.name) ? 'claude' : codexMap.has(s.name) ? 'codex' : undefined);
+    // store が現在の主と別 agent の場合、その store の status/chat は別ランのものなので使わない。
+    const storeMatches = !tracked?.source || tracked.source === agent;
     return {
       ...s,
-      claudeStatus: tracked?.source === 'claude' ? tracked.status : detectedMap.get(s.name)?.status,
+      claudeStatus: agent === 'claude'
+        ? (storeMatches && tracked?.source === 'claude' ? tracked.status : detectedMap.get(s.name)?.status)
+        : undefined,
       agent,
-      codexStatus: tracked?.source === 'codex' ? tracked.status : codexMap.get(s.name)?.status,
+      codexStatus: agent === 'codex'
+        ? (storeMatches && tracked?.source === 'codex' ? tracked.status : codexMap.get(s.name)?.status)
+        : undefined,
       codexHookHealth: codexMap.get(s.name)?.hookHealth ?? (agent === 'codex' ? getCodexHookHealth(tracked?.cwd) : getCodexHookHealth()),
-      codexNeedsHookAttention: codexMap.get(s.name)?.needsHookAttention ?? false,
-      lastChat: buildLastChat(s.name),
+      codexNeedsHookAttention: (agent === 'codex' && codexMap.get(s.name)?.needsHookAttention) ?? false,
+      lastChat: storeMatches ? buildLastChat(s.name) : undefined,
     };
   });
   for (const retained of listRetainedSessions(liveNames)) {
