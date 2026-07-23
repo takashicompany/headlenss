@@ -14,9 +14,13 @@ type ChatMessage = { role: 'user' | 'assistant'; text: string; ts: number; synth
 type SessionStatus = 'idle' | 'busy' | 'waiting-permission' | 'waiting-question';
 const INITIAL_VISIBLE_MESSAGES = 20;
 const VISIBLE_MESSAGES_STEP = 20;
-// 楽観投稿がサーバ側に取り込まれず一致しなかった場合の保険。これを超えたら破棄して
-// 「古い自分の投稿が最下部に固定されて残る」不具合を防ぐ (通常は数秒で一致・除去される)。
-const OPTIMISTIC_PENDING_TTL_MS = 60_000;
+// 楽観投稿がサーバ側に取り込まれず一致しなかった場合の保険。
+// 破棄条件は「会話がこの投稿より新しいメッセージまで進んだ(=取り残された)」を主とし、
+// ターン処理中にキューされた投稿(まだ新しいサーバメッセージが無い)は消さない。
+// SUPERSEDE_GRACE は hook 書き込み順の前後を吸収する猶予。TTL は「新しいメッセージが
+// 二度と来ない idle セッションで取り残された場合」の最終保険で、通常のターンより十分長くする。
+const OPTIMISTIC_SUPERSEDE_GRACE_MS = 10_000;
+const OPTIMISTIC_PENDING_TTL_MS = 15 * 60_000;
 
 type AskQuestionOption = { label: string; description?: string };
 type AskQuestion = {
@@ -327,6 +331,9 @@ export function ChatView({
               const consumed = new Set<number>();
               let confirmed = false;
               const nowTs = Date.now();
+              // サーバ側に記録済みの最新 ts。これがこの楽観投稿より新しければ「会話が
+              // 進んだのに取り込まれなかった=取り残された」と判断できる。
+              const newestServerTs = next.reduce((m, x) => (x.ts > m ? x.ts : m), 0);
               for (const pm of prev) {
                 let matchedIdx = -1;
                 for (let i = 0; i < next.length; i++) {
@@ -339,8 +346,12 @@ export function ChatView({
                   }
                 }
                 if (matchedIdx === -1) {
-                  // 一致しないまま TTL を超えたものは破棄 (最下部に居座り続けるのを防ぐ保険)。
-                  if (nowTs - pm.ts <= OPTIMISTIC_PENDING_TTL_MS) remaining.push(pm);
+                  const age = nowTs - pm.ts;
+                  // 会話がこの投稿より新しいメッセージまで進んでいる (取り残された) か、
+                  // 超長時間 (TTL) 一致しないものだけ破棄。ターン処理中でキュー待ちの投稿
+                  // (まだ新しいサーバメッセージが無い) は破棄しない=消えない。
+                  const superseded = newestServerTs > pm.ts && age > OPTIMISTIC_SUPERSEDE_GRACE_MS;
+                  if (!superseded && age <= OPTIMISTIC_PENDING_TTL_MS) remaining.push(pm);
                 } else {
                   consumed.add(matchedIdx);
                   confirmed = true;
