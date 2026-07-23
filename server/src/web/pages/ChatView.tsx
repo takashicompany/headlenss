@@ -14,6 +14,9 @@ type ChatMessage = { role: 'user' | 'assistant'; text: string; ts: number; synth
 type SessionStatus = 'idle' | 'busy' | 'waiting-permission' | 'waiting-question';
 const INITIAL_VISIBLE_MESSAGES = 20;
 const VISIBLE_MESSAGES_STEP = 20;
+// 楽観投稿がサーバ側に取り込まれず一致しなかった場合の保険。これを超えたら破棄して
+// 「古い自分の投稿が最下部に固定されて残る」不具合を防ぐ (通常は数秒で一致・除去される)。
+const OPTIMISTIC_PENDING_TTL_MS = 60_000;
 
 type AskQuestionOption = { label: string; description?: string };
 type AskQuestion = {
@@ -48,6 +51,13 @@ function inlineUploadedImages(text: string): string {
     /@(\/tmp\/headlenss-uploads\/([a-zA-Z0-9._-]+))/g,
     (_match, _full: string, filename: string) => `![](/api/uploads/${filename})`,
   );
+}
+
+// 楽観投稿(ユーザが打った生テキスト)と、サーバ保存側 (sanitizeChatText で trim /
+// 3連続改行の圧縮などが掛かったテキスト) を突き合わせるための正規化。空白差で一致を
+// 取り逃して楽観投稿が消えず最下部に残る不具合を防ぐ。
+function normalizeForMatch(text: string): string {
+  return text.replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function sameChatMessages(a: ChatMessage[], b: ChatMessage[]): boolean {
@@ -316,18 +326,22 @@ export function ChatView({
               const remaining: ChatMessage[] = [];
               const consumed = new Set<number>();
               let confirmed = false;
+              const nowTs = Date.now();
               for (const pm of prev) {
                 let matchedIdx = -1;
                 for (let i = 0; i < next.length; i++) {
                   if (consumed.has(i)) continue;
                   const s = next[i];
-                  if (s.role === pm.role && s.text === pm.text) {
+                  // サーバ側は sanitize (trim 等) 済みなので、正規化して突き合わせる。
+                  if (s.role === pm.role && normalizeForMatch(s.text) === normalizeForMatch(pm.text)) {
                     matchedIdx = i;
                     break;
                   }
                 }
-                if (matchedIdx === -1) remaining.push(pm);
-                else {
+                if (matchedIdx === -1) {
+                  // 一致しないまま TTL を超えたものは破棄 (最下部に居座り続けるのを防ぐ保険)。
+                  if (nowTs - pm.ts <= OPTIMISTIC_PENDING_TTL_MS) remaining.push(pm);
+                } else {
                   consumed.add(matchedIdx);
                   confirmed = true;
                 }
