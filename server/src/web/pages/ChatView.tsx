@@ -14,6 +14,13 @@ type ChatMessage = { role: 'user' | 'assistant'; text: string; ts: number; synth
 type SessionStatus = 'idle' | 'busy' | 'waiting-permission' | 'waiting-question';
 const INITIAL_VISIBLE_MESSAGES = 20;
 const VISIBLE_MESSAGES_STEP = 20;
+// 楽観投稿がサーバ側に取り込まれず一致しなかった場合の保険。
+// 破棄条件は「会話がこの投稿より新しいメッセージまで進んだ(=取り残された)」を主とし、
+// ターン処理中にキューされた投稿(まだ新しいサーバメッセージが無い)は消さない。
+// SUPERSEDE_GRACE は hook 書き込み順の前後を吸収する猶予。TTL は「新しいメッセージが
+// 二度と来ない idle セッションで取り残された場合」の最終保険で、通常のターンより十分長くする。
+const OPTIMISTIC_SUPERSEDE_GRACE_MS = 10_000;
+const OPTIMISTIC_PENDING_TTL_MS = 15 * 60_000;
 
 type AskQuestionOption = { label: string; description?: string };
 type AskQuestion = {
@@ -48,6 +55,13 @@ function inlineUploadedImages(text: string): string {
     /@(\/tmp\/headlenss-uploads\/([a-zA-Z0-9._-]+))/g,
     (_match, _full: string, filename: string) => `![](/api/uploads/${filename})`,
   );
+}
+
+// 楽観投稿(ユーザが打った生テキスト)と、サーバ保存側 (sanitizeChatText で trim /
+// 3連続改行の圧縮などが掛かったテキスト) を突き合わせるための正規化。空白差で一致を
+// 取り逃して楽観投稿が消えず最下部に残る不具合を防ぐ。
+function normalizeForMatch(text: string): string {
+  return text.replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function sameChatMessages(a: ChatMessage[], b: ChatMessage[]): boolean {
@@ -316,18 +330,29 @@ export function ChatView({
               const remaining: ChatMessage[] = [];
               const consumed = new Set<number>();
               let confirmed = false;
+              const nowTs = Date.now();
+              // サーバ側に記録済みの最新 ts。これがこの楽観投稿より新しければ「会話が
+              // 進んだのに取り込まれなかった=取り残された」と判断できる。
+              const newestServerTs = next.reduce((m, x) => (x.ts > m ? x.ts : m), 0);
               for (const pm of prev) {
                 let matchedIdx = -1;
                 for (let i = 0; i < next.length; i++) {
                   if (consumed.has(i)) continue;
                   const s = next[i];
-                  if (s.role === pm.role && s.text === pm.text) {
+                  // サーバ側は sanitize (trim 等) 済みなので、正規化して突き合わせる。
+                  if (s.role === pm.role && normalizeForMatch(s.text) === normalizeForMatch(pm.text)) {
                     matchedIdx = i;
                     break;
                   }
                 }
-                if (matchedIdx === -1) remaining.push(pm);
-                else {
+                if (matchedIdx === -1) {
+                  const age = nowTs - pm.ts;
+                  // 会話がこの投稿より新しいメッセージまで進んでいる (取り残された) か、
+                  // 超長時間 (TTL) 一致しないものだけ破棄。ターン処理中でキュー待ちの投稿
+                  // (まだ新しいサーバメッセージが無い) は破棄しない=消えない。
+                  const superseded = newestServerTs > pm.ts && age > OPTIMISTIC_SUPERSEDE_GRACE_MS;
+                  if (!superseded && age <= OPTIMISTIC_PENDING_TTL_MS) remaining.push(pm);
+                } else {
                   consumed.add(matchedIdx);
                   confirmed = true;
                 }

@@ -7,6 +7,7 @@ import { resolve as pathResolve } from 'node:path';
 import { promisify } from 'node:util';
 import { setTimeout as wait } from 'node:timers/promises';
 import { detectClaudeSessions } from './process-detect.ts';
+import { detectLiveOwners } from './live-owner.ts';
 import * as store from './store.ts';
 import { resolveTmuxSessionName } from './tmux-resolver.ts';
 import { captureOutput } from '../tmux.ts';
@@ -538,14 +539,12 @@ claudeRouter.get('/claude/sessions', async (c) => {
 
   // 掃除後の tracked 一覧を取り直す
   const trackedAlive = liveTmux ? store.listSessions() : tracked;
-  const trackedNames = new Set(trackedAlive.map((s) => s.tmuxSessionName));
 
-  // ~/.claude/sessions/ レジストリから検出 (プラグインなしでも検出可)
-  const [detected, codexDetected] = await Promise.all([
-    // 検出失敗時は 500 にせず [] に倒す (process-detect 側が throttle 付きで warn 済み)。
-    // hook/store 追跡分は保持されるので、検出のみのセッションが一時的に欠けるだけ。
+  // 検出 + live owner (今その画面を握っている本人)。失敗は [] / null に倒して sticky。
+  const [detected, codexDetected, liveOwners] = await Promise.all([
     detectClaudeSessions().catch(() => []),
     detectCodexSessions().catch(() => []),
+    detectLiveOwners().catch(() => null),
   ]);
 
   const merged: Array<{
@@ -559,46 +558,66 @@ claudeRouter.get('/claude/sessions', async (c) => {
     codexNeedsHookAttention?: boolean;
   }> = [];
 
-  for (const s of trackedAlive) {
-    merged.push({
-      tmuxSessionName: s.tmuxSessionName,
-      cwd: s.cwd,
-      status: s.status,
-      startedAt: s.startedAt,
-      lastSeenAt: s.lastSeenAt,
-      source: s.source,
-      codexHookHealth: s.source === 'codex' ? getCodexHookHealth(s.cwd) : undefined,
-    });
-  }
+  const claudeByName = new Map(detected.map((d) => [d.tmuxSessionName, d]));
+  const codexByName = new Map(codexDetected.map((d) => [d.tmuxSessionName, d]));
+  const trackedByName = new Map(trackedAlive.map((s) => [s.tmuxSessionName, s]));
 
-  for (const d of detected) {
-    if (trackedNames.has(d.tmuxSessionName)) continue;
-    // detect 側にも tmux 居るかフィルタ (process-detect は tmux pane 紐付け済なので
-    // 通常はOKだが、念のため)
-    if (liveTmux && !liveTmux.has(d.tmuxSessionName)) continue;
-    merged.push({
-      tmuxSessionName: d.tmuxSessionName,
-      cwd: d.cwd,
-      status: d.status,
-      startedAt: d.startedAt,
-      lastSeenAt: d.startedAt,
-      source: 'claude',
-    });
-  }
+  // 対象セッション名: store・claude 検出・codex 検出・live owner の和集合 (1 名 1 エントリ)。
+  const names = new Set<string>([
+    ...trackedByName.keys(),
+    ...claudeByName.keys(),
+    ...codexByName.keys(),
+    ...(liveOwners ? liveOwners.keys() : []),
+  ]);
 
-  for (const d of codexDetected) {
-    if (trackedNames.has(d.tmuxSessionName)) continue;
-    if (liveTmux && !liveTmux.has(d.tmuxSessionName)) continue;
-    merged.push({
-      tmuxSessionName: d.tmuxSessionName,
-      cwd: d.cwd,
-      status: d.status,
-      startedAt: d.startedAt,
-      lastSeenAt: d.lastSeenAt,
-      source: 'codex',
-      codexHookHealth: d.hookHealth,
-      codexNeedsHookAttention: d.needsHookAttention,
-    });
+  for (const name of names) {
+    if (liveTmux && !liveTmux.has(name)) continue;
+    const st = trackedByName.get(name);
+    const ownerEntry = liveOwners?.get(name);
+    // Claude が owner のときは owner PID 一致の det「のみ」を使う (fail-closed)。
+    // 同名 last-wins でヘッドレス claude の cwd/status を出さないため。
+    const cd = ownerEntry?.source === 'claude'
+      ? detected.find((d) => d.pid === ownerEntry.pid)
+      : claudeByName.get(name);
+    const xd = codexByName.get(name);
+
+    // 実効ソース: live owner を最優先 → store → 検出。owner 不明時は sticky。
+    const effSource: 'claude' | 'codex' | undefined =
+      ownerEntry?.source ?? st?.source ?? (cd ? 'claude' : xd ? 'codex' : undefined);
+    if (!effSource) continue;
+
+    // store が実効ソースと別 agent (残骸) の場合、その cwd/status は使わない。
+    const storeMatched = !!st && st.source === effSource;
+
+    if (effSource === 'claude') {
+      const sc = storeMatched ? st : undefined;
+      let status: SessionStatus = cd?.status === 'busy' ? 'busy' : 'idle';
+      if (sc && (sc.status === 'waiting-permission' || sc.status === 'waiting-question')) status = sc.status;
+      if (status === 'busy' && sc?.lastStopAt) status = 'idle';
+      merged.push({
+        tmuxSessionName: name,
+        cwd: sc?.cwd || cd?.cwd || '',
+        status,
+        startedAt: sc?.startedAt ?? cd?.startedAt ?? 0,
+        lastSeenAt: sc?.lastSeenAt ?? cd?.startedAt ?? 0,
+        source: 'claude',
+      });
+    } else {
+      const sx = storeMatched ? st : undefined;
+      const cwd = sx?.cwd || xd?.cwd || '';
+      let status: SessionStatus = xd?.status === 'waiting-permission' ? 'waiting-permission' : 'idle';
+      if (sx && sx.status !== 'idle') status = sx.status;
+      merged.push({
+        tmuxSessionName: name,
+        cwd,
+        status,
+        startedAt: sx?.startedAt ?? xd?.startedAt ?? 0,
+        lastSeenAt: sx?.lastSeenAt ?? xd?.lastSeenAt ?? 0,
+        source: 'codex',
+        codexHookHealth: cwd ? getCodexHookHealth(cwd) : undefined,
+        codexNeedsHookAttention: xd?.needsHookAttention,
+      });
+    }
   }
 
   return c.json({ sessions: merged });
@@ -617,17 +636,31 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   // (store cwd/ccSessionId preferred, detect as fallback).
   type DetResult = Awaited<ReturnType<typeof detectClaudeSessions>>[number] | undefined;
   type CodexDetResult = Awaited<ReturnType<typeof detectCodexSessions>>[number] | undefined;
-  const [detected, codexDetected] = await Promise.all([
-    // 検出失敗時は 500 にせず [] に倒す (process-detect 側が throttle 付きで warn 済み)。
-    // hook/store 追跡分は保持されるので、検出のみのセッションが一時的に欠けるだけ。
+  const [detected, codexDetected, liveOwners] = await Promise.all([
     detectClaudeSessions().catch(() => []),
     detectCodexSessions().catch(() => []),
+    detectLiveOwners().catch(() => null),
   ]);
-  const det: DetResult = detected.find((d) => d.tmuxSessionName === tmuxName);
+  // live owner (今その画面を握っている本人) を source の権威にする。
+  const owner = liveOwners?.get(tmuxName);
+  // Claude が owner のときは owner の PID に一致する det「のみ」を使う (fail-closed)。
+  // 名前フォールバックすると、対話 claude の registry がまだ出ていない一瞬に、
+  // 同名で拾える別の claude det (claude -p 等) の会話を出す恐れがあるため。
+  // owner が codex / 不明のときは従来どおり名前一致で解決する。
+  const det: DetResult = owner?.source === 'claude'
+    ? detected.find((d) => d.pid === owner.pid)
+    : detected.find((d) => d.tmuxSessionName === tmuxName);
   const codexDet: CodexDetResult = codexDetected.find((d) => d.tmuxSessionName === tmuxName);
 
-  // hook 経由で記録された chat
-  const hookChat = session?.chat ?? [];
+  // 実効ソース: live owner を最優先 → store → 検出。owner 不明時は sticky。
+  const effSource: 'claude' | 'codex' | undefined =
+    owner?.source ?? session?.source ?? (det ? 'claude' : codexDet ? 'codex' : undefined);
+  // store が現在の主と別 agent の残骸なら、その chat/transcript/status/pending は出さない
+  // (表示の抑止のみ。store は書き換えない)。
+  const storeIsStale = !!owner && !!session?.source && owner.source !== session.source;
+
+  // hook 経由で記録された chat (現在の主と一致する store のみ採用)
+  const hookChat = storeIsStale ? [] : (session?.chat ?? []);
 
   // Parse tail query param (clamped 1..200, NaN-safe)
   const tailParam = c.req.query('tail');
@@ -640,13 +673,22 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   // transcript を読んで履歴を補完 (hook では取りこぼす過去分も拾える)。
   // Store-first: Claude sessions use store's cwd/ccSessionId when available;
   // only fall back to detect results when the store lacks them.
+  // transcript は effectiveSource で先に分岐する (stale codex が Claude の transcript に
+  // 落ちて誤表示するのを防ぐ)。
   let transcriptChat: ChatItem[] = [];
-  if (session?.source === 'codex' && session.transcriptPath && existsSync(session.transcriptPath)) {
-    transcriptChat = await extractCodexChatFromTranscript(session.transcriptPath, transcriptLimit, !!tailN);
-  } else {
-    // Resolve cwd/ccSessionId: prefer store, fall back to detect
-    const cwd = session?.cwd || det?.cwd || '';
-    const ccSessionId = session?.ccSessionId || det?.ccSessionId || '';
+  if (effSource === 'codex') {
+    // Codex の会話中身はフック由来の transcriptPath に頼る (現在の主と一致する store のみ)。
+    // stale (live=codex だが store=claude) の間は該当パスが無いので空にする (誤って Claude の
+    // 会話を出さない。codex フックが来れば自己回復)。
+    if (!storeIsStale && session?.source === 'codex' && session.transcriptPath && existsSync(session.transcriptPath)) {
+      transcriptChat = await extractCodexChatFromTranscript(session.transcriptPath, transcriptLimit, !!tailN);
+    }
+  } else if (effSource === 'claude') {
+    // store が claude を指す時のみ store の cwd/ccSessionId を使い、それ以外 (stale/無し) は
+    // live 検出 (owner PID 一致の det) を優先する。
+    const storeClaude = !storeIsStale && session?.source === 'claude' ? session : undefined;
+    const cwd = storeClaude?.cwd || det?.cwd || '';
+    const ccSessionId = storeClaude?.ccSessionId || det?.ccSessionId || '';
     if (cwd && ccSessionId) {
       const path = transcriptPathFor(cwd, ccSessionId);
       if (existsSync(path)) {
@@ -663,7 +705,7 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
     .filter((m) => m.text.length > 0);
   // 補完は cleanedHookChat から (Codex+transcript は従来どおり全捨て)、
   // enrichment だけは全 hookChat から行う。
-  let cleanedHookChat = session?.source === 'codex' && transcriptChat.length > 0 ? [] : allCleanedHookChat;
+  let cleanedHookChat = effSource === 'codex' && transcriptChat.length > 0 ? [] : allCleanedHookChat;
 
   // In tail mode, pre-cut cleanedHookChat to its last tailN entries so a large
   // hookChat can't crowd out newer transcript entries after the final splice.
@@ -713,7 +755,7 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   // det (process-detect で見つかった Claude セッション) も 404 判定に含める。
   // これが抜けていると、検出済みだが transcript がまだ空の Claude セッションを
   // 開いたときに 404 → チャットが空表示になってしまう。
-  if (merged.length === 0 && !session && !det && !codexDet) {
+  if (merged.length === 0 && !session && !det && !codexDet && !owner) {
     return c.json({ error: 'not found' }, 404);
   }
   // Claude Code の動作状態 (idle / busy / waiting-*) を一緒に返して、
@@ -725,16 +767,15 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   //   - 'idle' はそれ以外
   // hook session.status は常に 'idle' か 'waiting-*' (busy になる経路がない)ため、
   // 単純な ?? チェーンでは registry 由来の 'busy' が永遠に拾われない。merge する。
+  // status も effectiveSource に合わせる。stale な store 由来 status は混ぜない。
   let status: SessionStatus = 'idle';
-  if (det?.status === 'busy') status = 'busy';
-  if (codexDet?.status === 'waiting-permission') status = 'waiting-permission';
-  if (session?.status === 'waiting-permission' || session?.status === 'waiting-question') {
+  if (effSource === 'claude' && det?.status === 'busy') status = 'busy';
+  if (effSource === 'codex' && codexDet?.status === 'waiting-permission') status = 'waiting-permission';
+  if (!storeIsStale && (session?.status === 'waiting-permission' || session?.status === 'waiting-question')) {
     status = session.status;
   }
   // Stop hook が直近で発火していれば「ターン終了済み」なので busy を抑止。
-  // 次の user-prompt-submit が来るまではこのフラグが残り続け、registry が
-  // idle に追いつくまでの数秒間に「考え中」が残ってしまう問題を消す。
-  if (status === 'busy' && session?.lastStopAt) {
+  if (status === 'busy' && !storeIsStale && session?.lastStopAt) {
     status = 'idle';
   }
 
@@ -752,16 +793,18 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   }
   // pending (PreToolUse / PermissionRequest 待ち) も同梱して、
   // chat UI で許可応答 / 質問回答の UI を出せるようにする。
-  const codexHookHealth = session?.source === 'codex'
-    ? getCodexHookHealth(session.cwd)
-    : codexDet?.hookHealth;
+  // codex health は effSource=codex のときのみ。claude セッションに codex 情報が漏れないように。
+  const codexHookHealth = effSource === 'codex'
+    ? (!storeIsStale && session?.cwd ? getCodexHookHealth(session.cwd) : codexDet?.hookHealth)
+    : undefined;
   return c.json({
     chat: merged,
     status,
-    pending: session?.pending ?? null,
-    source: session?.source ?? (codexDet ? 'codex' : det ? 'claude' : undefined),
+    // stale (別 agent の残骸) の pending は表示しない (store は書き換えない=表示抑止のみ)。
+    pending: storeIsStale ? null : (session?.pending ?? null),
+    source: effSource,
     codexHookHealth: codexHookHealth ?? null,
-    codexNeedsHookAttention: codexDet?.needsHookAttention ?? false,
+    codexNeedsHookAttention: (effSource === 'codex' && codexDet?.needsHookAttention) ?? false,
   });
 });
 
