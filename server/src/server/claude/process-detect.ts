@@ -40,6 +40,21 @@ export function invalidateClaudeDetectCache(): void {
   claudeDetectCache = null;
 }
 
+// ── Rate-limited diagnostic warnings ──
+// 検出は過去に「無言で全滅」した (getPpidMap/getTmuxPaneMap が失敗しても空 Map を
+// 返す設計だったため、findTmuxAncestor が全 candidate を取りこぼし『Claude 0 件』を
+// 成功扱いでキャッシュしていた)。原因が journal に一切残らず調査が難航したので、
+// 異常状態を構造化して warn する。ポーリング (数秒間隔) で溢れないよう key ごとに
+// 一定間隔だけ出す。
+const WARN_INTERVAL_MS = 30_000;
+const lastWarnAt = new Map<string, number>();
+function warnThrottled(key: string, message: string): void {
+  const now = Date.now();
+  if (now - (lastWarnAt.get(key) ?? 0) < WARN_INTERVAL_MS) return;
+  lastWarnAt.set(key, now);
+  console.warn(message);
+}
+
 /**
  * `~/.claude/sessions/<PID>.json` レジストリ(undocumented but reliable)を読んで
  * 生きている Claude Code プロセスを検出し、tmux session 名と紐付ける。
@@ -62,6 +77,13 @@ export async function detectClaudeSessions(): Promise<DetectedSession[]> {
     },
     (err) => {
       claudeDetectInFlight = null;
+      // 失敗はキャッシュされない (成功パスのみキャッシュする) ので次回すぐ再スキャンされる。
+      // 無言で 0 件を返す旧挙動と違い、ここで必ず痕跡を残す。
+      warnThrottled(
+        'detect-scan-failed',
+        `[detect] ⚠ Claude 検出スキャンが失敗しました: ${(err as Error).message}。` +
+          `今回は検出分をスキップします (hook/store 追跡分は影響なし)。`,
+      );
       throw err;
     },
   );
@@ -135,6 +157,19 @@ async function detectClaudeSessionsUncached(): Promise<DetectedSession[]> {
     });
   }
 
+  // getPpidMap/getTmuxPaneMap は throw する (失敗を握り潰さない) ので、ここに来て
+  // maps が空 = 本当に tmux/プロセスが無いケース。ただし「生きた candidate はあるのに
+  // 1 件も tmux に紐付かない」状態は、出力フォーマット崩れや親子関係の追跡漏れなど
+  // 想定外のサインなので構造化して warn する (無言全滅の再発検知)。
+  if (candidates.length > 0 && result.length === 0) {
+    warnThrottled(
+      'detect-zero-match',
+      `[detect] ⚠ Claude candidate ${candidates.length} 件に対し tmux 紐付けが 0 件でした ` +
+        `(paneMap=${paneMap.size}, ppidMap=${ppidMap.size})。tmux/ps の出力が想定外か、` +
+        `pane との親子関係を辿れていない可能性があります。`,
+    );
+  }
+
   return result;
 }
 
@@ -161,36 +196,44 @@ function findTmuxAncestor(
 /** 全プロセスの pid→ppid マップ (`ps -Ao pid=,ppid=`)。macOS / Linux 共通。
  *  execFile (シェル無し) + 固定引数なので command injection の余地は無い。 */
 async function getPpidMap(): Promise<Map<number, number>> {
-  const run = promisify(execFile);
-  try {
-    const { stdout } = await run('ps', ['-Ao', 'pid=,ppid=']);
-    const map = new Map<number, number>();
-    for (const line of stdout.split('\n')) {
-      const m = line.trim().match(/^(\d+)\s+(\d+)$/);
-      if (m) map.set(Number(m[1]), Number(m[2]));
-    }
-    return map;
-  } catch {
-    return new Map();
+  // 失敗は握り潰さず throw する。空 Map を返すと findTmuxAncestor が全 candidate を
+  // 取りこぼし、「Claude セッション 0 件」を成功扱いでキャッシュしてしまう (過去の事故)。
+  // タイムアウトと maxBuffer を明示してハング/切り詰めも検知できるようにする。
+  const { stdout } = await exec('ps', ['-Ao', 'pid=,ppid='], {
+    timeout: 5_000,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  const map = new Map<number, number>();
+  for (const line of stdout.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (m) map.set(Number(m[1]), Number(m[2]));
   }
+  return map;
 }
 
 async function getTmuxPaneMap(): Promise<Map<number, string>> {
+  let stdout: string;
   try {
-    const { stdout } = await exec('tmux', [
+    ({ stdout } = await exec('tmux', [
       'list-panes',
       '-a',
       '-F',
       '#{pane_pid}|#{session_name}',
-    ]);
-    const map = new Map<number, string>();
-    for (const line of stdout.split('\n')) {
-      const [pidStr, name] = line.split('|');
-      const pid = Number(pidStr);
-      if (Number.isFinite(pid) && name) map.set(pid, name);
+    ], { timeout: 5_000, maxBuffer: 8 * 1024 * 1024 }));
+  } catch (e) {
+    // tmux サーバが居ない = 正常な「pane 0 件」。それ以外の失敗 (timeout / 予期せぬ
+    // エラー) は握り潰さず throw し、上位で「検出失敗」として扱わせる (無言全滅を防ぐ)。
+    const stderr = String((e as { stderr?: unknown }).stderr ?? '');
+    if (/no server running|no current (client|session)|error connecting/i.test(stderr)) {
+      return new Map();
     }
-    return map;
-  } catch {
-    return new Map();
+    throw e;
   }
+  const map = new Map<number, string>();
+  for (const line of stdout.split('\n')) {
+    const [pidStr, name] = line.split('|');
+    const pid = Number(pidStr);
+    if (Number.isFinite(pid) && name) map.set(pid, name);
+  }
+  return map;
 }
