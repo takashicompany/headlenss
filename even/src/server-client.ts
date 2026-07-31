@@ -27,6 +27,8 @@ export type ClaudeSessionInfo = {
   startedAt: number
   lastSeenAt: number
   source?: AgentSource
+  /** rootlist プレビュー用: 最後のメッセージ冒頭 (サーバ側で 48 文字に丸め済み)。 */
+  lastChat?: string
 }
 
 export type ChatRole = 'user' | 'assistant'
@@ -156,8 +158,8 @@ export class HeadlenssClient {
 
   // ── Claude Code hook 連携 ──────────────────────────────────────────────
 
-  async listClaudeSessions(): Promise<ClaudeSessionInfo[]> {
-    const res = await fetch(this.url('/api/claude/sessions'))
+  async listClaudeSessions(signal?: AbortSignal): Promise<ClaudeSessionInfo[]> {
+    const res = await fetch(this.url('/api/claude/sessions'), { signal })
     if (!res.ok) throw new Error(`listClaudeSessions HTTP ${res.status}`)
     const data = (await res.json()) as { sessions: ClaudeSessionInfo[] }
     return data.sessions
