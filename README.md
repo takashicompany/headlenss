@@ -142,6 +142,7 @@ npm run hooks:install   # writes both Claude Code and Codex hooks into ~/.claude
 
 - If your server is not `http://localhost:3000`: `HEADLENSS_SERVER_URL=http://<host>:3000 npm run hooks:install`.
 - After installing, restart Claude Code / Codex and trust the HeadLenss hooks once via `/hooks`.
+  **Hooks are loaded at session start, so already-running sessions won't pick them up** — restart the sessions you want them in.
 - To remove: `npm run hooks:uninstall`.
 
 > This writes hooks directly into `~/.claude/settings.json` (Claude) and `~/.codex/hooks.json` (Codex).

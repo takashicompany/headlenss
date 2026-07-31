@@ -121,6 +121,7 @@ npm run hooks:install   # Claude Code と Codex 両方のフックを ~/.claude�
 
 - サーバが `http://localhost:3000` 以外なら `HEADLENSS_SERVER_URL=http://<host>:3000 npm run hooks:install`。
 - 入れた後、Claude Code / Codex を再起動し、`/hooks` で HeadLenss のフックを一度 trust する。
+  **フックはセッション開始時に読み込まれるので、既に起動中のセッションには効かない**(効かせたいセッションは再起動する)。
 - 外すときは `npm run hooks:uninstall`。
 
 > Claude 側は `~/.claude/settings.json` に、Codex 側は `~/.codex/hooks.json` に直接書き込む方式。
