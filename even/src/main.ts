@@ -108,6 +108,7 @@ const smLangEl = document.getElementById('smLang') as HTMLSelectElement
 const smOperatingPointEl = document.getElementById('smOperatingPoint') as HTMLSelectElement
 const chatLinesEl = document.getElementById('chatLines') as HTMLInputElement
 const chatBottomSpacerEl = document.getElementById('chatBottomSpacer') as HTMLInputElement
+const devModeEl = document.getElementById('devMode') as HTMLInputElement
 const scrollLinesEl = document.getElementById('scrollLines') as HTMLInputElement
 const scrollLinesValEl = document.getElementById('scrollLinesVal') as HTMLSpanElement
 const scrollCooldownEl = document.getElementById('scrollCooldown') as HTMLInputElement
@@ -248,6 +249,9 @@ function isUnread(s: ClaudeSessionInfo): boolean {
 // Claude Code hook 連携
 let claudeSessions: ClaudeSessionInfo[] = []     // 起動中Claude Codeを持つtmuxセッション一覧
 let claudeChat: ChatItem[] = []                  // 現在選択中セッションのチャット履歴
+// formatChatLines(claudeChat) の結果。取得(ポーリング)時に 1 回だけ計算して使い回す。
+// スクロール毎の全文再整形 (長文で重い) を避けるため。claudeChat を差し替える箇所で必ず更新/クリアする。
+let chatLinesCache: string[] = []
 let currentAgentSource: AgentSource | undefined = undefined
 let claudePending: Pending | null = null         // 現在選択中セッションの承認/質問待ち
 let claudeChatLoading = false                    // セッション切替直後のロード中フラグ
@@ -273,9 +277,16 @@ let g2RefreshLastAt = -G2_REFRESH_THROTTLE_MS - 1000
 const client = new HeadlenssClient('')
 
 // ─── Logging ───────────────────────────────────────────────────────────
+// logEl は新しい行を先頭に前置する。上限を設けないと textContent が無制限に肥大し、
+// 1回の log で全文を read/concat/再代入するため累積コストが二乗的になり、巨大な <pre>
+// の再レイアウトで「使うほど重く」なる。直近 LOG_MAX_LINES 行だけ保持して抑える。
+const LOG_MAX_LINES = 200
 function log(msg: string): void {
+  // 開発モードがオフ (既定) のときは画面ログを出力しない (肥大による重さを根から断つ)。
+  if (!settings.devMode) return
   const time = new Date().toLocaleTimeString()
-  logEl.textContent = `[${time}] ${msg}\n` + (logEl.textContent ?? '')
+  const lines = (`[${time}] ${msg}\n` + (logEl.textContent ?? '')).split('\n')
+  logEl.textContent = lines.length > LOG_MAX_LINES ? lines.slice(0, LOG_MAX_LINES).join('\n') : lines.join('\n')
   console.log(`[headlenss] ${msg}`)
 }
 
@@ -394,7 +405,7 @@ function buildG2Content(): string {
 
   // idle時は Claude Code の chat (user発言とClaude返事) を画面いっぱい使って表示。
   if (phase === 'idle') {
-    const formatted = formatChatLines(claudeChat, CHAT_WRAP_PX)
+    const formatted = chatLinesCache
     if (formatted.length > 0) {
       // pending があるなら 1 行目に notice
       const notice = claudePending
@@ -491,7 +502,8 @@ function buildRootListView(): string {
     const agent = s.source === 'codex' ? 'Codex' : s.source === 'claude' ? 'Claude' : 'Agent'
     // 既読セッションは空白で揃え、未読は '*' でマーク
     const unread = isUnread(s) ? '*' : ' '
-    lines.push(`${cursor}${s.tmuxSessionName} [${agent}] ${unread}${mark}`)
+    const prefix = `${cursor}${s.tmuxSessionName} [${agent}] ${unread}${mark}`
+    lines.push(appendRootPreview(prefix, s.lastChat))
   }
   return lines.join('\n')
 }
@@ -620,12 +632,12 @@ function summarizeToolInput(input: unknown): string {
  * 役割タグ ([YOU] / [Claude|Codex]) を独立行で挟み、タグの前に空行を入れる。
  * 生ログ (claudeChat) は書き換えず、表示時にこの関数で都度生成する。
  */
-function formatChatLines(items: ChatItem[], maxWidthPx: number): string[] {
+function formatChatLines(items: ChatItem[], maxWidthPx: number, source: 'claude' | 'codex' | undefined = currentAgentSource): string[] {
   const out: string[] = []
   for (const item of items) {
     const text = item.text.replace(/\r/g, '').trim()
     if (!text) continue
-    const agentName = currentAgentSource === 'codex' ? 'Codex' : currentAgentSource === 'claude' ? 'Claude' : 'Agent'
+    const agentName = source === 'codex' ? 'Codex' : source === 'claude' ? 'Claude' : 'Agent'
     const tag = item.role === 'user' ? '[YOU]' : `[${agentName}]`
     if (out.length > 0) out.push('')  // タグの直前に空行を挟んで境目を強調
     out.push(tag)
@@ -682,6 +694,34 @@ function wrapText(text: string, maxWidthPx: number): string[] {
   return out
 }
 
+/** text を px 幅 maxPx に収まる最長の接頭辞に切り詰める。切り詰めたかも返す。 */
+function truncateToPx(text: string, maxPx: number): { s: string; truncated: boolean } {
+  if (maxPx <= 0) return { s: '', truncated: text.length > 0 }
+  if (getTextWidth(text) <= maxPx) return { s: text, truncated: false }
+  let buf = ''
+  let last = ''
+  for (const ch of text) {
+    const addW = last ? getTextWidth(last + ch) - getTextWidth(last) : getTextWidth(ch)
+    if (getTextWidth(buf) + addW > maxPx) return { s: buf, truncated: true }
+    buf += ch
+    last = ch
+  }
+  return { s: buf, truncated: false }
+}
+
+/** rootlist 1 行に、名前行の残り幅までプレビューを付ける (レンズ幅で折り返さないよう px で切る)。 */
+function appendRootPreview(prefix: string, preview: string | undefined): string {
+  const p = (preview ?? '').replace(/\s+/g, ' ').trim()
+  if (!p) return prefix
+  const sep = ' '
+  const avail = CHAT_WRAP_PX - getTextWidth(prefix + sep)
+  const ellipsisW = getTextWidth('…')
+  if (avail <= ellipsisW) return prefix // プレビューを置く余地が無い (名前が長い等)
+  if (getTextWidth(p) <= avail) return prefix + sep + p
+  const { s } = truncateToPx(p, avail - ellipsisW)
+  return s ? prefix + sep + s + '…' : prefix
+}
+
 /** chat 行配列を scrollOffset を考慮して n 行 window する */
 function chatWindow(lines: string[], n: number): string[] {
   if (lines.length === 0) return []
@@ -703,8 +743,7 @@ function lensWindow(text: string, n: number): string {
 }
 
 function maxChatScrollOffset(): number {
-  const formatted = formatChatLines(claudeChat, CHAT_WRAP_PX)
-  return Math.max(0, formatted.length - chatDisplayLines())
+  return Math.max(0, chatLinesCache.length - chatDisplayLines())
 }
 
 function isScrolled(): boolean {
@@ -1018,6 +1057,7 @@ sessionPillsEl.addEventListener('click', (e) => {
     settings.sessionName = name
     void persistSettings()
     claudeChat = []
+    chatLinesCache = []
     claudeChatLoading = true
     renderSessionPills()
     recomputePhase()
@@ -1087,16 +1127,23 @@ function setOutputDisplay(text: string, kind: 'ok' | 'muted' | 'err'): void {
 }
 
 /** Claude Code 起動中の tmux session 一覧を取得 (rootlist 用) */
+let reloadClaudeInFlight = false
 async function reloadClaudeSessions(): Promise<void> {
   if (!serverProbeOk) {
     renderClaudeSessionsList()
     return
   }
+  // 前回の応答待ち中は重ねて叩かない。サーバ応答が停滞した際に 1.5s 毎のポーリングで
+  // 未解決リクエスト/プロミスが累積して重くなるのを防ぐ。タイムアウトで必ず解ける。
+  if (reloadClaudeInFlight) return
+  reloadClaudeInFlight = true
+  const ctrl = new AbortController()
+  const timeout = setTimeout(() => ctrl.abort(), 10_000)
   try {
-    const next = await client.listClaudeSessions()
+    const next = await client.listClaudeSessions(ctrl.signal)
     const changed =
       next.length !== claudeSessions.length ||
-      next.some((s, i) => s.tmuxSessionName !== claudeSessions[i]?.tmuxSessionName || s.status !== claudeSessions[i]?.status)
+      next.some((s, i) => s.tmuxSessionName !== claudeSessions[i]?.tmuxSessionName || s.status !== claudeSessions[i]?.status || s.lastChat !== claudeSessions[i]?.lastChat)
     claudeSessions = next
     // rootCursorName の指すセッションが消えた場合、名前解決内でクランプされる
     resolveRootCursorIndex()
@@ -1105,7 +1152,10 @@ async function reloadClaudeSessions(): Promise<void> {
     // rootlist を見ている間は中身が変わったら即レンズ再描画
     if (changed && phase === 'rootlist') void refreshG2(true)
   } catch (e) {
-    log(`listClaudeSessions error: ${(e as Error).message}`)
+    if ((e as DOMException).name !== 'AbortError') log(`listClaudeSessions error: ${(e as Error).message}`)
+  } finally {
+    clearTimeout(timeout)
+    reloadClaudeInFlight = false
   }
 }
 
@@ -1134,10 +1184,13 @@ async function refreshClaudeData(): Promise<void> {
     if (settings.sessionName !== targetSession) return
     const chat = chatResponse.chat
     currentAgentSource = chatResponse.source ?? claudeSessions.find((s) => s.tmuxSessionName === targetSession)?.source
+    // 整形は取得時に1回だけ行い、描画/スクロールで使い回す (スクロール毎の全文再整形を回避)。
+    // source を明示的に渡してタグずれを防ぐ。
+    const newChatLines = formatChatLines(chat, CHAT_WRAP_PX, currentAgentSource)
     // chat: scrollback 中なら新着分だけオフセット繰り上げ
     if (scrollOffset > 0) {
-      const oldLen = formatChatLines(claudeChat, CHAT_WRAP_PX).length
-      const newLen = formatChatLines(chat, CHAT_WRAP_PX).length
+      const oldLen = chatLinesCache.length
+      const newLen = newChatLines.length
       const delta = newLen - oldLen
       if (delta > 0) {
         const max = Math.max(0, newLen - chatDisplayLines())
@@ -1145,6 +1198,7 @@ async function refreshClaudeData(): Promise<void> {
       }
     }
     claudeChat = chat
+    chatLinesCache = newChatLines
     claudeChatLoading = false
     claudePending = pending
     if (chat.length > 0) {
@@ -1285,6 +1339,7 @@ function renderSettings(): void {
   smOperatingPointEl.value = settings.speechmaticsOperatingPoint
   chatLinesEl.value = String(settings.chatDisplayLines)
   chatBottomSpacerEl.checked = settings.chatBottomSpacer
+  devModeEl.checked = settings.devMode
   applyScrollLinesMax() // scrollLinesEl の max / value / 値表示をまとめて設定
   syncSlider(scrollCooldownEl, scrollCooldownValEl, settings.scrollCooldownMs)
   syncSlider(scrollAnimTickEl, scrollAnimTickValEl, settings.scrollAnimTickMs)
@@ -1385,6 +1440,13 @@ chatBottomSpacerEl.addEventListener('change', () => {
   settings.chatBottomSpacer = chatBottomSpacerEl.checked
   void persistSettings()
   void refreshG2(true)
+})
+
+devModeEl.addEventListener('change', () => {
+  settings.devMode = devModeEl.checked
+  // オフに戻したら溜まったログを破棄してメモリを解放する。
+  if (!settings.devMode) logEl.textContent = ''
+  void persistSettings()
 })
 
 function scheduleProbe(): void {
@@ -1936,6 +1998,7 @@ function openSelectedFromRoot(): void {
   void persistSettings()
   log(`Opened Agent session: ${sel.tmuxSessionName}`)
   claudeChat = []
+  chatLinesCache = []
   claudeChatLoading = true
   currentAgentSource = sel.source
   claudePending = null

@@ -110,18 +110,22 @@ PCとG2スマホ・操作端末を同じ tailnet に入れる。`tailscale ip -4
 
 MagicDNS が有効なら `http://<hostname>.<tailnet>.ts.net:3000/` でもアクセスできる。
 
-### 3. (任意) Claude Code プラグインを入れる
+### 3. フック(Claude Code / Codex)を入れる
 
-承認待ち・質問待ちなどを G2 や Web UI に流したい場合だけ。
+承認待ち・質問待ち・会話などを G2 や Web UI に流すのに必要。**セットアップ時に一括で入れるのが楽:**
 
+```bash
+cd server
+npm run hooks:install   # Claude Code と Codex 両方のフックを ~/.claude・~/.codex に書き込む
 ```
-# Claude Code 内で
-/plugin marketplace add /path/to/headlenss
-/plugin install headlenss@headlenss
-```
 
-これで以降 tmux 内で Claude Code を起動するたびに lifecycle イベントが
-`http://localhost:3000/api/hooks/*` に飛ぶ。詳細は [plugin/README.md](./plugin/README.md) を参照。
+- サーバが `http://localhost:3000` 以外なら `HEADLENSS_SERVER_URL=http://<host>:3000 npm run hooks:install`。
+- 入れた後、Claude Code / Codex を再起動し、`/hooks` で HeadLenss のフックを一度 trust する。
+  **フックはセッション開始時に読み込まれるので、既に起動中のセッションには効かない**(効かせたいセッションは再起動する)。
+- 外すときは `npm run hooks:uninstall`。
+
+> Claude 側は `~/.claude/settings.json` に、Codex 側は `~/.codex/hooks.json` に直接書き込む方式。
+> **マーケットプレイス版 (`/plugin install headlenss@headlenss`) と併用すると hook が二重発火する**ので、どちらか一方にすること。詳細は [plugin/README.md](./plugin/README.md) を参照。
 
 ### 4. (任意) G2アプリをスマホに入れる
 

@@ -131,17 +131,22 @@ Verify that `http://<tailscale-ip>:3000/` opens in a browser.
 
 If MagicDNS is enabled, `http://<hostname>.<tailnet>.ts.net:3000/` also works.
 
-### 3. (Optional) Install the Claude Code plugin
+### 3. Install the hooks (Claude Code / Codex)
 
-Only if you want approval / question events from Claude Code to surface on the G2 or the Web UI.
+Needed to surface approvals / questions / conversation on the G2 or Web UI. **Easiest to install both at setup time:**
 
+```bash
+cd server
+npm run hooks:install   # writes both Claude Code and Codex hooks into ~/.claude and ~/.codex
 ```
-# Inside Claude Code
-/plugin marketplace add /path/to/headlenss
-/plugin install headlenss@headlenss
-```
 
-After this, every Claude Code instance launched inside tmux will forward its lifecycle events to `http://localhost:3000/api/hooks/*`. See [plugin/README.md](./plugin/README.md) for details.
+- If your server is not `http://localhost:3000`: `HEADLENSS_SERVER_URL=http://<host>:3000 npm run hooks:install`.
+- After installing, restart Claude Code / Codex and trust the HeadLenss hooks once via `/hooks`.
+  **Hooks are loaded at session start, so already-running sessions won't pick them up** — restart the sessions you want them in.
+- To remove: `npm run hooks:uninstall`.
+
+> This writes hooks directly into `~/.claude/settings.json` (Claude) and `~/.codex/hooks.json` (Codex).
+> **Do NOT also install the marketplace plugin (`/plugin install headlenss@headlenss`)** — running both double-fires the hooks. Pick one. See [plugin/README.md](./plugin/README.md) for details.
 
 ### 4. (Optional) Install the G2 app on your smartphone
 

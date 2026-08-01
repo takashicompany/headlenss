@@ -20,6 +20,10 @@ export type Settings = {
   /** chat 表示の最終行のさらに下に空行を 1 行足す。最終行が下端 border に
    *  かかって切れる時、この空行を犠牲にして実テキストを安全域に逃がす用途。 */
   chatBottomSpacer: boolean
+
+  // 開発モード。オフ (既定) のときは画面ログ (#log) を出力しない。ログは無制限に肥大して
+  // 使うほど重くなるため、通常利用ではオフにしておく。
+  devMode: boolean
   /** スクロール 1 ジェスチャーで動かす行数。 */
   scrollLinesPerGesture: number
   /** スクロールイベントのクールダウン (ms)。直近に通したイベントからこの時間内の
@@ -51,6 +55,7 @@ export const DEFAULT_SETTINGS: Settings = {
   language: 'ja',
   chatDisplayLines: 7,
   chatBottomSpacer: false,
+  devMode: false,
   scrollLinesPerGesture: 7,
   scrollCooldownMs: 200,
   scrollAnimTickMs: 10,
@@ -93,6 +98,7 @@ function parse(json: string | null | undefined): Settings | null {
         typeof raw.chatBottomSpacer === 'boolean'
           ? raw.chatBottomSpacer
           : DEFAULT_SETTINGS.chatBottomSpacer,
+      devMode: typeof raw.devMode === 'boolean' ? raw.devMode : DEFAULT_SETTINGS.devMode,
       // 最大値はレンズ表示行数 (chatDisplayLines) に従う。動的なので定数化していない
       scrollLinesPerGesture: clampInt(
         raw.scrollLinesPerGesture,

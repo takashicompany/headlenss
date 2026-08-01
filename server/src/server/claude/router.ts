@@ -556,6 +556,7 @@ claudeRouter.get('/claude/sessions', async (c) => {
     source?: 'claude' | 'codex';
     codexHookHealth?: ReturnType<typeof getCodexHookHealth>;
     codexNeedsHookAttention?: boolean;
+    lastChat?: string;
   }> = [];
 
   const claudeByName = new Map(detected.map((d) => [d.tmuxSessionName, d]));
@@ -589,6 +590,17 @@ claudeRouter.get('/claude/sessions', async (c) => {
     // store が実効ソースと別 agent (残骸) の場合、その cwd/status は使わない。
     const storeMatched = !!st && st.source === effSource;
 
+    // G2 一覧のプレビュー用: 現在の主と一致する store chat の最後の非空メッセージ冒頭。
+    // (別 agent の残骸チャットは出さない。hook 未追跡セッションでは空になる。)
+    let lastChat: string | undefined;
+    if (storeMatched) {
+      const storeChat = store.getChat(name);
+      for (let i = storeChat.length - 1; i >= 0; i--) {
+        const txt = sanitizeChatText(storeChat[i].text).replace(/\s+/g, ' ').trim();
+        if (txt) { lastChat = txt.slice(0, 48); break; }
+      }
+    }
+
     if (effSource === 'claude') {
       const sc = storeMatched ? st : undefined;
       let status: SessionStatus = cd?.status === 'busy' ? 'busy' : 'idle';
@@ -601,6 +613,7 @@ claudeRouter.get('/claude/sessions', async (c) => {
         startedAt: sc?.startedAt ?? cd?.startedAt ?? 0,
         lastSeenAt: sc?.lastSeenAt ?? cd?.startedAt ?? 0,
         source: 'claude',
+        lastChat,
       });
     } else {
       const sx = storeMatched ? st : undefined;
@@ -616,6 +629,7 @@ claudeRouter.get('/claude/sessions', async (c) => {
         source: 'codex',
         codexHookHealth: cwd ? getCodexHookHealth(cwd) : undefined,
         codexNeedsHookAttention: xd?.needsHookAttention,
+        lastChat,
       });
     }
   }
