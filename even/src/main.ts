@@ -407,11 +407,13 @@ function rootRowKey(row: RootRow): string {
 /**
  * rootlist に描かれる行の指紋。中身が変わったか (= 再描画が要るか) の判定に使う。
  * 行として見えるものを全部含める: 行の並び・キー・表示に使う値。
+ * lastSeenAt は生値ではなく、表示に効く未読フラグ (isUnread) に落としてから含める。
+ * 生値だとフックイベントのたびに変わり、表示が同じでも毎ポーリング全面再描画になる。
  */
 function rootRowSignature(): string {
   return rootRows()
     .map((r) => (r.kind === 'session'
-      ? `${rootRowKey(r)}|${r.session.status}|${r.session.source ?? ''}|${r.session.lastChat ?? ''}|${r.session.lastSeenAt}`
+      ? `${rootRowKey(r)}|${r.session.status}|${r.session.source ?? ''}|${r.session.lastChat ?? ''}|${isUnread(r.session)}`
       : `${rootRowKey(r)}|${r.plugin.name}`))
     .join('\n')
 }
