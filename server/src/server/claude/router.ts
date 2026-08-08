@@ -95,6 +95,11 @@ type HookPayload = {
   tool_name?: string;
   tool_input?: { questions?: AskQuestion[]; [k: string]: unknown };
   source?: string;
+  // Stop / SubagentStop で送られる「今のターンの最終アシスタント本文」。
+  // transcript は非同期書き込みでフック発火時にまだ今ターン分を含まないため、
+  // 公式ドキュメントはこちらを使うよう指示している。
+  // https://code.claude.com/docs/en/hooks
+  last_assistant_message?: string | null;
 };
 
 // ───────── hooks (received from plugin) ─────────
@@ -207,12 +212,19 @@ claudeRouter.post('/hooks/stop', async (c) => {
       source: 'claude',
     });
   }
+  // 今ターンの本文は payload の last_assistant_message を最優先で使う。
+  // transcript は非同期書き込みなので、フック発火時点ではまだ今ターン分が
+  // 書かれておらず、読みに行くと「1ターン前の返答」を拾ってしまう。
+  // 古い Claude Code (フィールド未提供) 向けに transcript 読みを fallback で残す。
+  let text = (body.last_assistant_message ?? '').trim();
+  let textSource: 'payload' | 'transcript' = 'payload';
   const transcriptPath = body.transcript_path ?? '';
-  if (transcriptPath) {
-    const text = await extractLastAssistantText(transcriptPath);
-    console.log(`[hook] stop -> assistant text len=${text.length}`);
-    if (text) store.appendChat(tmuxName, 'assistant', text, { agent: 'claude' });
+  if (!text && transcriptPath) {
+    text = await extractLastAssistantText(transcriptPath);
+    textSource = 'transcript';
   }
+  console.log(`[hook] stop -> assistant text len=${text.length} src=${textSource}`);
+  if (text) store.appendChat(tmuxName, 'assistant', text, { agent: 'claude' });
   // ターン終了マーカーを立てる: registry の busy が idle に追いつくまでの
   // ラグの間、考え中インジケータをこちらで先に消す。
   store.markStopped(tmuxName);

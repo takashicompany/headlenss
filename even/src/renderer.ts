@@ -29,8 +29,36 @@ export const MAIN_INNER_HEIGHT = CONTENT_HEIGHT - 2 * (MAIN_PADDING + MAIN_BORDE
 /** LVGL の行の高さ (px, 固定)。@evenrealities/pretext の計測値準拠。 */
 export const LENS_LINE_HEIGHT = 27
 
+/** ブリッジ送信 1 回あたりの待ち上限 (ms)。 */
+const BRIDGE_SEND_TIMEOUT_MS = 5000
+
 let bridge: EvenAppBridge | null = null
 let startupRendered = false
+
+/**
+ * ブリッジ送信に上限時間を付ける。
+ *
+ * SDK 側の Promise が解決しないまま返ってこないと、呼び出し元 (main.ts) の
+ * 送信ロックが解放されず、以降レンズが二度と更新されなくなる。
+ * 時間切れ時は reject して呼び出し元にロックを解放させる。SDK 側の処理自体は
+ * 止められないので、あくまで「こちらが待つのをやめる」ための保険。
+ */
+async function withBridgeTimeout<T>(op: string, p: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`bridge ${op} timed out after ${BRIDGE_SEND_TIMEOUT_MS}ms`)),
+          BRIDGE_SEND_TIMEOUT_MS,
+        )
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
 
 export function initRenderer(appBridge: EvenAppBridge): void {
   bridge = appBridge
@@ -50,12 +78,18 @@ async function rebuildPage(config: {
   const previewLine = mainContent.split('\n')[0].slice(0, 40)
   if (!startupRendered) {
     console.log(`[renderer] createStartUpPageContainer (main: "${previewLine}")`)
-    await bridge.createStartUpPageContainer(new CreateStartUpPageContainer(config))
+    await withBridgeTimeout(
+      'createStartUpPageContainer',
+      bridge.createStartUpPageContainer(new CreateStartUpPageContainer(config)),
+    )
     startupRendered = true
     return
   }
   console.log(`[renderer] rebuildPageContainer (main: "${previewLine}")`)
-  await bridge.rebuildPageContainer(new RebuildPageContainer(config))
+  await withBridgeTimeout(
+    'rebuildPageContainer',
+    bridge.rebuildPageContainer(new RebuildPageContainer(config)),
+  )
 }
 
 function evtContainer(): TextContainerProperty {
@@ -131,40 +165,49 @@ export async function updateContent(content: string): Promise<void> {
   if (!bridge) return
   const previewLine = content.split('\n')[0].slice(0, 40)
   console.log(`[renderer] textContainerUpgrade #2 (main: "${previewLine}")`)
-  await bridge.textContainerUpgrade(
-    new TextContainerUpgrade({
-      containerID: 2,
-      containerName: 'main',
-      contentOffset: 0,
-      contentLength: 2000,
-      content,
-    }),
+  await withBridgeTimeout(
+    'textContainerUpgrade #2',
+    bridge.textContainerUpgrade(
+      new TextContainerUpgrade({
+        containerID: 2,
+        containerName: 'main',
+        contentOffset: 0,
+        contentLength: 2000,
+        content,
+      }),
+    ),
   )
 }
 
 export async function updateHeader(header: string): Promise<void> {
   if (!bridge) return
   console.log(`[renderer] textContainerUpgrade #4 (header: "${header.slice(0, 40)}")`)
-  await bridge.textContainerUpgrade(
-    new TextContainerUpgrade({
-      containerID: 4,
-      containerName: 'header',
-      contentOffset: 0,
-      contentLength: 2000,
-      content: header,
-    }),
+  await withBridgeTimeout(
+    'textContainerUpgrade #4',
+    bridge.textContainerUpgrade(
+      new TextContainerUpgrade({
+        containerID: 4,
+        containerName: 'header',
+        contentOffset: 0,
+        contentLength: 2000,
+        content: header,
+      }),
+    ),
   )
 }
 
 export async function updateFooter(footer: string): Promise<void> {
   if (!bridge) return
-  await bridge.textContainerUpgrade(
-    new TextContainerUpgrade({
-      containerID: 3,
-      containerName: 'footer',
-      contentOffset: 0,
-      contentLength: 2000,
-      content: footer,
-    }),
+  await withBridgeTimeout(
+    'textContainerUpgrade #3',
+    bridge.textContainerUpgrade(
+      new TextContainerUpgrade({
+        containerID: 3,
+        containerName: 'footer',
+        contentOffset: 0,
+        contentLength: 2000,
+        content: footer,
+      }),
+    ),
   )
 }

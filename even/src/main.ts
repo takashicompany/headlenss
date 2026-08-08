@@ -58,8 +58,9 @@ import {
 // ───────────────────────────────────────────────────────────────────────
 
 const BRIDGE_TIMEOUT_MS = 4000
-const G2_RECORDING_LIMIT_SEC = 30 // G2 ハードウェアの連続録音上限。UI カウントダウンの起点
-const MAX_RECORDING_SEC = 28      // 30秒の少し手前で安全に自動停止する閾値
+// かつて「G2 の連続録音上限は 30 秒」としてカウントダウンと自動停止を入れていたが、
+// 実機で 30 秒を超えて録音し続けられることを確認したため、両方とも廃止した。
+// SDK の audioControl にも録音長の上限は明記されていない。
 const MIN_RECORDING_SEC = 0.2
 const HISTORY_LIMIT = 20
 const PROBE_DEBOUNCE_MS = 500
@@ -215,6 +216,13 @@ let tmuxOutput = ''     // (legacy) tmux 出力 — 現状ダッシュボード�
 let outputPollTimer: ReturnType<typeof setInterval> | null = null
 let outputFetchOkLogged = false
 let scrollOffset = 0  // chat の末尾から何行戻ったか (0=ライブ末尾)
+// 録音中の live transcript 用スクロール。喋った内容が画面に収まらなくなった時に
+// 遡って読めるようにする。0 = 最新 (喋っている先頭) を表示。
+let recordingScrollOffset = 0
+// live transcript を折り返した結果。partial が来るたびに全文を折り返すと重いので、
+// 元テキストが変わった時だけ計算する。
+let recordingLinesCache: string[] = []
+let recordingLinesCacheKey = ''
 let scrollAnimPending = 0  // アニメーションでまだ消化していない残り行数。正=back, 負=forward
 let scrollAnimTimer: ReturnType<typeof setTimeout> | null = null
 let rootCursorName: string | null = null  // rootlist 内のカーソルが指すセッション名 (index ではなく名前で追跡)
@@ -249,9 +257,17 @@ function isUnread(s: ClaudeSessionInfo): boolean {
 // Claude Code hook 連携
 let claudeSessions: ClaudeSessionInfo[] = []     // 起動中Claude Codeを持つtmuxセッション一覧
 let claudeChat: ChatItem[] = []                  // 現在選択中セッションのチャット履歴
-// formatChatLines(claudeChat) の結果。取得(ポーリング)時に 1 回だけ計算して使い回す。
-// スクロール毎の全文再整形 (長文で重い) を避けるため。claudeChat を差し替える箇所で必ず更新/クリアする。
+// formatChatLines(claudeChat) の結果。スクロール毎の全文再整形 (長文で重い) を
+// 避けるため保持する。claudeChat を差し替える箇所で必ず更新/クリアする。
 let chatLinesCache: string[] = []
+// chatLinesCache がどの入力から作られたかの指紋。ポーリングで取得した内容が前回と
+// 同一ならここで打ち切り、再整形しない。
+//
+// formatChatLines は全文字を 1 文字ずつグリフ幅測定するため、コストが表示対象の
+// 総文字数に比例する (実測: 20件x9,700字 で約2,000ms)。ポーリング間隔は1.5秒なので、
+// 会話が長くなるほどメインスレッドが埋まり、スクロールも一覧移動も止まる。
+// 無操作中は内容が変わらないので、指紋一致で丸ごと省ける。
+let chatLinesCacheKey = ''
 let currentAgentSource: AgentSource | undefined = undefined
 let claudePending: Pending | null = null         // 現在選択中セッションの承認/質問待ち
 let claudeChatLoading = false                    // セッション切替直後のロード中フラグ
@@ -428,14 +444,12 @@ function buildG2Content(): string {
   // それ以外の状態は状態 + 内容を表示
   const lines: string[] = []
   if (phase === 'recording') {
-    // 秒数表示は header に移動。content は live transcript (もしくは状態メッセージ) のみ
-    if (liveTranscript) {
-      lines.push('▌ ' + liveTranscript)
-    } else if (!recordingReady) {
-      lines.push('▌ ' + t('recConnecting'))
-    } else {
-      lines.push('▌ ' + t('recStartedHint'))
-    }
+    // 秒数表示は header。content は live transcript (もしくは状態メッセージ) を
+    // レンズ幅で折り返し、スクロール位置に応じた窓だけ出す。
+    const all = recordingLines()
+    const n = chatDisplayLines()
+    const end = Math.max(n, all.length - recordingScrollOffset)
+    return all.slice(Math.max(0, end - n), end).join('\n')
   } else if (phase === 'finalizing') {
     // 接続中など PCM が乗る前に停止すると liveTranscript は空のまま finalize に入る。
     // 「処理中」と見せると実態 (何も処理していない) と齟齬があるので empty 表示にする。
@@ -462,6 +476,57 @@ function buildG2Content(): string {
     lines.push(t('appName'))
   }
   return lines.join('\n')
+}
+
+/**
+ * 録音中に表示する live transcript を、レンズ幅で折り返した行配列にして返す。
+ * 元テキストが変わっていなければ前回の結果を返す (partial のたびに全文を px 計測
+ * し直すと、喋るほど重くなるため)。
+ * 遡って読んでいる最中 (recordingScrollOffset > 0) に行が増えた場合は、その分だけ
+ * オフセットを繰り上げて読んでいる位置を保つ。
+ */
+function recordingLines(): string[] {
+  const body = liveTranscript
+    ? '▌ ' + liveTranscript
+    : '▌ ' + (recordingReady ? t('recStartedHint') : t('recConnecting'))
+  if (body === recordingLinesCacheKey) return recordingLinesCache
+
+  const out: string[] = []
+  for (const para of body.split('\n')) {
+    for (const line of wrapText(para, CHAT_WRAP_PX)) out.push(line)
+  }
+  if (recordingScrollOffset > 0) {
+    const delta = out.length - recordingLinesCache.length
+    if (delta > 0) {
+      const max = Math.max(0, out.length - chatDisplayLines())
+      recordingScrollOffset = Math.min(max, recordingScrollOffset + delta)
+    }
+  }
+  recordingLinesCache = out
+  recordingLinesCacheKey = body
+  return out
+}
+
+/** 録音中スクロールの上限 (これ以上遡れない行数) */
+function maxRecordingScrollOffset(): number {
+  return Math.max(0, recordingLines().length - chatDisplayLines())
+}
+
+/** 録音中: 過去方向へ遡る */
+function recordingScrollBack(): void {
+  const max = maxRecordingScrollOffset()
+  if (max === 0) return
+  const next = Math.min(max, recordingScrollOffset + scrollLinesPerGesture())
+  if (next === recordingScrollOffset) return
+  recordingScrollOffset = next
+  void refreshG2(true)
+}
+
+/** 録音中: 最新方向へ戻る */
+function recordingScrollForward(): void {
+  if (recordingScrollOffset === 0) return
+  recordingScrollOffset = Math.max(0, recordingScrollOffset - scrollLinesPerGesture())
+  void refreshG2(true)
 }
 
 /** 行ごとに右側の空白を落とし、末尾の空行を全部捨てた結果の配列を返す */
@@ -625,6 +690,17 @@ function summarizeToolInput(input: unknown): string {
   } catch {
     return ''
   }
+}
+
+/**
+ * chatLinesCache の指紋。formatChatLines の出力を決めるのは各項目の role と text、
+ * そして source (タグ表記) だけなので、それらだけを連結する。
+ * 文字列連結は総文字数に比例するが、グリフ幅測定を伴う整形より桁違いに安い。
+ */
+function chatCacheKeyOf(items: ChatItem[], source: AgentSource | undefined): string {
+  let key = String(source)
+  for (const item of items) key += `${item.role}${item.text}`
+  return key
 }
 
 /**
@@ -848,10 +924,12 @@ function buildG2Footer(): string {
       // multi-select 中の Submit 行を強調するため、multi-select 質問のときは別文言
       if (currentRespondQuestionIsMulti()) return t('g2FootCcRespMulti')
       return t('g2FootCcResponse')
-    case 'recording':
+    case 'recording': {
       // cc-response の Type something で録音中なら専用文言
-      if (recordingPurpose === 'respond-type-something') return t('g2FootCcRespRec')
-      return t('g2FootRecOff')
+      const base = recordingPurpose === 'respond-type-something' ? t('g2FootCcRespRec') : t('g2FootRecOff')
+      // 遡って読んでいる間は戻り行数を出す (idle の chat と同じ表記)
+      return recordingScrollOffset > 0 ? `${base}  (-${recordingScrollOffset})` : base
+    }
     case 'finalizing':    return t('g2FootFinalizing')
     case 'pending':       return t('g2FootPending')
     case 'sending':       return t('g2FootSending')
@@ -875,11 +953,8 @@ function buildG2Header(): string {
     case 'boot':         return t('g2HeadBoot')
     case 'unconfigured': return t('g2HeadSetup')
     case 'rootlist':     return t('g2HeadRoot')
-    case 'recording': {
-      // 30秒制限から残り何秒かをカウントダウン表示する。安全停止 (28s) で表示は約 2s となる
-      const remaining = Math.max(0, G2_RECORDING_LIMIT_SEC - getRecordingSeconds())
-      return `${t('g2HeadRecording')}  ${remaining.toFixed(1)}s`
-    }
+    // 時間制限が無いのでカウントダウンはしない。代わりに経過秒をカウントアップする。
+    case 'recording':    return `${t('g2HeadRecording')}  ${getRecordingSeconds().toFixed(1)}s`
     case 'finalizing':   return t('g2HeadFinalizing')
     case 'pending': {
       const n = pendingSentences.length
@@ -1058,6 +1133,7 @@ sessionPillsEl.addEventListener('click', (e) => {
     void persistSettings()
     claudeChat = []
     chatLinesCache = []
+    chatLinesCacheKey = ''
     claudeChatLoading = true
     renderSessionPills()
     recomputePhase()
@@ -1184,21 +1260,28 @@ async function refreshClaudeData(): Promise<void> {
     if (settings.sessionName !== targetSession) return
     const chat = chatResponse.chat
     currentAgentSource = chatResponse.source ?? claudeSessions.find((s) => s.tmuxSessionName === targetSession)?.source
-    // 整形は取得時に1回だけ行い、描画/スクロールで使い回す (スクロール毎の全文再整形を回避)。
-    // source を明示的に渡してタグずれを防ぐ。
-    const newChatLines = formatChatLines(chat, CHAT_WRAP_PX, currentAgentSource)
-    // chat: scrollback 中なら新着分だけオフセット繰り上げ
-    if (scrollOffset > 0) {
-      const oldLen = chatLinesCache.length
-      const newLen = newChatLines.length
-      const delta = newLen - oldLen
-      if (delta > 0) {
-        const max = Math.max(0, newLen - chatDisplayLines())
-        scrollOffset = Math.min(max, scrollOffset + delta)
+    // 取得内容が前回と同一なら整形をまるごと省く。無操作でもポーリングは 1.5 秒毎に
+    // 走るので、ここを毎回計算すると会話が長いほどメインスレッドが埋まる。
+    // source も鍵に含める (タグ表記が変わると整形結果も変わるため)。
+    const nextCacheKey = chatCacheKeyOf(chat, currentAgentSource)
+    if (nextCacheKey !== chatLinesCacheKey) {
+      // 整形は取得時に1回だけ行い、描画/スクロールで使い回す (スクロール毎の全文再整形を回避)。
+      // source を明示的に渡してタグずれを防ぐ。
+      const newChatLines = formatChatLines(chat, CHAT_WRAP_PX, currentAgentSource)
+      // chat: scrollback 中なら新着分だけオフセット繰り上げ
+      if (scrollOffset > 0) {
+        const oldLen = chatLinesCache.length
+        const newLen = newChatLines.length
+        const delta = newLen - oldLen
+        if (delta > 0) {
+          const max = Math.max(0, newLen - chatDisplayLines())
+          scrollOffset = Math.min(max, scrollOffset + delta)
+        }
       }
+      chatLinesCache = newChatLines
+      chatLinesCacheKey = nextCacheKey
     }
     claudeChat = chat
-    chatLinesCache = newChatLines
     claudeChatLoading = false
     claudePending = pending
     if (chat.length > 0) {
@@ -1608,10 +1691,7 @@ function startRecordingTimer(): void {
     durationEl.textContent = `${getRecordingSeconds().toFixed(1)}s`
     paintStatus()
     void refreshG2()
-    if (getRecordingSeconds() >= MAX_RECORDING_SEC) {
-      log(`Reached safe limit ${MAX_RECORDING_SEC}s, auto-stop.`)
-      void toggleRecording()
-    }
+    // 時間による自動停止はしない。停止はユーザー操作 (クリック / ダブルタップ) のみ。
   }, 250)
 }
 
@@ -1663,6 +1743,12 @@ async function startRecording(): Promise<void> {
   }
 
   resetPcmCounter()
+
+  recordingScrollOffset = 0
+
+  recordingLinesCache = []
+
+  recordingLinesCacheKey = ''
   liveTranscript = ''
   recordingReady = false
   durationEl.textContent = '0.0s'
@@ -1928,6 +2014,9 @@ async function abortRecording(): Promise<void> {
   rtSession?.abort()
   rtSession = null
   resetPcmCounter()
+  recordingScrollOffset = 0
+  recordingLinesCache = []
+  recordingLinesCacheKey = ''
   liveTranscript = ''
   durationEl.textContent = '0.0s'
   recordingReady = false
@@ -1999,6 +2088,7 @@ function openSelectedFromRoot(): void {
   log(`Opened Agent session: ${sel.tmuxSessionName}`)
   claudeChat = []
   chatLinesCache = []
+  chatLinesCacheKey = ''
   claudeChatLoading = true
   currentAgentSource = sel.source
   claudePending = null
@@ -2554,12 +2644,14 @@ async function boot(): Promise<void> {
         if (phase === 'rootlist') moveRootCursor(-1)
         else if (phase === 'pending') void confirmAndSend()
         else if (phase === 'idle') scrollBack()
+        else if (phase === 'recording') recordingScrollBack()
         else if (phase === 'cc-response') moveRespondCursor(-1)
       },
       onScrollDown: () => {
         if (phase === 'rootlist') moveRootCursor(1)
         else if (phase === 'pending') removeLastSentence() // 末尾1文だけ削除。空になれば idle
         else if (phase === 'idle') scrollForward()
+        else if (phase === 'recording') recordingScrollForward()
         else if (phase === 'cc-response') moveRespondCursor(1)
       },
       onClick: () => { void toggleRecording() },
@@ -2610,6 +2702,13 @@ async function boot(): Promise<void> {
         })()
       },
       onForegroundExit: () => {
+        // 録音中に離脱した場合はここで必ず後始末する。放置するとマイクが開いたまま、
+        // 音声認識の WebSocket も開いたままになり、離脱のたびに積み上がる。
+        // 録音済みの確定文 (pendingSentences) は abortRecording が保持する。
+        if (phase === 'recording') {
+          log('foreground exit during recording — aborting')
+          void abortRecording()
+        }
         // ページが破棄されている可能性に備え、次回入場時に createStartUpPageContainer に戻す
         resetPageState()
       },
