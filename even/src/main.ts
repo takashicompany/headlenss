@@ -399,7 +399,21 @@ type RootRow =
 function rootRowKey(row: RootRow): string {
   return row.kind === 'session'
     ? `s:${row.session.tmuxSessionName}`
-    : `p:${row.session.tmuxSessionName}:${row.plugin.url}`
+    // 名前も含める。URL だけだと、同じ URL を別名で 2 行宣言した時にキーが衝突し、
+    // 2 件目にカーソルを合わせても 1 件目に吸い寄せられて永久に選べなくなる。
+    : `p:${row.session.tmuxSessionName}:${row.plugin.name}:${row.plugin.url}`
+}
+
+/**
+ * rootlist に描かれる行の指紋。中身が変わったか (= 再描画が要るか) の判定に使う。
+ * 行として見えるものを全部含める: 行の並び・キー・表示に使う値。
+ */
+function rootRowSignature(): string {
+  return rootRows()
+    .map((r) => (r.kind === 'session'
+      ? `${rootRowKey(r)}|${r.session.status}|${r.session.source ?? ''}|${r.session.lastChat ?? ''}|${r.session.lastSeenAt}`
+      : `${rootRowKey(r)}|${r.plugin.name}`))
+    .join('\n')
 }
 
 /** セッション一覧を、プラグインをぶら下げた行配列に展開する。 */
@@ -1271,11 +1285,14 @@ async function reloadClaudeSessions(): Promise<void> {
   const timeout = setTimeout(() => ctrl.abort(), 10_000)
   try {
     const next = await client.listClaudeSessions(ctrl.signal)
-    const changed =
-      next.length !== claudeSessions.length ||
-      next.some((s, i) => s.tmuxSessionName !== claudeSessions[i]?.tmuxSessionName || s.status !== claudeSessions[i]?.status || s.lastChat !== claudeSessions[i]?.lastChat)
+    // rootlist に出る行が変わったかを、実際に描く行の並びで比較する。
+    // セッションだけを見ていると、プラグイン行の増減 (dev server の起動/停止) を
+    // 取りこぼす。取りこぼすとレンズは古い一覧のままなのにカーソルは新しい行配列で
+    // 解決されるため、光っている行とタップで実行される行がズレる。
+    const before = rootRowSignature()
     claudeSessions = next
-    // rootCursorName の指すセッションが消えた場合、名前解決内でクランプされる
+    const changed = before !== rootRowSignature()
+    // カーソルの指す行が消えた場合、キー解決内でクランプされる
     resolveRootCursorIndex()
     // WebView の一覧は毎回更新 (active 切り替えなど含む)
     renderClaudeSessionsList()
