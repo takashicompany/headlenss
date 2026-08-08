@@ -104,7 +104,9 @@ async function isReachable(url: string): Promise<boolean> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), REACH_TIMEOUT_MS);
   try {
-    await fetch(url, { method: 'GET', signal: ctrl.signal, redirect: 'manual' });
+    const res = await fetch(url, { method: 'GET', signal: ctrl.signal, redirect: 'manual' });
+    // body を破棄して接続を解放する (放置すると GC まで保持される)
+    await res.body?.cancel().catch(() => {});
     return true;
   } catch {
     return false;

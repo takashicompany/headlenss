@@ -1498,6 +1498,15 @@ function stopAllBackgroundWork(): void {
   toastHideTimer = null
   // 実行中の取得も打ち切る (完了時に描画へ回るため)
   abortInFlightRefresh()
+  // 取り込み後、SDK がブリッジ単例を再利用する実装でも headlenss のハンドラが誤発火しないよう無効化する
+  setEventHandlers({
+    onScrollUp: () => {},
+    onScrollDown: () => {},
+    onClick: () => {},
+    onDoubleClick: () => {},
+    onAudio: () => {},
+  })
+  navigatingToPlugin = false
 }
 
 // ─── Settings UI ───────────────────────────────────────────────────────

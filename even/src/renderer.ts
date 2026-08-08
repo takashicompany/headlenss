@@ -227,6 +227,7 @@ export async function showScreen(header: string, content: string, footer: string
 
 export async function updateContent(content: string): Promise<void> {
   if (!bridge) return
+  drawSeq++ // 差分描画もガード再描画のスキップ判定に数える (数えないと復帰後に古いフレームで上書きされる)
   const previewLine = content.split('\n')[0].slice(0, 40)
   console.log(`[renderer] textContainerUpgrade #2 (main: "${previewLine}")`)
   await withBridgeTimeout(
@@ -245,6 +246,7 @@ export async function updateContent(content: string): Promise<void> {
 
 export async function updateHeader(header: string): Promise<void> {
   if (!bridge) return
+  drawSeq++ // 差分描画もガード再描画のスキップ判定に数える (数えないと復帰後に古いフレームで上書きされる)
   console.log(`[renderer] textContainerUpgrade #4 (header: "${header.slice(0, 40)}")`)
   await withBridgeTimeout(
     'textContainerUpgrade #4',
@@ -262,6 +264,7 @@ export async function updateHeader(header: string): Promise<void> {
 
 export async function updateFooter(footer: string): Promise<void> {
   if (!bridge) return
+  drawSeq++ // 差分描画もガード再描画のスキップ判定に数える (数えないと復帰後に古いフレームで上書きされる)
   await withBridgeTimeout(
     'textContainerUpgrade #3',
     bridge.textContainerUpgrade(
