@@ -34,6 +34,46 @@ const BRIDGE_SEND_TIMEOUT_MS = 5000
 
 let bridge: EvenAppBridge | null = null
 let startupRendered = false
+// 復帰フラグ由来で「ページは既にホスト側に存在する」とみなした場合に true。
+// その初回 rebuild が拒否された (= 実は新規セッションだった) 場合は create へ戻す。
+let returnRebuildFallbackArmed = false
+// 描画呼び出しの通し番号。復帰後ガード再描画の「間に他の描画があったらスキップ」判定に使う。
+let drawSeq = 0
+// 復帰直後の初回描画フレームがホスト側で取りこぼされる実機対策 (even-loader で実測)。
+// この時間内に他の描画が無ければ、同じ内容をもう一度だけ送る。
+const RETURN_REDRAW_RETRY_MS = 800
+
+let logFn: (msg: string) => void = (m) => console.log(`[renderer] ${m}`)
+/** ログ出力先を差し替える (main.ts の log() に繋ぐ) */
+export function setRendererLog(fn: (msg: string) => void): void {
+  logFn = fn
+}
+
+/**
+ * プラグインから復帰した直後の boot で呼ぶ。
+ * ホスト側セッションには既にプラグインのコンテナが存在し、
+ * createStartUpPageContainer はセッションにつき 1 回きりなので、
+ * 初回描画を rebuildPageContainer (全コンテナ置き換え) にする。
+ */
+export function markPageAlreadyBuilt(): void {
+  startupRendered = true
+  returnRebuildFallbackArmed = true
+}
+
+function scheduleReturnRedraw(config: {
+  containerTotalNum: number
+  textObject?: TextContainerProperty[]
+}): void {
+  const seqAt = drawSeq
+  window.setTimeout(() => {
+    if (!bridge) return
+    if (drawSeq !== seqAt) return  // 間に他の描画があった = 取りこぼしていない
+    drawSeq++
+    logFn(`復帰後ガード再描画: ${RETURN_REDRAW_RETRY_MS}ms 無描画のため rebuild を再送`)
+    void withBridgeTimeout('rebuildPageContainer(guard)', bridge.rebuildPageContainer(new RebuildPageContainer(config)))
+      .catch((err) => logFn(`ガード再描画 失敗: ${err}`))
+  }, RETURN_REDRAW_RETRY_MS)
+}
 
 /**
  * ブリッジ送信に上限時間を付ける。
@@ -67,6 +107,7 @@ export function initRenderer(appBridge: EvenAppBridge): void {
 /** Foreground 再入場後など、レンズページを再生成したいときに呼ぶ */
 export function resetPageState(): void {
   startupRendered = false
+  returnRebuildFallbackArmed = false
 }
 
 async function rebuildPage(config: {
@@ -76,6 +117,29 @@ async function rebuildPage(config: {
   if (!bridge) return
   const mainContent = config.textObject?.find((t) => t.containerID === 2)?.content ?? ''
   const previewLine = mainContent.split('\n')[0].slice(0, 40)
+  drawSeq++
+  // プラグインからの復帰直後: create は使えないので rebuild で全置き換えする。
+  // 復帰フラグが古くて実は新規セッションだった場合、rebuild は拒否されるので
+  // create にフォールバックして自己修復する。
+  if (returnRebuildFallbackArmed) {
+    returnRebuildFallbackArmed = false
+    let ok = false
+    try {
+      ok = await withBridgeTimeout(
+        'rebuildPageContainer(return)',
+        bridge.rebuildPageContainer(new RebuildPageContainer(config)),
+      )
+    } catch (err) {
+      logFn(`復帰 rebuild 失敗: ${err}`)
+    }
+    logFn(`復帰 rebuild 結果=${String(ok)}`)
+    if (ok) {
+      scheduleReturnRedraw(config)
+      return
+    }
+    logFn('復帰 rebuild が拒否されたため createStartUpPageContainer にフォールバック')
+    startupRendered = false
+  }
   if (!startupRendered) {
     console.log(`[renderer] createStartUpPageContainer (main: "${previewLine}")`)
     await withBridgeTimeout(

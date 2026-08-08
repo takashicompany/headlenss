@@ -12,17 +12,27 @@ import { onEvenHubEvent, setEventHandlers, setScrollCooldownMs } from './events'
 import {
   initRenderer,
   MAIN_INNER_WIDTH,
+  markPageAlreadyBuilt,
   resetPageState,
+  setRendererLog,
   showScreen,
   updateContent,
   updateFooter,
   updateHeader,
 } from './renderer'
 import {
+  consumeReturnFlag,
+  markNavigateToPlugin,
+  markReturnReload,
+  withLoaderParam,
+} from './plugin-launch'
+import { fetchTargetHtml, isProxyInjected, performTakeover } from './plugin-takeover'
+import {
   HeadlenssClient,
   type AgentSource,
   type ChatItem,
   type ClaudeSessionInfo,
+  type G2PluginInfo,
   type Pending,
   type Session,
 } from './server-client'
@@ -225,7 +235,8 @@ let recordingLinesCache: string[] = []
 let recordingLinesCacheKey = ''
 let scrollAnimPending = 0  // アニメーションでまだ消化していない残り行数。正=back, 負=forward
 let scrollAnimTimer: ReturnType<typeof setTimeout> | null = null
-let rootCursorName: string | null = null  // rootlist 内のカーソルが指すセッション名 (index ではなく名前で追跡)
+// rootlist 内のカーソルが指す行のキー (index ではなくキーで追跡し、一覧が入れ替わっても位置を保つ)
+let rootCursorKey: string | null = null
 let rootListStart = 0 // rootlist 表示窓の先頭 index。カーソル追従方式で cursor が窓外に出た時だけスライドする
 let ccListStart = 0   // cc-response 画面の表示窓の先頭行 index (rootlist と同じカーソル追従方式)
 
@@ -376,20 +387,53 @@ function recomputePhase(): void {
   updatePendingUI()
 }
 
-/** rootCursorName を claudeSessions 内の index に解決する。名前が消えた場合はクランプして名前も更新する */
+/**
+ * rootlist の 1 行。セッション行と、その配下にぶら下がる G2 プラグイン行の 2 種類。
+ * カーソルはこの行配列の上を動く (プラグイン行にも止まれる)。
+ */
+type RootRow =
+  | { kind: 'session'; session: ClaudeSessionInfo }
+  | { kind: 'plugin'; session: ClaudeSessionInfo; plugin: G2PluginInfo }
+
+/** 行の同一性キー。並びが変わってもカーソル位置を保つために index ではなくこれで追う。 */
+function rootRowKey(row: RootRow): string {
+  return row.kind === 'session'
+    ? `s:${row.session.tmuxSessionName}`
+    : `p:${row.session.tmuxSessionName}:${row.plugin.url}`
+}
+
+/** セッション一覧を、プラグインをぶら下げた行配列に展開する。 */
+function rootRows(): RootRow[] {
+  const rows: RootRow[] = []
+  for (const session of claudeSessions) {
+    rows.push({ kind: 'session', session })
+    for (const plugin of session.g2Plugins ?? []) rows.push({ kind: 'plugin', session, plugin })
+  }
+  return rows
+}
+
+/** rootCursorKey を rootRows 内の index に解決する。行が消えた場合はクランプしてキーも更新する */
 function resolveRootCursorIndex(): number {
-  if (claudeSessions.length === 0) return 0
-  if (rootCursorName) {
-    const idx = claudeSessions.findIndex((s) => s.tmuxSessionName === rootCursorName)
+  const rows = rootRows()
+  if (rows.length === 0) return 0
+  if (rootCursorKey) {
+    const idx = rows.findIndex((r) => rootRowKey(r) === rootCursorKey)
     if (idx >= 0) return idx
   }
-  // 名前が見つからない (一覧から消えた) → 先頭にフォールバックし名前も更新
-  rootCursorName = claudeSessions[0]?.tmuxSessionName ?? null
+  // 行が見つからない (一覧から消えた) → 先頭にフォールバックしキーも更新
+  rootCursorKey = rows[0] ? rootRowKey(rows[0]) : null
   return 0
 }
-/** lastSessions に対して rootCursorName を現在の選択 (settings.sessionName) に合わせる */
+
+/** カーソルが今指している行 */
+function currentRootRow(): RootRow | undefined {
+  return rootRows()[resolveRootCursorIndex()]
+}
+
+/** rootCursorKey を現在の選択 (settings.sessionName) のセッション行に合わせる */
 function syncRootCursor(): void {
-  rootCursorName = settings.sessionName || (claudeSessions[0]?.tmuxSessionName ?? null)
+  const name = settings.sessionName || claudeSessions[0]?.tmuxSessionName || ''
+  rootCursorKey = name ? `s:${name}` : null
 }
 
 /** Claude Code セッションの待機状態を1文字記号にする */
@@ -543,7 +587,7 @@ function tailLines(text: string, n: number): string {
 
 /** G2 rootlist 画面: Claude Code 起動中の tmux 一覧 (待機状態は記号で示す) */
 function buildRootListView(): string {
-  const items = claudeSessions
+  const items = rootRows()
   if (items.length === 0) {
     return t('rootListEmpty')
   }
@@ -561,8 +605,14 @@ function buildRootListView(): string {
 
   const lines: string[] = []
   for (let i = rootListStart; i < Math.min(rootListStart + ROOT_LIST_VISIBLE, total); i++) {
-    const s = items[i]
+    const row = items[i]
     const cursor = i === rootCursor ? '▶ ' : '  '
+    if (row.kind === 'plugin') {
+      // セッション行の下にぶら下げる。字下げで従属関係を示す。
+      lines.push(`${cursor}  └ ${row.plugin.name}`)
+      continue
+    }
+    const s = row.session
     const mark = claudeStatusMark(s)
     const agent = s.source === 'codex' ? 'Codex' : s.source === 'claude' ? 'Claude' : 'Agent'
     // 既読セッションは空白で揃え、未読は '*' でマーク
@@ -917,9 +967,13 @@ function currentRespondRowIsTypeSomething(): boolean {
 
 function buildG2Footer(): string {
   switch (phase) {
-    case 'rootlist':
-      if (claudeSessions.length === 0) return t('g2NoSessionsBrief')
-      return `${t('g2FootRoot')} (${resolveRootCursorIndex() + 1}/${claudeSessions.length})`
+    case 'rootlist': {
+      // 分母はカーソルが動ける行数 (プラグイン行を含む)。セッション数だと
+      // プラグインを足したぶんだけ「22/21」のようにズレる。
+      const rows = rootRows().length
+      if (rows === 0) return t('g2NoSessionsBrief')
+      return `${t('g2FootRoot')} (${resolveRootCursorIndex() + 1}/${rows})`
+    }
     case 'cc-response':
       // multi-select 中の Submit 行を強調するため、multi-select 質問のときは別文言
       if (currentRespondQuestionIsMulti()) return t('g2FootCcRespMulti')
@@ -1397,7 +1451,35 @@ clearHistoryBtn.addEventListener('click', () => {
   renderHistory()
 })
 
-setInterval(renderHistory, 60_000)
+const historyRenderTimer = setInterval(renderHistory, 60_000)
+
+/**
+ * headlenss 自身の常駐処理を全部止める。
+ *
+ * プラグインを取り込む (document を対象 HTML に置き換える) 前に必ず呼ぶ。
+ * document.open() はイベントリスナーは消すが**タイマーは消さない**ため、
+ * 止めないと headlenss のポーリングが裏で回り続け、プラグインの描画と
+ * 奪い合ってレンズがちらつく (1.5 秒ごとに一覧の内容を送ってしまう)。
+ */
+function stopAllBackgroundWork(): void {
+  for (const t of [recordingTimer, sessionsRefreshTimer, outputPollTimer, claudePollTimer, historyRenderTimer]) {
+    if (t) clearInterval(t)
+  }
+  recordingTimer = null
+  sessionsRefreshTimer = null
+  outputPollTimer = null
+  claudePollTimer = null
+  for (const t of [probeDebounceTimer, scrollAnimTimer, lastReadPersistTimer, obProbeTimer, toastHideTimer]) {
+    if (t) clearTimeout(t)
+  }
+  probeDebounceTimer = null
+  scrollAnimTimer = null
+  lastReadPersistTimer = null
+  obProbeTimer = null
+  toastHideTimer = null
+  // 実行中の取得も打ち切る (完了時に描画へ回るため)
+  abortInFlightRefresh()
+}
 
 // ─── Settings UI ───────────────────────────────────────────────────────
 /** スライダーと、その横の現在値表示を同じ値で揃える。 */
@@ -2042,7 +2124,7 @@ async function toggleRecording(): Promise<void> {
     await startRecording()
     return
   } else if (phase === 'rootlist') {
-    openSelectedFromRoot()
+    activateSelectedFromRoot()
   } else if (phase === 'idle') {
     // pending があるなら音声入力ではなく応答画面に遷移
     if (claudePending) {
@@ -2067,19 +2149,111 @@ async function toggleRecording(): Promise<void> {
 // ─── rootlist ──────────────────────────────────────────────────────────
 function moveRootCursor(delta: number): void {
   if (phase !== 'rootlist') return
-  if (claudeSessions.length === 0) return
+  const rows = rootRows()
+  if (rows.length === 0) return
   const cur = resolveRootCursorIndex()
-  const next = (cur + delta + claudeSessions.length) % claudeSessions.length
-  rootCursorName = claudeSessions[next]?.tmuxSessionName ?? null
+  const next = (cur + delta + rows.length) % rows.length
+  rootCursorKey = rootRowKey(rows[next])
+  const row = rows[next]
+  log(`rootlist cursor=${row.kind} ${row.kind === 'plugin' ? row.plugin.name : row.session.tmuxSessionName}`)
   void refreshG2(true)
+}
+
+// ─── G2 プラグインへの遷移 ─────────────────────────────────────────────
+// 遷移直前にレンズへフィードバックを出し、そのフレームが届くまで少し待つ。
+const PLUGIN_NAVIGATE_DELAY_MS = 400
+let navigatingToPlugin = false
+// 取り込み用 fetch の中断口 (Connecting 中のダブルタップ中止で使う)
+let pluginNavAbort: AbortController | null = null
+
+/**
+ * セッション配下の G2 プラグインへ WebView ごと遷移する。
+ * URL に `?even_loader=1` を付けるので、遷移先に even-loader のシムが入っていれば
+ * ダブルタップで headlenss に戻れる (Plugin Loader と同じ規約)。
+ */
+function openG2Plugin(plugin: G2PluginInfo): void {
+  if (navigatingToPlugin) return
+  // URL は宣言ファイルに書かれたものをそのまま使う (推測しない)。
+  const url = plugin.url
+  if (!url) return
+  navigatingToPlugin = true
+  pluginNavAbort = new AbortController()
+  log(`plugin を開きます: ${plugin.name} -> ${url}`)
+  void (async () => {
+    try {
+      await updateHeader(plugin.name)
+      await updateContent(`${t('pluginConnecting')}\n${url}`)
+      await new Promise((r) => setTimeout(r, PLUGIN_NAVIGATE_DELAY_MS))
+    } catch (err) {
+      log(`plugin を開く前の描画エラー: ${err}`)
+    }
+    if (!navigatingToPlugin) return
+
+    // 取り込み方式: 対象の HTML を取得して自分のドキュメントを置き換える。
+    // ページは headlenss のまま (URL も変わらない) なので、戻る機構をこちら側で
+    // 仕込める = 相手のプラグインにも中継サーバにも一切依存しない。
+    const html = await fetchTargetHtml(url, pluginNavAbort.signal)
+    if (!navigatingToPlugin) return
+
+    if (html && !isProxyInjected(html)) {
+      // 取り込み後もタイマーは生き残る。止めないと headlenss のポーリングが
+      // 裏で回り続け、プラグインの描画と奪い合う。
+      stopAllBackgroundWork()
+      log('plugin を取り込みます (ページ置き換え)')
+      performTakeover(html, url, log)
+      return
+    }
+
+    // 取り込めない場合 (CORS 拒否 / 非 HTML / 応答なし / 既にシム注入済み) は
+    // 従来どおりトップレベル遷移する。相手にシムがあれば戻れる。
+    log(`plugin を取り込めないので遷移します (html=${html ? 'proxy注入済み' : '取得失敗'})`)
+    await markNavigateToPlugin(bridge)
+    if (!navigatingToPlugin) {
+      void consumeReturnFlag(bridge)
+      return
+    }
+    location.assign(withLoaderParam(url))
+  })()
+}
+
+/**
+ * 遷移の中止。
+ *
+ * 接続先が落ちている / 応答しない場合、location.assign を呼んでも WebView は現ページに
+ * 留まり、Connecting 表示のまま固まる。この間のダブルタップで一覧へ戻す。
+ * (遷移が成功した場合はページごと破棄されるのでこの処理は動かない)
+ */
+function cancelPluginNavigation(): void {
+  if (!navigatingToPlugin) return
+  navigatingToPlugin = false
+  log('plugin を開くのを中止しました')
+  // 取り込み用 fetch と、保留中のトップレベル遷移の両方を止める
+  pluginNavAbort?.abort()
+  pluginNavAbort = null
+  try { window.stop() } catch { /* ignore */ }
+  // 遷移前に立てた復帰フラグを撤回する (遷移しなかったので次回 boot は通常経路でよい)
+  void consumeReturnFlag(bridge)
+  // レンズを一覧へ戻す。このページは構築済みなので rebuild 経路で描き直す。
+  markPageAlreadyBuilt()
+  void refreshG2(true)
+}
+
+/** rootlist でタップされた時の分岐: セッション行なら開く、プラグイン行なら遷移する */
+function activateSelectedFromRoot(): void {
+  if (phase !== 'rootlist') return
+  const row = currentRootRow()
+  if (!row) return
+  if (row.kind === 'plugin') {
+    openG2Plugin(row.plugin)
+    return
+  }
+  openSelectedFromRoot()
 }
 
 function openSelectedFromRoot(): void {
   if (phase !== 'rootlist') return
-  // カーソル名からセッションを検索 (index ではなく名前ベース)
-  const sel = rootCursorName
-    ? claudeSessions.find((s) => s.tmuxSessionName === rootCursorName)
-    : claudeSessions[0]
+  const row = currentRootRow()
+  const sel = row?.session ?? claudeSessions[0]
   if (!sel) return
   // セッション切替: 前回の in-flight fetch を中断してから新セッションに切替
   abortInFlightRefresh()
@@ -2383,7 +2557,7 @@ claudeSessionsListEl.addEventListener('click', (e) => {
     log(`Active session set: ${name}`)
     if (phase === 'rootlist') {
       // rootlist のカーソル名も合わせる
-      rootCursorName = name
+      rootCursorKey = `s:${name}`
       void refreshG2(true)
     }
   }
@@ -2495,7 +2669,7 @@ async function submitNewClaudeSession(e: Event): Promise<void> {
 
     if (appeared) {
       // 検出成功: rootlist のカーソルを新セッションに合わせて、レンズへ即反映
-      rootCursorName = name
+      rootCursorKey = `s:${name}`
       setNewClaudeStatus('ok', `${t('newClaudeOk')} (${name})`)
       log(`Agent session "${name}" detected (took ${Date.now() - startedAt}ms)`)
     } else {
@@ -2622,6 +2796,7 @@ async function boot(): Promise<void> {
   setupLogToolbar()
   setupLanguageSelector()
   setupExternalLink(obSmPortalLink)
+  setRendererLog(log)
   newClaudeForm.addEventListener('submit', (e) => { void submitNewClaudeSession(e) })
 
   // 1. Bridge 接続 (必須)
@@ -2630,6 +2805,15 @@ async function boot(): Promise<void> {
     log('Connected to Even bridge')
   } catch {
     log('Even bridge not available — このアプリはG2 SDK経由でしか動作しません')
+  }
+
+  // G2 プラグインから戻ってきた場合、ホスト側セッションにはプラグインのコンテナが
+  // 残っている。createStartUpPageContainer はセッションにつき 1 回きりなので、
+  // 初回描画を rebuildPageContainer に切り替える (拒否されたら create へ戻る)。
+  const returning = await consumeReturnFlag(bridge)
+  if (returning.found) {
+    log(`プラグインからの復帰を検出 (経路=${returning.via.join('+')}) — 初回描画を rebuild で行います`)
+    markPageAlreadyBuilt()
   }
 
   // 2. G2画面初期化
@@ -2657,6 +2841,9 @@ async function boot(): Promise<void> {
       onClick: () => { void toggleRecording() },
       // 二重クリック: 各 phase での「戻る/キャンセル」操作
       onDoubleClick: () => {
+        // プラグインへの遷移待ちで固まっている場合は、まずそれを中止する。
+        // (接続先が落ちていると Connecting 表示のまま戻れなくなるため)
+        if (navigatingToPlugin) { cancelPluginNavigation(); return }
         if (phase === 'idle') backToRoot()
         else if (phase === 'recording') void abortRecording()  // 録音中止 (新しい文は追加しない)
         else if (phase === 'pending') discardPending()         // pending 全破棄 → idle
@@ -2793,6 +2980,18 @@ async function boot(): Promise<void> {
     }, 500)
   }
 }
+
+// G2 プラグインから history.back() で戻ってきた場合、WebView は履歴復帰 (bfcache)
+// になることがある。復帰したページはブリッジ経路が死んでいることがあるため
+// (even-loader が公式シミュレータで実測)、リロードして通常の boot 経路に戻す。
+// reload 後の boot が初回描画を rebuild にできるよう、同期的にフラグを立ててから
+// リロードする。
+window.addEventListener('pageshow', (e) => {
+  if (!e.persisted) return
+  log('pageshow (履歴復帰) — リロードして再初期化します')
+  markReturnReload()
+  location.reload()
+})
 
 boot().catch((err) => {
   log(`Fatal: ${err}`)

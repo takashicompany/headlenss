@@ -29,6 +29,19 @@ export type ClaudeSessionInfo = {
   source?: AgentSource
   /** rootlist プレビュー用: 最後のメッセージ冒頭 (サーバ側で 48 文字に丸め済み)。 */
   lastChat?: string
+  /** このセッションの作業フォルダ配下で動いている G2 プラグインの dev server。 */
+  g2Plugins?: G2PluginInfo[]
+}
+
+/**
+ * セッションのフォルダの宣言ファイルに書かれた G2 プラグイン。
+ * サーバ側で疎通確認済みのものだけが降ってくる (= タップすれば必ず開ける)。
+ */
+export type G2PluginInfo = {
+  /** 宣言ファイルに書かれた表示名 */
+  name: string
+  /** 宣言ファイルに書かれた URL。そのまま遷移先になる (組み立て直さない) */
+  url: string
 }
 
 export type ChatRole = 'user' | 'assistant'

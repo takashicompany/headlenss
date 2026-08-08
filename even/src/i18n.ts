@@ -169,6 +169,7 @@ const STRINGS = {
   // G2 footer (28全角文字 = 56半角文字 以内)。各 phase で利用可能な全操作を網羅する。
   // 共通記法: `Tap:X　↑↓:Y　2Tap:Z` (区切りは全角スペース U+3000、2Tap = double tap)
   g2FootRoot:       { en: 'Tap:Open　↑↓:Nav　2Tap:Exit',           ja: 'タップ:開く　↑↓:移動　2タップ:終了' },
+  pluginConnecting: { en: 'Opening plugin...',                        ja: 'プラグインを開いています...' },
   g2FootRecOff:     { en: 'Tap:Done　2Tap:Cancel',                     ja: 'タップ:録音終了　2タップ:取消' },
   g2FootFinalizing: { en: 'Transcribing…',                                 ja: '文字起こし中…' },
   g2FootPending:    { en: 'Tap:Add　↑:Send　↓:Del　2Tap:Back', ja: 'タップ:追加　↑:送信　↓:削除　2タップ:戻る' },
