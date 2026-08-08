@@ -2,8 +2,22 @@ import { execFile } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { resolveAgentTarget } from './agent-pane.ts';
+import { getSession } from './claude/store.ts';
 
 const exec = promisify(execFile);
+
+/**
+ * 送信 / 画面取得の宛先を「エージェントがいる pane」に解決する。
+ *
+ * セッション名のまま tmux に渡すとアクティブ pane 行きになるため、別ウィンドウ
+ * (dev server 等) を作られると宛先がそちらへずれる。pane ID を名指しすれば
+ * ずれようがない。解決できない時だけ従来どおりセッション名で送る。
+ */
+async function agentTarget(name: string): Promise<string> {
+  validateName(name);
+  return resolveAgentTarget(name, getSession(name)?.tmuxPane);
+}
 
 /** `~/...` や相対パスをホーム基準で絶対パスに解決 */
 function resolveCwd(input: string): string {
@@ -286,32 +300,32 @@ export async function renameSession(name: string, nextName: string): Promise<voi
 }
 
 export async function sendKeys(name: string, text: string, submit = false): Promise<void> {
-  validateName(name);
+  const target = await agentTarget(name);
   if (text.length > 0) {
-    await exec('tmux', ['send-keys', '-t', name, '-l', text]);
+    await exec('tmux', ['send-keys', '-t', target, '-l', text]);
   }
   if (submit) {
-    await exec('tmux', ['send-keys', '-t', name, 'C-m']);
+    await exec('tmux', ['send-keys', '-t', target, 'C-m']);
   }
 }
 
 export async function sendKey(name: string, key: string): Promise<void> {
-  validateName(name);
   if (!/^[A-Za-z0-9_+-]+$/.test(key)) throw new Error('invalid key');
-  await exec('tmux', ['send-keys', '-t', name, key]);
+  const target = await agentTarget(name);
+  await exec('tmux', ['send-keys', '-t', target, key]);
 }
 
 /**
- * セッションのアクティブpaneを capture-pane でテキスト化して返す。
+ * エージェントがいる pane を capture-pane でテキスト化して返す。
  * `-p` stdout出力 / `-J` 折り返し行を結合 / `-S -<lines>` で開始行を相対指定。
  * 色エスケープは付かない (`-e` を渡さない)。
  */
 export async function captureOutput(name: string, lines = 24): Promise<string> {
-  validateName(name);
+  const target = await agentTarget(name);
   const safeLines = Math.max(1, Math.min(2000, Math.floor(lines)));
   const { stdout } = await exec('tmux', [
     'capture-pane',
-    '-t', name,
+    '-t', target,
     '-p',
     '-J',
     '-S', `-${safeLines}`,

@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>headlenss e2e seed</title>
+<!--
+  E2E 検証専用のシード投入ページ。
+
+  headlenss は「サーバ URL とセッション名が設定済み」でないと rootlist まで進めない。
+  シミュレータでは手入力できないので、このページで localStorage に設定を書いてから
+  アプリ本体へ replace 遷移する。
+
+  使い方:
+    /e2e-seed.html?server=http://127.0.0.1:3000&session=greensky
+-->
+<body>
+<pre id="out">seeding...</pre>
+<script>
+  var q = new URLSearchParams(location.search)
+  var settings = {
+    serverBaseUrl: q.get('server') || 'http://127.0.0.1:3000',
+    sessionName: q.get('session') || 'greensky',
+    // ASR は使わないが、未設定だと unconfigured 画面で止まるのでダミーを入れる
+    speechmaticsApiKey: q.get('key') || 'e2e-dummy-key',
+    speechmaticsLang: 'ja',
+    speechmaticsOperatingPoint: 'enhanced',
+    language: q.get('lang') || 'ja',
+    chatDisplayLines: 7,
+    chatBottomSpacer: false,
+    // シミュレータの console にアプリのログを流すため開発モードを ON にする
+    devMode: true,
+    scrollLinesPerGesture: 7,
+    scrollCooldownMs: 200,
+    // スクロールアニメを切って、カーソル移動を 1 回の入力で確定させる
+    scrollAnimTickMs: 0
+  }
+  try { localStorage.setItem('headlenss_settings_v1', JSON.stringify(settings)) } catch (e) {}
+  document.getElementById('out').textContent = 'seeded: ' + JSON.stringify(settings, null, 2)
+  location.replace('/')
+</script>
+</body>

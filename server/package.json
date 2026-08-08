@@ -9,6 +9,7 @@
     "dev": "concurrently -k -n server,web -c blue,green \"npm:dev:server\" \"npm:dev:web\"",
     "dev:server": "tsx --env-file-if-exists=.env watch src/server/index.ts",
     "dev:web": "vite",
+    "test": "tsx --test src/server/*.test.ts",
     "build": "vite build",
     "prestart": "vite build",
     "start": "tsx --env-file-if-exists=.env src/server/index.ts",
