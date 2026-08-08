@@ -15,6 +15,7 @@ import { extractChatFromTranscript, extractLastAssistantText, sanitizeChatText }
 import { extractCodexChatFromTranscript } from '../codex/transcript.ts';
 import { detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
 import { matchUiSubmission } from '../uiSubmissions.ts';
+import { detectG2Plugins, tmuxSessionPaths, type G2Plugin } from '../g2-plugins.ts';
 import type { AskQuestion, ChatItem, HookDecision, RespondInput, SessionStatus } from './types.ts';
 
 const exec = promisify(execFile);
@@ -569,6 +570,8 @@ claudeRouter.get('/claude/sessions', async (c) => {
     codexHookHealth?: ReturnType<typeof getCodexHookHealth>;
     codexNeedsHookAttention?: boolean;
     lastChat?: string;
+    /** セッションの作業フォルダ配下で動いている G2 プラグインの dev server */
+    g2Plugins?: G2Plugin[];
   }> = [];
 
   const claudeByName = new Map(detected.map((d) => [d.tmuxSessionName, d]));
@@ -645,6 +648,22 @@ claudeRouter.get('/claude/sessions', async (c) => {
       });
     }
   }
+
+  // 各セッションの作業フォルダ配下で動いている G2 プラグインを付ける。
+  // 検出結果は g2-plugins 側でキャッシュされるので、セッション数ぶん呼んでも
+  // ポート走査は 1 回にまとまる。失敗しても一覧自体は返す。
+  // cwd はフック由来なので、サーバ再起動直後やフック未導入のセッションでは空になる。
+  // その場合は tmux の pane から直接引いて補う (検出はフォルダが要るため)。
+  const panePaths = await tmuxSessionPaths().catch(() => new Map<string, string>());
+  await Promise.all(merged.map(async (s) => {
+    const cwd = s.cwd || panePaths.get(s.tmuxSessionName) || '';
+    if (!cwd) return;
+    const plugins = await detectG2Plugins(cwd).catch((e) => {
+      console.warn(`[g2-plugins] ${s.tmuxSessionName}: ${(e as Error).message}`);
+      return [] as G2Plugin[];
+    });
+    if (plugins.length > 0) s.g2Plugins = plugins;
+  }));
 
   return c.json({ sessions: merged });
 });
