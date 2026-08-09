@@ -16,7 +16,7 @@ import { extractCodexChatFromTranscript } from '../codex/transcript.ts';
 import { detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
 import { matchUiSubmission } from '../uiSubmissions.ts';
 import { detectG2Plugins, tmuxSessionPaths, type G2Plugin } from '../g2-plugins.ts';
-import { pickClaudeDetected, resolveSessionStatus } from '../session-status.ts';
+import { pickClaudeDetected, pickEffectiveSource, resolveSessionStatus } from '../session-status.ts';
 import type { AskQuestion, ChatItem, HookDecision, RespondInput, SessionStatus } from './types.ts';
 
 const exec = promisify(execFile);
@@ -598,8 +598,15 @@ claudeRouter.get('/claude/sessions', async (c) => {
     const xd = codexByName.get(name);
 
     // 実効ソース: live owner を最優先 → store → 検出。owner 不明時は sticky。
-    const effSource: 'claude' | 'codex' | undefined =
-      ownerEntry?.source ?? st?.source ?? (cd ? 'claude' : xd ? 'codex' : undefined);
+    // /api/sessions と同じ判定になるよう共有関数に寄せている。
+    const signals = {
+      tmuxSessionName: name,
+      store: st,
+      claudeDetected: detected,
+      codexDetected,
+      liveOwner: ownerEntry,
+    };
+    const effSource = pickEffectiveSource(signals);
     if (!effSource) continue;
 
     // store が実効ソースと別 agent (残骸) の場合、その cwd/status は使わない。
@@ -618,14 +625,7 @@ claudeRouter.get('/claude/sessions', async (c) => {
 
     if (effSource === 'claude') {
       const sc = storeMatched ? st : undefined;
-      const status = resolveSessionStatus({
-        source: 'claude',
-        tmuxSessionName: name,
-        store: st,
-        claudeDetected: detected,
-        codexDetected,
-        liveOwner: ownerEntry,
-      });
+      const status = resolveSessionStatus({ ...signals, source: 'claude' });
       merged.push({
         tmuxSessionName: name,
         cwd: sc?.cwd || cd?.cwd || '',
@@ -638,14 +638,7 @@ claudeRouter.get('/claude/sessions', async (c) => {
     } else {
       const sx = storeMatched ? st : undefined;
       const cwd = sx?.cwd || xd?.cwd || '';
-      const status = resolveSessionStatus({
-        source: 'codex',
-        tmuxSessionName: name,
-        store: st,
-        claudeDetected: detected,
-        codexDetected,
-        liveOwner: ownerEntry,
-      });
+      const status = resolveSessionStatus({ ...signals, source: 'codex' });
       merged.push({
         tmuxSessionName: name,
         cwd,

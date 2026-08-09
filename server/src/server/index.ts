@@ -21,7 +21,7 @@ import * as claudeStore from './claude/store.ts';
 import { sanitizeChatText } from './claude/transcript.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot, stopPeriodicSnapshot } from './persist.ts';
 import { recordUiSubmission } from './uiSubmissions.ts';
-import { resolveSessionStatus } from './session-status.ts';
+import { pickEffectiveSource, resolveSessionStatus } from './session-status.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -176,30 +176,27 @@ app.get('/api/sessions', async (c) => {
     // live owner (今その画面を握っている本人)。失敗時は null → sticky フォールバック。
     detectLiveOwners().catch(() => null),
   ]);
-  const detectedMap = new Map(detected.map((d) => [d.tmuxSessionName, d]));
+  // codex の hookHealth / needsHookAttention 用 (status と source の判定は共有関数側)。
   const codexMap = new Map(codexDetected.map((d) => [d.tmuxSessionName, d]));
   const liveNames = new Set(sessions.map((s) => s.name));
   const enriched = sessions.map((s) => {
     const tracked = claudeStore.getSession(s.name);
-    // agent は live owner を最優先 → store → 検出。owner 不明時は sticky。
-    const owner = liveOwners?.get(s.name);
-    const agent = owner?.source ?? tracked?.source ?? (codexMap.has(s.name) ? 'codex' : detectedMap.has(s.name) ? 'claude' : undefined);
+    // agent (実効ソース) も status も /api/claude/sessions と同じ共有関数で決める。
+    // 実効ソースの優先順位 (live owner → store → claude 検出 → codex 検出) も
+    // 検出結果の選び方 (live owner が claude なら owner PID 一致の det のみ) も
+    // 関数内に閉じているので、2 つのエンドポイントで答えがズレない。
+    const signals = {
+      tmuxSessionName: s.name,
+      store: tracked,
+      claudeDetected: detected,
+      codexDetected,
+      liveOwner: liveOwners?.get(s.name),
+    };
+    const agent = pickEffectiveSource(signals);
     // store が現在の主と別 agent の残骸なら、その chat は別ランのものなので使わない。
     // (status 側の残骸判定は resolveSessionStatus が source 照合で行う。)
     const storeMatches = !tracked?.source || tracked.source === agent;
-    // status は /api/claude/sessions と同じ共有関数で決める。検出結果の選び方
-    // (live owner が claude なら owner PID 一致の det のみ) も関数内に閉じているので、
-    // 2 つのエンドポイントで答えがズレない。
-    const status = agent
-      ? resolveSessionStatus({
-          source: agent,
-          tmuxSessionName: s.name,
-          store: tracked,
-          claudeDetected: detected,
-          codexDetected,
-          liveOwner: owner,
-        })
-      : undefined;
+    const status = agent ? resolveSessionStatus({ ...signals, source: agent }) : undefined;
     return {
       ...s,
       claudeStatus: agent === 'claude' ? status : undefined,

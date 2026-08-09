@@ -58,7 +58,9 @@ export function pickClaudeDetected<T extends ClaudeDetectedInput>(
   liveOwner?: LiveOwnerInput,
 ): T | undefined {
   if (liveOwner?.source === 'claude') {
-    return detected.find((d) => d.pid === liveOwner.pid);
+    // PID だけでなく tmux セッション名も照合する。owner の PID は当該 pane 由来なので
+    // 通常は一致するが、万一ズレた検出結果を拾って別セッションの状態を出さないため。
+    return detected.find((d) => d.pid === liveOwner.pid && d.tmuxSessionName === tmuxSessionName);
   }
   let last: T | undefined;
   for (const d of detected) {
@@ -79,15 +81,34 @@ function pickCodexDetected<T extends CodexDetectedInput>(
   return last;
 }
 
-export type ResolveStatusInput = {
-  /** 実効ソース (live owner → store → 検出 の順で呼び出し側が決めたもの)。 */
-  source: AgentSource;
+/** 1 セッションについて分かっている材料一式。両エンドポイントはこれを組み立てて渡す。 */
+export type SessionSignals = {
   tmuxSessionName: string;
-  /** 素の store。source が実効ソースと違えば残骸として無視される。 */
+  /** 素の store。実効ソースと source が違えば残骸として無視される。 */
   store?: StoreStatusInput;
   claudeDetected: readonly ClaudeDetectedInput[];
   codexDetected: readonly CodexDetectedInput[];
   liveOwner?: LiveOwnerInput;
+};
+
+/**
+ * そのセッションの実効ソース (今その画面の主が claude か codex か) を決める。
+ *
+ * 優先順位: live owner (今その画面を握っている本人) → store (フック追跡) → 検出。
+ * owner も store も無いときは claude 検出を先に見る (registry 由来で確度が高い)。
+ * owner 不明時に勝手に切り替えない (sticky) のが狙い。
+ */
+export function pickEffectiveSource(signals: SessionSignals): AgentSource | undefined {
+  if (signals.liveOwner) return signals.liveOwner.source;
+  if (signals.store?.source) return signals.store.source;
+  if (pickClaudeDetected(signals.tmuxSessionName, signals.claudeDetected, signals.liveOwner)) return 'claude';
+  if (pickCodexDetected(signals.tmuxSessionName, signals.codexDetected)) return 'codex';
+  return undefined;
+}
+
+export type ResolveStatusInput = SessionSignals & {
+  /** 実効ソース。pickEffectiveSource の結果を渡す。 */
+  source: AgentSource;
 };
 
 /**

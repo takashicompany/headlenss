@@ -2,6 +2,7 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import {
   pickClaudeDetected,
+  pickEffectiveSource,
   resolveSessionStatus,
   type ClaudeDetectedInput,
   type CodexDetectedInput,
@@ -154,6 +155,48 @@ test('Claude det の選択: live owner が claude なら owner PID 一致分の�
   assert.equal(pickClaudeDetected(NAME, [interactive, headless], undefined), headless);
   assert.equal(pickClaudeDetected(NAME, [interactive, headless], { source: 'codex', pid: 300 }), headless);
   assert.equal(pickClaudeDetected('other', [interactive], undefined), undefined);
+  // PID が一致しても tmux セッション名が違う検出結果は使わない (別セッションの状態を出さない)。
+  const otherSession: ClaudeDetectedInput = { pid: 100, tmuxSessionName: 'other', status: 'busy' };
+  assert.equal(pickClaudeDetected(NAME, [otherSession], owner), undefined);
+});
+
+test('実効ソース: live owner → store → claude 検出 → codex 検出 の順で決まる', () => {
+  const signals = (over: Partial<Parameters<typeof pickEffectiveSource>[0]>) =>
+    pickEffectiveSource({
+      tmuxSessionName: NAME,
+      claudeDetected: [],
+      codexDetected: [],
+      ...over,
+    });
+
+  // live owner が最優先 (store や検出が別 agent を指していても owner が勝つ)。
+  assert.equal(
+    signals({
+      liveOwner: { source: 'codex', pid: 1 },
+      store: { status: 'idle', source: 'claude' },
+      claudeDetected: [claudeDet(1, 'idle')],
+    }),
+    'codex',
+  );
+  // owner 不明なら store で sticky。
+  assert.equal(
+    signals({ store: { status: 'idle', source: 'codex' }, claudeDetected: [claudeDet(1, 'idle')] }),
+    'codex',
+  );
+  // owner も store も無ければ検出。claude 検出を先に見る (両方あっても claude)。
+  assert.equal(
+    signals({
+      claudeDetected: [claudeDet(1, 'idle')],
+      codexDetected: [{ tmuxSessionName: NAME, status: 'idle' }],
+    }),
+    'claude',
+  );
+  assert.equal(signals({ codexDetected: [{ tmuxSessionName: NAME, status: 'idle' }] }), 'codex');
+  // 何も無ければ不明。source 未設定の古い store も判断材料にしない。
+  assert.equal(signals({}), undefined);
+  assert.equal(signals({ store: { status: 'idle' } }), undefined);
+  // 別セッションの検出結果に引きずられない。
+  assert.equal(signals({ claudeDetected: [{ pid: 1, tmuxSessionName: 'other', status: 'busy' }] }), undefined);
 });
 
 test('同一セッションに対話 claude と claude -p が居ても両エンドポイントで status が一致する', () => {
