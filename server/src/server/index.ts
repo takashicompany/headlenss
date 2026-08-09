@@ -21,6 +21,7 @@ import * as claudeStore from './claude/store.ts';
 import { sanitizeChatText } from './claude/transcript.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot, stopPeriodicSnapshot } from './persist.ts';
 import { recordUiSubmission } from './uiSubmissions.ts';
+import { resolveSessionStatus } from './session-status.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -185,15 +186,18 @@ app.get('/api/sessions', async (c) => {
     const agent = live ?? tracked?.source ?? (codexMap.has(s.name) ? 'codex' : detectedMap.has(s.name) ? 'claude' : undefined);
     // store が現在の主と別 agent の残骸なら、その status/chat は別ランのものなので使わない。
     const storeMatches = !tracked?.source || tracked.source === agent;
+    // status は /api/claude/sessions と同じマージ関数で決める。
+    // (store をそのまま返すと、フック導入済み Claude セッションの busy が
+    //  registry 由来でしか分からないため永久に見えなくなる。)
+    const storeStatus = tracked && tracked.source === agent ? tracked : undefined;
+    const status = agent
+      ? resolveSessionStatus(agent, storeStatus, agent === 'claude' ? detectedMap.get(s.name) : codexMap.get(s.name))
+      : undefined;
     return {
       ...s,
-      claudeStatus: agent === 'claude'
-        ? (storeMatches && tracked?.source === 'claude' ? tracked.status : detectedMap.get(s.name)?.status)
-        : undefined,
+      claudeStatus: agent === 'claude' ? status : undefined,
       agent,
-      codexStatus: agent === 'codex'
-        ? (storeMatches && tracked?.source === 'codex' ? tracked.status : codexMap.get(s.name)?.status)
-        : undefined,
+      codexStatus: agent === 'codex' ? status : undefined,
       codexHookHealth: codexMap.get(s.name)?.hookHealth ?? (agent === 'codex' ? getCodexHookHealth(tracked?.cwd) : getCodexHookHealth()),
       codexNeedsHookAttention: (agent === 'codex' && codexMap.get(s.name)?.needsHookAttention) ?? false,
       lastChat: storeMatches ? buildLastChat(s.name) : undefined,

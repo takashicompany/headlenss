@@ -16,6 +16,7 @@ import { extractCodexChatFromTranscript } from '../codex/transcript.ts';
 import { detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
 import { matchUiSubmission } from '../uiSubmissions.ts';
 import { detectG2Plugins, tmuxSessionPaths, type G2Plugin } from '../g2-plugins.ts';
+import { resolveSessionStatus } from '../session-status.ts';
 import type { AskQuestion, ChatItem, HookDecision, RespondInput, SessionStatus } from './types.ts';
 
 const exec = promisify(execFile);
@@ -618,9 +619,7 @@ claudeRouter.get('/claude/sessions', async (c) => {
 
     if (effSource === 'claude') {
       const sc = storeMatched ? st : undefined;
-      let status: SessionStatus = cd?.status === 'busy' ? 'busy' : 'idle';
-      if (sc && (sc.status === 'waiting-permission' || sc.status === 'waiting-question')) status = sc.status;
-      if (status === 'busy' && sc?.lastStopAt) status = 'idle';
+      const status = resolveSessionStatus('claude', sc, cd);
       merged.push({
         tmuxSessionName: name,
         cwd: sc?.cwd || cd?.cwd || '',
@@ -633,8 +632,7 @@ claudeRouter.get('/claude/sessions', async (c) => {
     } else {
       const sx = storeMatched ? st : undefined;
       const cwd = sx?.cwd || xd?.cwd || '';
-      let status: SessionStatus = xd?.status === 'waiting-permission' ? 'waiting-permission' : 'idle';
-      if (sx && sx.status !== 'idle') status = sx.status;
+      const status = resolveSessionStatus('codex', sx, xd);
       merged.push({
         tmuxSessionName: name,
         cwd,
