@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import {
+  deleteSessionStatusObservation,
   observeSessionStatus,
   pickClaudeDetected,
   pickEffectiveSource,
@@ -254,6 +255,16 @@ test('statusChangedAt: 生きていない tmux セッションのエントリは
   assert.equal(observeSessionStatus(NAME, 'busy', 2_000), 1_000);
   // 捨てられた方は初回観測扱いに戻る。
   assert.equal(observeSessionStatus('other', 'busy', 2_000), 2_000);
+});
+
+test('statusChangedAt: agent 不明の期間を挟んだら古い時刻を引き継がない', () => {
+  resetSessionStatusObservations();
+  // フック未導入の claude が busy 中に落ちる → 実効ソース不明 (この間は観測できない)。
+  assert.equal(observeSessionStatus(NAME, 'busy', 1_000), 1_000);
+  assert.equal(pickEffectiveSource({ tmuxSessionName: NAME, claudeDetected: [], codexDetected: [] }), undefined);
+  deleteSessionStatusObservation(NAME);
+  // 数時間後に同じセッションでまた busy になっても、その時刻が初回観測になる。
+  assert.equal(observeSessionStatus(NAME, 'busy', 9_000_000), 9_000_000);
 });
 
 test('resolveTrackedSessionStatus: 解決した status と観測時刻を返す', () => {

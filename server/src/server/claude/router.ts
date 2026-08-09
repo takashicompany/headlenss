@@ -17,6 +17,7 @@ import { detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from
 import { matchUiSubmission } from '../uiSubmissions.ts';
 import { detectG2Plugins, tmuxSessionPaths, type G2Plugin } from '../g2-plugins.ts';
 import {
+  deleteSessionStatusObservation,
   pickClaudeDetected,
   pickEffectiveSource,
   pruneSessionStatusObservations,
@@ -616,7 +617,12 @@ claudeRouter.get('/claude/sessions', async (c) => {
       liveOwner: ownerEntry,
     };
     const effSource = pickEffectiveSource(signals);
-    if (!effSource) continue;
+    if (!effSource) {
+      // agent 不明の間は status を観測できないので記録を忘れる
+      // (再び agent が現れたときに古い statusChangedAt を引き継がないため)。
+      deleteSessionStatusObservation(name);
+      continue;
+    }
 
     // store が実効ソースと別 agent (残骸) の場合、その cwd/status は使わない。
     const storeMatched = !!st && st.source === effSource;

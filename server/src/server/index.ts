@@ -21,7 +21,12 @@ import * as claudeStore from './claude/store.ts';
 import { sanitizeChatText } from './claude/transcript.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot, stopPeriodicSnapshot } from './persist.ts';
 import { recordUiSubmission } from './uiSubmissions.ts';
-import { pickEffectiveSource, pruneSessionStatusObservations, resolveTrackedSessionStatus } from './session-status.ts';
+import {
+  deleteSessionStatusObservation,
+  pickEffectiveSource,
+  pruneSessionStatusObservations,
+  resolveTrackedSessionStatus,
+} from './session-status.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -198,6 +203,9 @@ app.get('/api/sessions', async (c) => {
     // store が現在の主と別 agent の残骸なら、その chat は別ランのものなので使わない。
     // (status 側の残骸判定は resolveSessionStatus が source 照合で行う。)
     const storeMatches = !tracked?.source || tracked.source === agent;
+    // agent 不明の間は status を観測できないので、記録を残さず忘れる
+    // (再び agent が現れたときに古い statusChangedAt を引き継がないため)。
+    if (!agent) deleteSessionStatusObservation(s.name);
     const resolved = agent ? resolveTrackedSessionStatus({ ...signals, source: agent }) : undefined;
     const status = resolved?.status;
     return {

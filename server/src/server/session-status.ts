@@ -95,8 +95,10 @@ export type SessionSignals = {
  * そのセッションの実効ソース (今その画面の主が claude か codex か) を決める。
  *
  * 優先順位: live owner (今その画面を握っている本人) → store (フック追跡) → 検出。
- * owner も store も無いときは claude 検出を先に見る (registry 由来で確度が高い)。
  * owner 不明時に勝手に切り替えない (sticky) のが狙い。
+ * owner も store も無いときは claude 検出を先に見る。これは確度の優劣ではなく
+ * /api/claude/sessions の既存挙動に合わせたもの (2 つの API で答えを一致させるのを優先。
+ * registry にはヘッドレスの `claude -p` も載るので「registry の方が確か」ではない)。
  */
 export function pickEffectiveSource(signals: SessionSignals): AgentSource | undefined {
   if (signals.liveOwner) return signals.liveOwner.source;
@@ -177,6 +179,18 @@ export function observeSessionStatus(
   if (prev && prev.status === status) return prev.changedAt;
   statusObservations.set(tmuxSessionName, { status, changedAt: now });
   return now;
+}
+
+/**
+ * 1 セッションぶんの観測を捨てる。
+ *
+ * 実効ソースが不明になった (agent が居なくなった) 間は観測が止まるので、
+ * そのまま残すと「フック未導入の claude が busy 中に落ちて、数時間後に同じ
+ * セッションでまた busy になったら statusChangedAt が数時間前」になってしまう。
+ * 観測できない状態に入ったら忘れて、次に観測できたときを初回として扱う。
+ */
+export function deleteSessionStatusObservation(tmuxSessionName: string): void {
+  statusObservations.delete(tmuxSessionName);
 }
 
 /** 生きている tmux セッション名の集合に無いエントリを捨てる (kill / rename の掃除)。 */
