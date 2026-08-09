@@ -246,6 +246,8 @@ app.post('/api/sessions', async (c) => {
       startClaude: body.startClaude === true,
       startCodex: body.startCodex === true,
     });
+    // 同名の別セッションなので status の変化時刻は引き継がせない。
+    deleteSessionStatusObservation(body.name);
     const source = body.startCodex === true ? 'codex' : body.startClaude === true ? 'claude' : undefined;
     if (source) {
       claudeStore.upsertSession({
@@ -279,6 +281,8 @@ app.patch('/api/sessions/:name', async (c) => {
     } else {
       renameRetainedSession(name, nextName);
     }
+    // 旧名の status 変化時刻は捨てる (新名は次の観測で初回扱いになる)。
+    deleteSessionStatusObservation(name);
     const tracked = claudeStore.getSession(name);
     if (tracked) {
       claudeStore.removeSession(name);
@@ -310,6 +314,8 @@ app.post('/api/sessions/:name/release', async (c) => {
     retainSession({ ...live, cwd: cwd ?? tracked?.cwd ?? process.cwd(), agent: tracked?.source });
     await killSession(name);
     claudeStore.removeSession(name);
+    // 退避したセッションの status 変化時刻は捨てる (mount し直したら初回観測から)。
+    deleteSessionStatusObservation(name);
     invalidateDetectCaches();
     void saveSnapshot();
     return c.json({ ok: true });
@@ -332,6 +338,8 @@ app.post('/api/sessions/:name/mount', async (c) => {
       });
     }
     removeRetainedSession(name);
+    // 復帰したセッションは別ランなので status の変化時刻は引き継がせない。
+    deleteSessionStatusObservation(name);
     if (retained.agent) {
       claudeStore.upsertSession({
         ccSessionId: 'web-' + randomUUID(),
@@ -358,6 +366,9 @@ app.delete('/api/sessions/:name', async (c) => {
     // hook 経由で記録された Claude セッションエントリも合わせて削除する。
     // これをやらないと /api/claude/sessions に死んだ tmux セッションが残り続ける。
     claudeStore.removeSession(name);
+    // status の変化時刻も削除する。一覧取得を挟まずに同名で作り直された場合に、
+    // 別セッションの古い statusChangedAt を引き継がないため。
+    deleteSessionStatusObservation(name);
     invalidateDetectCaches();
     void saveSnapshot();
     return c.json({ ok: true });

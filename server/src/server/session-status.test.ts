@@ -267,6 +267,15 @@ test('statusChangedAt: agent 不明の期間を挟んだら古い時刻を引き
   assert.equal(observeSessionStatus(NAME, 'busy', 9_000_000), 9_000_000);
 });
 
+test('statusChangedAt: 同名で作り直されたセッションは古い時刻を引き継がない', () => {
+  resetSessionStatusObservations();
+  // delete / release / rename / create の時点でエントリを捨てるので、一覧取得を
+  // 挟まずに同じ名前で作り直しても、前のセッションの時刻は残らない。
+  assert.equal(observeSessionStatus(NAME, 'busy', 1_000), 1_000);
+  deleteSessionStatusObservation(NAME);
+  assert.equal(observeSessionStatus(NAME, 'busy', 2_000), 2_000);
+});
+
 test('resolveTrackedSessionStatus: 解決した status と観測時刻を返す', () => {
   resetSessionStatusObservations();
   const input = {
