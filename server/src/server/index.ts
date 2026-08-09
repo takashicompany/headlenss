@@ -21,7 +21,7 @@ import * as claudeStore from './claude/store.ts';
 import { sanitizeChatText } from './claude/transcript.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot, stopPeriodicSnapshot } from './persist.ts';
 import { recordUiSubmission } from './uiSubmissions.ts';
-import { pickEffectiveSource, resolveSessionStatus } from './session-status.ts';
+import { pickEffectiveSource, pruneSessionStatusObservations, resolveTrackedSessionStatus } from './session-status.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -179,6 +179,8 @@ app.get('/api/sessions', async (c) => {
   // codex の hookHealth / needsHookAttention 用 (status と source の判定は共有関数側)。
   const codexMap = new Map(codexDetected.map((d) => [d.tmuxSessionName, d]));
   const liveNames = new Set(sessions.map((s) => s.name));
+  // 死んだ / 改名された tmux セッションの status 変化時刻は捨てる。
+  pruneSessionStatusObservations(liveNames);
   const enriched = sessions.map((s) => {
     const tracked = claudeStore.getSession(s.name);
     // agent (実効ソース) も status も /api/claude/sessions と同じ共有関数で決める。
@@ -196,12 +198,15 @@ app.get('/api/sessions', async (c) => {
     // store が現在の主と別 agent の残骸なら、その chat は別ランのものなので使わない。
     // (status 側の残骸判定は resolveSessionStatus が source 照合で行う。)
     const storeMatches = !tracked?.source || tracked.source === agent;
-    const status = agent ? resolveSessionStatus({ ...signals, source: agent }) : undefined;
+    const resolved = agent ? resolveTrackedSessionStatus({ ...signals, source: agent }) : undefined;
+    const status = resolved?.status;
     return {
       ...s,
       claudeStatus: agent === 'claude' ? status : undefined,
       agent,
       codexStatus: agent === 'codex' ? status : undefined,
+      // 現在の status に入ったとサーバが観測した時刻 (agent 不明なら undefined)。
+      statusChangedAt: resolved?.statusChangedAt,
       codexHookHealth: codexMap.get(s.name)?.hookHealth ?? (agent === 'codex' ? getCodexHookHealth(tracked?.cwd) : getCodexHookHealth()),
       codexNeedsHookAttention: (agent === 'codex' && codexMap.get(s.name)?.needsHookAttention) ?? false,
       lastChat: storeMatches ? buildLastChat(s.name) : undefined,
@@ -213,6 +218,7 @@ app.get('/api/sessions', async (c) => {
       claudeStatus: undefined,
       agent: retained.agent,
       codexStatus: undefined,
+      statusChangedAt: undefined,
       codexHookHealth: retained.agent === 'codex' ? getCodexHookHealth() : getCodexHookHealth(),
       codexNeedsHookAttention: false,
       lastChat: undefined,

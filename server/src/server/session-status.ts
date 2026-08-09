@@ -145,3 +145,64 @@ export function resolveSessionStatus(input: ResolveStatusInput): SessionStatus {
   if (store && store.status !== 'idle') status = store.status;
   return status;
 }
+
+// ───────── status の変化時刻トラッカー ─────────
+//
+// status はリクエストごとに計算していて履歴が無いため、クライアントからは
+// 「この idle (= 完了) が自分の最後の確認より前の出来事か」を区別できない。
+// そこでセッションごとに「直近に解決した status」と「それを最初に観測した時刻」を
+// サーバのメモリに持ち、statusChangedAt として返す。
+//
+// 性質:
+//   - あくまで「観測した日時」。検出キャッシュ (2.5 秒) とポーリング間隔のぶん、
+//     実際の変化より数秒遅れることがある。
+//   - メモリのみ (永続化しない)。サーバ再起動後は「再起動後に初めて観測した時刻」になる。
+//   - status が変わらない限り更新しないので、同じリクエスト内や並行リクエストで
+//     二重に観測しても値は動かない (no-op)。
+
+type StatusObservation = { status: SessionStatus; changedAt: number };
+
+const statusObservations = new Map<string, StatusObservation>();
+
+/**
+ * 解決済み status を記録し、その status に入ったと観測した時刻を返す。
+ * 記録と同じ status なら何もせず既存の時刻を返す (初回観測は今の時刻)。
+ */
+export function observeSessionStatus(
+  tmuxSessionName: string,
+  status: SessionStatus,
+  now: number = Date.now(),
+): number {
+  const prev = statusObservations.get(tmuxSessionName);
+  if (prev && prev.status === status) return prev.changedAt;
+  statusObservations.set(tmuxSessionName, { status, changedAt: now });
+  return now;
+}
+
+/** 生きている tmux セッション名の集合に無いエントリを捨てる (kill / rename の掃除)。 */
+export function pruneSessionStatusObservations(aliveNames: Iterable<string>): void {
+  const alive = aliveNames instanceof Set ? aliveNames : new Set(aliveNames);
+  for (const name of statusObservations.keys()) {
+    if (!alive.has(name)) statusObservations.delete(name);
+  }
+}
+
+/** テスト用: トラッカーを空にする。 */
+export function resetSessionStatusObservations(): void {
+  statusObservations.clear();
+}
+
+export type TrackedSessionStatus = {
+  status: SessionStatus;
+  /** その status に入ったとサーバが観測した時刻 (epoch ms)。startedAt / lastSeenAt と同じ形式。 */
+  statusChangedAt: number;
+};
+
+/** status を解決し、同時に変化時刻を記録する。両エンドポイントはこれを使う。 */
+export function resolveTrackedSessionStatus(
+  input: ResolveStatusInput,
+  now: number = Date.now(),
+): TrackedSessionStatus {
+  const status = resolveSessionStatus(input);
+  return { status, statusChangedAt: observeSessionStatus(input.tmuxSessionName, status, now) };
+}

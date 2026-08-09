@@ -16,7 +16,12 @@ import { extractCodexChatFromTranscript } from '../codex/transcript.ts';
 import { detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
 import { matchUiSubmission } from '../uiSubmissions.ts';
 import { detectG2Plugins, tmuxSessionPaths, type G2Plugin } from '../g2-plugins.ts';
-import { pickClaudeDetected, pickEffectiveSource, resolveSessionStatus } from '../session-status.ts';
+import {
+  pickClaudeDetected,
+  pickEffectiveSource,
+  pruneSessionStatusObservations,
+  resolveTrackedSessionStatus,
+} from '../session-status.ts';
 import type { AskQuestion, ChatItem, HookDecision, RespondInput, SessionStatus } from './types.ts';
 
 const exec = promisify(execFile);
@@ -549,6 +554,8 @@ claudeRouter.get('/claude/sessions', async (c) => {
         store.removeSession(s.tmuxSessionName);
       }
     }
+    // 死んだ / 改名された tmux セッションの status 変化時刻も一緒に捨てる。
+    pruneSessionStatusObservations(liveTmux);
   }
 
   // 掃除後の tracked 一覧を取り直す
@@ -565,6 +572,8 @@ claudeRouter.get('/claude/sessions', async (c) => {
     tmuxSessionName: string;
     cwd: string;
     status: SessionStatus;
+    /** 現在の status に入ったとサーバが観測した時刻 (epoch ms)。 */
+    statusChangedAt: number;
     startedAt: number;
     lastSeenAt: number;
     source?: 'claude' | 'codex';
@@ -625,11 +634,12 @@ claudeRouter.get('/claude/sessions', async (c) => {
 
     if (effSource === 'claude') {
       const sc = storeMatched ? st : undefined;
-      const status = resolveSessionStatus({ ...signals, source: 'claude' });
+      const { status, statusChangedAt } = resolveTrackedSessionStatus({ ...signals, source: 'claude' });
       merged.push({
         tmuxSessionName: name,
         cwd: sc?.cwd || cd?.cwd || '',
         status,
+        statusChangedAt,
         startedAt: sc?.startedAt ?? cd?.startedAt ?? 0,
         lastSeenAt: sc?.lastSeenAt ?? cd?.startedAt ?? 0,
         source: 'claude',
@@ -638,11 +648,12 @@ claudeRouter.get('/claude/sessions', async (c) => {
     } else {
       const sx = storeMatched ? st : undefined;
       const cwd = sx?.cwd || xd?.cwd || '';
-      const status = resolveSessionStatus({ ...signals, source: 'codex' });
+      const { status, statusChangedAt } = resolveTrackedSessionStatus({ ...signals, source: 'codex' });
       merged.push({
         tmuxSessionName: name,
         cwd,
         status,
+        statusChangedAt,
         startedAt: sx?.startedAt ?? xd?.startedAt ?? 0,
         lastSeenAt: sx?.lastSeenAt ?? xd?.lastSeenAt ?? 0,
         source: 'codex',

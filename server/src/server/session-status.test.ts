@@ -1,9 +1,13 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import {
+  observeSessionStatus,
   pickClaudeDetected,
   pickEffectiveSource,
+  pruneSessionStatusObservations,
+  resetSessionStatusObservations,
   resolveSessionStatus,
+  resolveTrackedSessionStatus,
   type ClaudeDetectedInput,
   type CodexDetectedInput,
   type LiveOwnerInput,
@@ -217,5 +221,56 @@ test('同一セッションに対話 claude と claude -p が居ても両エン�
       liveOwner: owner,
     }),
     'busy',
+  );
+});
+
+test('statusChangedAt: 初回観測は今の時刻、同じ status が続く間は動かない', () => {
+  resetSessionStatusObservations();
+  assert.equal(observeSessionStatus(NAME, 'busy', 1_000), 1_000);
+  // 同じ status を何度観測しても最初の時刻のまま (同一リクエスト内 / 並行リクエストでも安全)。
+  assert.equal(observeSessionStatus(NAME, 'busy', 2_000), 1_000);
+  assert.equal(observeSessionStatus(NAME, 'busy', 3_000), 1_000);
+});
+
+test('statusChangedAt: status が変わった時だけ更新される', () => {
+  resetSessionStatusObservations();
+  assert.equal(observeSessionStatus(NAME, 'busy', 1_000), 1_000);
+  assert.equal(observeSessionStatus(NAME, 'waiting-permission', 2_000), 2_000);
+  assert.equal(observeSessionStatus(NAME, 'idle', 3_000), 3_000);
+  assert.equal(observeSessionStatus(NAME, 'idle', 4_000), 3_000);
+  // 元の status に戻ったら「その時に入り直した」扱い。
+  assert.equal(observeSessionStatus(NAME, 'busy', 5_000), 5_000);
+  // セッションごとに独立。
+  assert.equal(observeSessionStatus('other', 'busy', 6_000), 6_000);
+  assert.equal(observeSessionStatus(NAME, 'busy', 7_000), 5_000);
+});
+
+test('statusChangedAt: 生きていない tmux セッションのエントリは掃除される', () => {
+  resetSessionStatusObservations();
+  observeSessionStatus(NAME, 'busy', 1_000);
+  observeSessionStatus('other', 'busy', 1_000);
+  pruneSessionStatusObservations([NAME]);
+  // 残った方は時刻を保持。
+  assert.equal(observeSessionStatus(NAME, 'busy', 2_000), 1_000);
+  // 捨てられた方は初回観測扱いに戻る。
+  assert.equal(observeSessionStatus('other', 'busy', 2_000), 2_000);
+});
+
+test('resolveTrackedSessionStatus: 解決した status と観測時刻を返す', () => {
+  resetSessionStatusObservations();
+  const input = {
+    source: 'claude' as const,
+    tmuxSessionName: NAME,
+    store: { status: 'idle' as const, source: 'claude' as const },
+    claudeDetected: [claudeDet(1, 'busy')],
+    codexDetected: [],
+  };
+  assert.deepEqual(resolveTrackedSessionStatus(input, 1_000), { status: 'busy', statusChangedAt: 1_000 });
+  // busy が続く間は時刻据え置き。
+  assert.deepEqual(resolveTrackedSessionStatus(input, 2_000), { status: 'busy', statusChangedAt: 1_000 });
+  // idle に落ちたら更新。
+  assert.deepEqual(
+    resolveTrackedSessionStatus({ ...input, claudeDetected: [claudeDet(1, 'idle')] }, 3_000),
+    { status: 'idle', statusChangedAt: 3_000 },
   );
 });
