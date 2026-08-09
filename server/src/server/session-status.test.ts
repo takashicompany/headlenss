@@ -1,50 +1,178 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { resolveClaudeStatus, resolveCodexStatus, resolveSessionStatus } from './session-status.ts';
+import {
+  pickClaudeDetected,
+  resolveSessionStatus,
+  type ClaudeDetectedInput,
+  type CodexDetectedInput,
+  type LiveOwnerInput,
+  type StoreStatusInput,
+} from './session-status.ts';
+
+const NAME = 'make15';
+
+/** 引数の組み立てを 1 箇所にして、呼び出し側 (2 つのエンドポイント) の差を作らない。 */
+function status(opts: {
+  source: 'claude' | 'codex';
+  store?: StoreStatusInput;
+  claudeDetected?: ClaudeDetectedInput[];
+  codexDetected?: CodexDetectedInput[];
+  liveOwner?: LiveOwnerInput;
+}) {
+  return resolveSessionStatus({
+    source: opts.source,
+    tmuxSessionName: NAME,
+    store: opts.store,
+    claudeDetected: opts.claudeDetected ?? [],
+    codexDetected: opts.codexDetected ?? [],
+    liveOwner: opts.liveOwner,
+  });
+}
+
+const claudeDet = (pid: number, s: 'idle' | 'busy'): ClaudeDetectedInput => ({
+  pid,
+  tmuxSessionName: NAME,
+  status: s,
+});
 
 test('Claude: busy は検出側からしか来ない (フック導入済みでも拾う)', () => {
   // フックが入っている = store がある。store の status は idle のままだが、
-  // registry が busy を報告しているなら busy を返す。
-  assert.equal(resolveClaudeStatus({ status: 'idle' }, { status: 'busy' }), 'busy');
+  // registry が busy を報告しているなら busy を返す (これが今回の修正点)。
+  assert.equal(
+    status({ source: 'claude', store: { status: 'idle', source: 'claude' }, claudeDetected: [claudeDet(1, 'busy')] }),
+    'busy',
+  );
   // フック未導入 (store 無し) でも同じ。
-  assert.equal(resolveClaudeStatus(undefined, { status: 'busy' }), 'busy');
+  assert.equal(status({ source: 'claude', claudeDetected: [claudeDet(1, 'busy')] }), 'busy');
   // 検出が idle / 未検出なら idle。
-  assert.equal(resolveClaudeStatus({ status: 'idle' }, { status: 'idle' }), 'idle');
-  assert.equal(resolveClaudeStatus(undefined, undefined), 'idle');
+  assert.equal(
+    status({ source: 'claude', store: { status: 'idle', source: 'claude' }, claudeDetected: [claudeDet(1, 'idle')] }),
+    'idle',
+  );
+  assert.equal(status({ source: 'claude' }), 'idle');
 });
 
 test('Claude: waiting-* はフック側からしか来ないので検出より優先', () => {
-  assert.equal(resolveClaudeStatus({ status: 'waiting-permission' }, { status: 'busy' }), 'waiting-permission');
-  assert.equal(resolveClaudeStatus({ status: 'waiting-question' }, { status: 'busy' }), 'waiting-question');
-  assert.equal(resolveClaudeStatus({ status: 'waiting-permission' }, undefined), 'waiting-permission');
-});
-
-test('Claude: Stop hook 済みなら registry の busy は idle に落とす', () => {
-  assert.equal(resolveClaudeStatus({ status: 'idle', lastStopAt: 1 }, { status: 'busy' }), 'idle');
-  // waiting-* は Stop マーカーがあっても消さない (許可待ちは継続中)。
   assert.equal(
-    resolveClaudeStatus({ status: 'waiting-permission', lastStopAt: 1 }, { status: 'busy' }),
+    status({
+      source: 'claude',
+      store: { status: 'waiting-permission', source: 'claude' },
+      claudeDetected: [claudeDet(1, 'busy')],
+    }),
+    'waiting-permission',
+  );
+  assert.equal(
+    status({
+      source: 'claude',
+      store: { status: 'waiting-question', source: 'claude' },
+      claudeDetected: [claudeDet(1, 'busy')],
+    }),
+    'waiting-question',
+  );
+  assert.equal(
+    status({ source: 'claude', store: { status: 'waiting-permission', source: 'claude' } }),
     'waiting-permission',
   );
 });
 
+test('Claude: Stop hook 済みなら registry の busy は idle に落とす', () => {
+  assert.equal(
+    status({
+      source: 'claude',
+      store: { status: 'idle', source: 'claude', lastStopAt: 1 },
+      claudeDetected: [claudeDet(1, 'busy')],
+    }),
+    'idle',
+  );
+  // waiting-* は Stop マーカーがあっても潰さない (許可待ちは継続中)。検出が無い場合も同様。
+  assert.equal(
+    status({
+      source: 'claude',
+      store: { status: 'waiting-permission', source: 'claude', lastStopAt: 1 },
+      claudeDetected: [claudeDet(1, 'busy')],
+    }),
+    'waiting-permission',
+  );
+  assert.equal(
+    status({ source: 'claude', store: { status: 'waiting-question', source: 'claude', lastStopAt: 1 } }),
+    'waiting-question',
+  );
+});
+
+test('別 agent の残骸 store は status に混ぜない', () => {
+  // live owner が claude に替わった直後、store には codex の残骸が残っている。
+  assert.equal(
+    status({
+      source: 'claude',
+      store: { status: 'waiting-permission', source: 'codex' },
+      claudeDetected: [claudeDet(1, 'idle')],
+    }),
+    'idle',
+  );
+  // source 未設定の古い store も使わない (どちらのランのものか分からないため)。
+  assert.equal(status({ source: 'claude', store: { status: 'waiting-question' } }), 'idle');
+  assert.equal(
+    status({ source: 'codex', store: { status: 'busy', source: 'claude' }, codexDetected: [] }),
+    'idle',
+  );
+});
+
 test('Codex: フックの busy を採用しつつ、pane 由来の waiting-permission も拾う', () => {
-  assert.equal(resolveCodexStatus({ status: 'busy' }, undefined), 'busy');
-  assert.equal(resolveCodexStatus({ status: 'idle' }, { status: 'waiting-permission' }), 'waiting-permission');
-  assert.equal(resolveCodexStatus(undefined, { status: 'waiting-permission' }), 'waiting-permission');
-  assert.equal(resolveCodexStatus(undefined, undefined), 'idle');
-  // フックが idle 以外を主張していればそちらが勝つ。
-  assert.equal(resolveCodexStatus({ status: 'waiting-question' }, { status: 'waiting-permission' }), 'waiting-question');
+  assert.equal(status({ source: 'codex', store: { status: 'busy', source: 'codex' } }), 'busy');
+  assert.equal(
+    status({
+      source: 'codex',
+      store: { status: 'idle', source: 'codex' },
+      codexDetected: [{ tmuxSessionName: NAME, status: 'waiting-permission' }],
+    }),
+    'waiting-permission',
+  );
+  assert.equal(
+    status({ source: 'codex', codexDetected: [{ tmuxSessionName: NAME, status: 'waiting-permission' }] }),
+    'waiting-permission',
+  );
+  assert.equal(status({ source: 'codex' }), 'idle');
 });
 
-test('別 agent の残骸 store は渡さない前提: undefined なら検出だけで決まる', () => {
-  assert.equal(resolveSessionStatus('claude', undefined, { status: 'busy' }), 'busy');
-  assert.equal(resolveSessionStatus('codex', undefined, { status: 'waiting-permission' }), 'waiting-permission');
+test('Codex: lastStopAt は見ない (Stop 相当のフックが idle を直接書くため)', () => {
+  // Claude 側と違い、Stop マーカーが立っていてもフックの busy はそのまま返す。
+  assert.equal(
+    status({ source: 'codex', store: { status: 'busy', source: 'codex', lastStopAt: 1 } }),
+    'busy',
+  );
 });
 
-test('入口関数はソースごとに同じ結果を返す', () => {
-  const store = { status: 'idle' as const };
-  const det = { status: 'busy' as const };
-  assert.equal(resolveSessionStatus('claude', store, det), resolveClaudeStatus(store, det));
-  assert.equal(resolveSessionStatus('codex', store, det), resolveCodexStatus(store, det));
+test('Claude det の選択: live owner が claude なら owner PID 一致分のみ (fail-closed)', () => {
+  const interactive = claudeDet(100, 'idle');
+  const headless = claudeDet(200, 'busy'); // 同じ tmux セッションで動く `claude -p`
+  const owner: LiveOwnerInput = { source: 'claude', pid: 100 };
+
+  assert.equal(pickClaudeDetected(NAME, [interactive, headless], owner), interactive);
+  // owner の PID が検出に出ていないなら「不明」に倒す (別 PID の busy を拾わない)。
+  assert.equal(pickClaudeDetected(NAME, [headless], owner), undefined);
+  // owner 不明 / codex のときは従来どおり名前一致 (同名なら後勝ち)。
+  assert.equal(pickClaudeDetected(NAME, [interactive, headless], undefined), headless);
+  assert.equal(pickClaudeDetected(NAME, [interactive, headless], { source: 'codex', pid: 300 }), headless);
+  assert.equal(pickClaudeDetected('other', [interactive], undefined), undefined);
+});
+
+test('同一セッションに対話 claude と claude -p が居ても両エンドポイントで status が一致する', () => {
+  // 回帰の再現: 名前一致 last-wins だと、対話 claude が idle なのに
+  // ヘッドレスの `claude -p` (busy) を拾って busy になる。
+  // status 判定は det の選択ごと共有関数に閉じているので、どちらの呼び出し側も同じ答えになる。
+  const detected = [claudeDet(100, 'idle'), claudeDet(200, 'busy')];
+  const owner: LiveOwnerInput = { source: 'claude', pid: 100 };
+  const store: StoreStatusInput = { status: 'idle', source: 'claude' };
+
+  assert.equal(status({ source: 'claude', store, claudeDetected: detected, liveOwner: owner }), 'idle');
+  // 対話側が本当に busy なら busy になる (fail-closed が busy を殺していないことの確認)。
+  assert.equal(
+    status({
+      source: 'claude',
+      store,
+      claudeDetected: [claudeDet(100, 'busy'), claudeDet(200, 'idle')],
+      liveOwner: owner,
+    }),
+    'busy',
+  );
 });

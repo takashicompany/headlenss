@@ -182,16 +182,23 @@ app.get('/api/sessions', async (c) => {
   const enriched = sessions.map((s) => {
     const tracked = claudeStore.getSession(s.name);
     // agent は live owner を最優先 → store → 検出。owner 不明時は sticky。
-    const live = liveOwners?.get(s.name)?.source;
-    const agent = live ?? tracked?.source ?? (codexMap.has(s.name) ? 'codex' : detectedMap.has(s.name) ? 'claude' : undefined);
-    // store が現在の主と別 agent の残骸なら、その status/chat は別ランのものなので使わない。
+    const owner = liveOwners?.get(s.name);
+    const agent = owner?.source ?? tracked?.source ?? (codexMap.has(s.name) ? 'codex' : detectedMap.has(s.name) ? 'claude' : undefined);
+    // store が現在の主と別 agent の残骸なら、その chat は別ランのものなので使わない。
+    // (status 側の残骸判定は resolveSessionStatus が source 照合で行う。)
     const storeMatches = !tracked?.source || tracked.source === agent;
-    // status は /api/claude/sessions と同じマージ関数で決める。
-    // (store をそのまま返すと、フック導入済み Claude セッションの busy が
-    //  registry 由来でしか分からないため永久に見えなくなる。)
-    const storeStatus = tracked && tracked.source === agent ? tracked : undefined;
+    // status は /api/claude/sessions と同じ共有関数で決める。検出結果の選び方
+    // (live owner が claude なら owner PID 一致の det のみ) も関数内に閉じているので、
+    // 2 つのエンドポイントで答えがズレない。
     const status = agent
-      ? resolveSessionStatus(agent, storeStatus, agent === 'claude' ? detectedMap.get(s.name) : codexMap.get(s.name))
+      ? resolveSessionStatus({
+          source: agent,
+          tmuxSessionName: s.name,
+          store: tracked,
+          claudeDetected: detected,
+          codexDetected,
+          liveOwner: owner,
+        })
       : undefined;
     return {
       ...s,

@@ -16,7 +16,7 @@ import { extractCodexChatFromTranscript } from '../codex/transcript.ts';
 import { detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
 import { matchUiSubmission } from '../uiSubmissions.ts';
 import { detectG2Plugins, tmuxSessionPaths, type G2Plugin } from '../g2-plugins.ts';
-import { resolveSessionStatus } from '../session-status.ts';
+import { pickClaudeDetected, resolveSessionStatus } from '../session-status.ts';
 import type { AskQuestion, ChatItem, HookDecision, RespondInput, SessionStatus } from './types.ts';
 
 const exec = promisify(execFile);
@@ -593,9 +593,8 @@ claudeRouter.get('/claude/sessions', async (c) => {
     const ownerEntry = liveOwners?.get(name);
     // Claude が owner のときは owner PID 一致の det「のみ」を使う (fail-closed)。
     // 同名 last-wins でヘッドレス claude の cwd/status を出さないため。
-    const cd = ownerEntry?.source === 'claude'
-      ? detected.find((d) => d.pid === ownerEntry.pid)
-      : claudeByName.get(name);
+    // status 側も同じ選び方をする必要があるので、選択自体を共有関数に置いている。
+    const cd = pickClaudeDetected(name, detected, ownerEntry);
     const xd = codexByName.get(name);
 
     // 実効ソース: live owner を最優先 → store → 検出。owner 不明時は sticky。
@@ -619,7 +618,14 @@ claudeRouter.get('/claude/sessions', async (c) => {
 
     if (effSource === 'claude') {
       const sc = storeMatched ? st : undefined;
-      const status = resolveSessionStatus('claude', sc, cd);
+      const status = resolveSessionStatus({
+        source: 'claude',
+        tmuxSessionName: name,
+        store: st,
+        claudeDetected: detected,
+        codexDetected,
+        liveOwner: ownerEntry,
+      });
       merged.push({
         tmuxSessionName: name,
         cwd: sc?.cwd || cd?.cwd || '',
@@ -632,7 +638,14 @@ claudeRouter.get('/claude/sessions', async (c) => {
     } else {
       const sx = storeMatched ? st : undefined;
       const cwd = sx?.cwd || xd?.cwd || '';
-      const status = resolveSessionStatus('codex', sx, xd);
+      const status = resolveSessionStatus({
+        source: 'codex',
+        tmuxSessionName: name,
+        store: st,
+        claudeDetected: detected,
+        codexDetected,
+        liveOwner: ownerEntry,
+      });
       merged.push({
         tmuxSessionName: name,
         cwd,
