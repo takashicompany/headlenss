@@ -21,6 +21,12 @@ import * as claudeStore from './claude/store.ts';
 import { sanitizeChatText } from './claude/transcript.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot, stopPeriodicSnapshot } from './persist.ts';
 import { recordUiSubmission } from './uiSubmissions.ts';
+import {
+  deleteSessionStatusObservation,
+  pickEffectiveSource,
+  pruneSessionStatusObservations,
+  resolveTrackedSessionStatus,
+} from './session-status.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -175,25 +181,40 @@ app.get('/api/sessions', async (c) => {
     // live owner (今その画面を握っている本人)。失敗時は null → sticky フォールバック。
     detectLiveOwners().catch(() => null),
   ]);
-  const detectedMap = new Map(detected.map((d) => [d.tmuxSessionName, d]));
+  // codex の hookHealth / needsHookAttention 用 (status と source の判定は共有関数側)。
   const codexMap = new Map(codexDetected.map((d) => [d.tmuxSessionName, d]));
   const liveNames = new Set(sessions.map((s) => s.name));
+  // 死んだ / 改名された tmux セッションの status 変化時刻は捨てる。
+  pruneSessionStatusObservations(liveNames);
   const enriched = sessions.map((s) => {
     const tracked = claudeStore.getSession(s.name);
-    // agent は live owner を最優先 → store → 検出。owner 不明時は sticky。
-    const live = liveOwners?.get(s.name)?.source;
-    const agent = live ?? tracked?.source ?? (codexMap.has(s.name) ? 'codex' : detectedMap.has(s.name) ? 'claude' : undefined);
-    // store が現在の主と別 agent の残骸なら、その status/chat は別ランのものなので使わない。
+    // agent (実効ソース) も status も /api/claude/sessions と同じ共有関数で決める。
+    // 実効ソースの優先順位 (live owner → store → claude 検出 → codex 検出) も
+    // 検出結果の選び方 (live owner が claude なら owner PID 一致の det のみ) も
+    // 関数内に閉じているので、2 つのエンドポイントで答えがズレない。
+    const signals = {
+      tmuxSessionName: s.name,
+      store: tracked,
+      claudeDetected: detected,
+      codexDetected,
+      liveOwner: liveOwners?.get(s.name),
+    };
+    const agent = pickEffectiveSource(signals);
+    // store が現在の主と別 agent の残骸なら、その chat は別ランのものなので使わない。
+    // (status 側の残骸判定は resolveSessionStatus が source 照合で行う。)
     const storeMatches = !tracked?.source || tracked.source === agent;
+    // agent 不明の間は status を観測できないので、記録を残さず忘れる
+    // (再び agent が現れたときに古い statusChangedAt を引き継がないため)。
+    if (!agent) deleteSessionStatusObservation(s.name);
+    const resolved = agent ? resolveTrackedSessionStatus({ ...signals, source: agent }) : undefined;
+    const status = resolved?.status;
     return {
       ...s,
-      claudeStatus: agent === 'claude'
-        ? (storeMatches && tracked?.source === 'claude' ? tracked.status : detectedMap.get(s.name)?.status)
-        : undefined,
+      claudeStatus: agent === 'claude' ? status : undefined,
       agent,
-      codexStatus: agent === 'codex'
-        ? (storeMatches && tracked?.source === 'codex' ? tracked.status : codexMap.get(s.name)?.status)
-        : undefined,
+      codexStatus: agent === 'codex' ? status : undefined,
+      // 現在の status に入ったとサーバが観測した時刻 (agent 不明なら undefined)。
+      statusChangedAt: resolved?.statusChangedAt,
       codexHookHealth: codexMap.get(s.name)?.hookHealth ?? (agent === 'codex' ? getCodexHookHealth(tracked?.cwd) : getCodexHookHealth()),
       codexNeedsHookAttention: (agent === 'codex' && codexMap.get(s.name)?.needsHookAttention) ?? false,
       lastChat: storeMatches ? buildLastChat(s.name) : undefined,
@@ -205,6 +226,7 @@ app.get('/api/sessions', async (c) => {
       claudeStatus: undefined,
       agent: retained.agent,
       codexStatus: undefined,
+      statusChangedAt: undefined,
       codexHookHealth: retained.agent === 'codex' ? getCodexHookHealth() : getCodexHookHealth(),
       codexNeedsHookAttention: false,
       lastChat: undefined,
@@ -224,6 +246,8 @@ app.post('/api/sessions', async (c) => {
       startClaude: body.startClaude === true,
       startCodex: body.startCodex === true,
     });
+    // 同名の別セッションなので status の変化時刻は引き継がせない。
+    deleteSessionStatusObservation(body.name);
     const source = body.startCodex === true ? 'codex' : body.startClaude === true ? 'claude' : undefined;
     if (source) {
       claudeStore.upsertSession({
@@ -257,6 +281,8 @@ app.patch('/api/sessions/:name', async (c) => {
     } else {
       renameRetainedSession(name, nextName);
     }
+    // 旧名の status 変化時刻は捨てる (新名は次の観測で初回扱いになる)。
+    deleteSessionStatusObservation(name);
     const tracked = claudeStore.getSession(name);
     if (tracked) {
       claudeStore.removeSession(name);
@@ -288,6 +314,8 @@ app.post('/api/sessions/:name/release', async (c) => {
     retainSession({ ...live, cwd: cwd ?? tracked?.cwd ?? process.cwd(), agent: tracked?.source });
     await killSession(name);
     claudeStore.removeSession(name);
+    // 退避したセッションの status 変化時刻は捨てる (mount し直したら初回観測から)。
+    deleteSessionStatusObservation(name);
     invalidateDetectCaches();
     void saveSnapshot();
     return c.json({ ok: true });
@@ -310,6 +338,8 @@ app.post('/api/sessions/:name/mount', async (c) => {
       });
     }
     removeRetainedSession(name);
+    // 復帰したセッションは別ランなので status の変化時刻は引き継がせない。
+    deleteSessionStatusObservation(name);
     if (retained.agent) {
       claudeStore.upsertSession({
         ccSessionId: 'web-' + randomUUID(),
@@ -336,6 +366,9 @@ app.delete('/api/sessions/:name', async (c) => {
     // hook 経由で記録された Claude セッションエントリも合わせて削除する。
     // これをやらないと /api/claude/sessions に死んだ tmux セッションが残り続ける。
     claudeStore.removeSession(name);
+    // status の変化時刻も削除する。一覧取得を挟まずに同名で作り直された場合に、
+    // 別セッションの古い statusChangedAt を引き継がないため。
+    deleteSessionStatusObservation(name);
     invalidateDetectCaches();
     void saveSnapshot();
     return c.json({ ok: true });

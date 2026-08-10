@@ -16,6 +16,13 @@ import { extractCodexChatFromTranscript } from '../codex/transcript.ts';
 import { detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
 import { matchUiSubmission } from '../uiSubmissions.ts';
 import { detectG2Plugins, tmuxSessionPaths, type G2Plugin } from '../g2-plugins.ts';
+import {
+  deleteSessionStatusObservation,
+  pickClaudeDetected,
+  pickEffectiveSource,
+  pruneSessionStatusObservations,
+  resolveTrackedSessionStatus,
+} from '../session-status.ts';
 import type { AskQuestion, ChatItem, HookDecision, RespondInput, SessionStatus } from './types.ts';
 
 const exec = promisify(execFile);
@@ -548,6 +555,8 @@ claudeRouter.get('/claude/sessions', async (c) => {
         store.removeSession(s.tmuxSessionName);
       }
     }
+    // 死んだ / 改名された tmux セッションの status 変化時刻も一緒に捨てる。
+    pruneSessionStatusObservations(liveTmux);
   }
 
   // 掃除後の tracked 一覧を取り直す
@@ -564,6 +573,8 @@ claudeRouter.get('/claude/sessions', async (c) => {
     tmuxSessionName: string;
     cwd: string;
     status: SessionStatus;
+    /** 現在の status に入ったとサーバが観測した時刻 (epoch ms)。 */
+    statusChangedAt: number;
     startedAt: number;
     lastSeenAt: number;
     source?: 'claude' | 'codex';
@@ -592,15 +603,26 @@ claudeRouter.get('/claude/sessions', async (c) => {
     const ownerEntry = liveOwners?.get(name);
     // Claude が owner のときは owner PID 一致の det「のみ」を使う (fail-closed)。
     // 同名 last-wins でヘッドレス claude の cwd/status を出さないため。
-    const cd = ownerEntry?.source === 'claude'
-      ? detected.find((d) => d.pid === ownerEntry.pid)
-      : claudeByName.get(name);
+    // status 側も同じ選び方をする必要があるので、選択自体を共有関数に置いている。
+    const cd = pickClaudeDetected(name, detected, ownerEntry);
     const xd = codexByName.get(name);
 
     // 実効ソース: live owner を最優先 → store → 検出。owner 不明時は sticky。
-    const effSource: 'claude' | 'codex' | undefined =
-      ownerEntry?.source ?? st?.source ?? (cd ? 'claude' : xd ? 'codex' : undefined);
-    if (!effSource) continue;
+    // /api/sessions と同じ判定になるよう共有関数に寄せている。
+    const signals = {
+      tmuxSessionName: name,
+      store: st,
+      claudeDetected: detected,
+      codexDetected,
+      liveOwner: ownerEntry,
+    };
+    const effSource = pickEffectiveSource(signals);
+    if (!effSource) {
+      // agent 不明の間は status を観測できないので記録を忘れる
+      // (再び agent が現れたときに古い statusChangedAt を引き継がないため)。
+      deleteSessionStatusObservation(name);
+      continue;
+    }
 
     // store が実効ソースと別 agent (残骸) の場合、その cwd/status は使わない。
     const storeMatched = !!st && st.source === effSource;
@@ -618,13 +640,12 @@ claudeRouter.get('/claude/sessions', async (c) => {
 
     if (effSource === 'claude') {
       const sc = storeMatched ? st : undefined;
-      let status: SessionStatus = cd?.status === 'busy' ? 'busy' : 'idle';
-      if (sc && (sc.status === 'waiting-permission' || sc.status === 'waiting-question')) status = sc.status;
-      if (status === 'busy' && sc?.lastStopAt) status = 'idle';
+      const { status, statusChangedAt } = resolveTrackedSessionStatus({ ...signals, source: 'claude' });
       merged.push({
         tmuxSessionName: name,
         cwd: sc?.cwd || cd?.cwd || '',
         status,
+        statusChangedAt,
         startedAt: sc?.startedAt ?? cd?.startedAt ?? 0,
         lastSeenAt: sc?.lastSeenAt ?? cd?.startedAt ?? 0,
         source: 'claude',
@@ -633,12 +654,12 @@ claudeRouter.get('/claude/sessions', async (c) => {
     } else {
       const sx = storeMatched ? st : undefined;
       const cwd = sx?.cwd || xd?.cwd || '';
-      let status: SessionStatus = xd?.status === 'waiting-permission' ? 'waiting-permission' : 'idle';
-      if (sx && sx.status !== 'idle') status = sx.status;
+      const { status, statusChangedAt } = resolveTrackedSessionStatus({ ...signals, source: 'codex' });
       merged.push({
         tmuxSessionName: name,
         cwd,
         status,
+        statusChangedAt,
         startedAt: sx?.startedAt ?? xd?.startedAt ?? 0,
         lastSeenAt: sx?.lastSeenAt ?? xd?.lastSeenAt ?? 0,
         source: 'codex',
