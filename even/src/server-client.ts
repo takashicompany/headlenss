@@ -94,6 +94,11 @@ export type RespondInput = (
       }>;
     }
 ) & {
+  /**
+   * chat 履歴に残す回答整形文をどの言語で作るか (今 UI で選択中の言語)。
+   * 未指定ならサーバは 'en' で整形する。
+   */
+  lang?: 'en' | 'ja'
   /** どの pending への回答かを明示する。サーバは現在の pending と不一致なら 409 を返す。 */
   pendingId?: string
 }

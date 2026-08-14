@@ -95,6 +95,21 @@ async function getTmuxName(c: Context): Promise<string> {
   return resolveTmuxSessionName(pane);
 }
 
+/**
+ * store の記録が「今その pane を握っている agent」とは別 agent の残骸か。
+ *
+ * true の間、その store 由来の表示 (chat / status / pending) は出さない
+ * (store 自体は書き換えない = 表示の抑止だけ)。判定を 1 箇所に持つのは、
+ * chat と pending で条件がずれると「会話は空なのに承認だけ出る」のような
+ * 非対称が生まれるため。owner が取れない (=不明) 間は sticky に従来表示。
+ */
+function isStoreStale(
+  session: { source?: 'claude' | 'codex' } | undefined,
+  owner: { source: 'claude' | 'codex' } | undefined,
+): boolean {
+  return !!owner && !!session?.source && owner.source !== session.source;
+}
+
 type HookPayload = {
   session_id?: string;
   transcript_path?: string;
@@ -296,6 +311,26 @@ claudeRouter.post('/hooks/pre-tool-use', async (c) => {
   return c.json({});
 });
 
+/**
+ * キー注入の途中で用件が入れ替わっていたことを表す。
+ * 注入は「Down x N → Enter」のように前後関係のある一連の操作なので、途中で TUI が
+ * 別の質問に変わっていたら以降のキーは全く別の意味になる。見つけ次第打ち切る。
+ */
+class PendingChangedError extends Error {
+  constructor(readonly currentPendingId: string | undefined) {
+    super('pending changed during key injection');
+    this.name = 'PendingChangedError';
+  }
+}
+
+/** 処理開始時の用件が今も現役かを確かめる。違っていたら PendingChangedError。 */
+function assertPendingUnchanged(tmuxName: string, expectPendingId: string): void {
+  const cur = store.getPending(tmuxName);
+  if (cur?.id === expectPendingId) return;
+  console.log(`[respond] pending changed mid-injection: expect=${expectPendingId} current=${cur?.id ?? '(none)'}`);
+  throw new PendingChangedError(cur?.id);
+}
+
 /** AskUserQuestion の TUI に対して、選んだ option を矢印キー + Enter で注入する。
  *
  *  実機検証で判明した TUI 仕様:
@@ -312,6 +347,7 @@ async function sendAnswersToTui(
   tmuxName: string,
   answers: Array<{ question: string; option?: string; options?: string[]; text?: string; notes?: string; answerKind?: 'predefined' | 'type-something' | 'chat-about-this' }>,
   questions: AskQuestion[],
+  expectPendingId: string,
 ): Promise<void> {
   console.log(`[respond] sendAnswersToTui tmux=${tmuxName} answers=${answers.length}`);
 
@@ -322,6 +358,7 @@ async function sendAnswersToTui(
   if (chatIdx >= 0) {
     const q = questions[chatIdx];
     if (q) {
+      assertPendingUnchanged(tmuxName, expectPendingId);
       const predefinedCount = (q.options ?? []).length;
       // Chat about this は Type something のさらに 1 つ下 → Down x (predefinedCount + 1)
       console.log(`[respond] chat-about-this at q${chatIdx}: navigating to Chat about this`);
@@ -345,6 +382,9 @@ async function sendAnswersToTui(
     const a = answers[qi];
     const q = questions[qi];
     if (!q) { console.log(`[respond]   q${qi}: question missing, skip`); continue; }
+    // 各質問のキー注入に入る前に、まだ同じ用件を相手にしているかを見直す。
+    // ここで打ち切らないと、入れ替わった後の TUI に残りの矢印と Enter を撃ち込む。
+    assertPendingUnchanged(tmuxName, expectPendingId);
     const predefinedCount = (q.options ?? []).length;
     const kind = a.answerKind ?? 'predefined';
 
@@ -423,6 +463,8 @@ async function sendAnswersToTui(
     return q?.multiSelect === true && a.answerKind !== 'chat-about-this' && a.answerKind !== 'type-something';
   });
   if (answers.length >= 2 || hasMulti) {
+    // 最後の Enter も「まだ同じ用件の Review 画面か」を確かめてから撃つ。
+    assertPendingUnchanged(tmuxName, expectPendingId);
     console.log(`[respond] final Review screen detected, sending Enter to confirm`);
     await sendKey(tmuxName, 'Enter');
   }
@@ -435,14 +477,38 @@ type TuiWatcher = { toolUseId: string; cancel: () => void };
 // toolUseId を持たせるのは、止めてよい watcher かを呼び出し側が照合できるようにするため
 // (別の用件の watcher を巻き添えで止めると、その用件の TUI 回答検出が孤児になる)。
 const tuiWatchers = new Map<string, TuiWatcher>();
+/** watcher の寿命。これを過ぎたら自分で止まる (pending 側の待ち受けと同じ長さ)。 */
+const TUI_WATCHER_MAX_MS = 600_000;
 function startTuiAnswerWatcher(tmuxName: string, toolUseId: string, transcriptPath: string): void {
   if (!toolUseId || !transcriptPath) return;
   // 既存 watcher があれば止める(ありえないが念のため)
   tuiWatchers.get(tmuxName)?.cancel();
 
   let cancelled = false;
-  const tick = async (): Promise<void> => {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const deadline = Date.now() + TUI_WATCHER_MAX_MS;
+
+  // 終了口はこの 1 つだけ。TUI 回答の検出・期限切れ・cancel のどの経路から来ても、
+  // 「タイマーを止める」と「自分がまだ登録中なら Map から自分を外す」を必ず行う。
+  // なぜ登録を確かめるか: 後から別の watcher に差し替わっていた場合、遅れて呼ばれた
+  // 終了処理が現役の登録を消してしまうため。逆に確かめずに消し忘れると、
+  // 止まった watcher の登録だけが Map に残り (孤児)、respond 側の
+  // 「watcher.toolUseId === pending.toolUseId」照合を狂わせる。
+  function finish(reason: 'answered' | 'timeout' | 'cancel'): void {
     if (cancelled) return;
+    cancelled = true;
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (tuiWatchers.get(tmuxName) === entry) tuiWatchers.delete(tmuxName);
+    if (reason !== 'cancel') {
+      console.log(`[watcher] stopped (${reason}) tmux=${tmuxName} toolUseId=${toolUseId}`);
+    }
+  }
+  const entry: TuiWatcher = { toolUseId, cancel: () => finish('cancel') };
+
+  const tick = async (): Promise<void> => {
+    timer = null;
+    if (cancelled) return;
+    if (Date.now() >= deadline) { finish('timeout'); return; }
     try {
       const { readFile } = await import('node:fs/promises');
       const raw = await readFile(transcriptPath, 'utf-8');
@@ -467,7 +533,7 @@ function startTuiAnswerWatcher(tmuxName: string, toolUseId: string, transcriptPa
                   // 監視していた用件が今も現役の時だけ消す (次の用件を巻き込まない)
                   const cur = store.getPending(tmuxName);
                   if (cur?.toolUseId === toolUseId) store.clearPendingIfId(tmuxName, cur.id);
-                  cancelled = true;
+                  finish('answered');
                   return;
                 }
               }
@@ -476,15 +542,9 @@ function startTuiAnswerWatcher(tmuxName: string, toolUseId: string, transcriptPa
         }
       }
     } catch { /* file not yet readable etc */ }
-    if (!cancelled) setTimeout(tick, 500);
+    if (!cancelled) timer = setTimeout(() => { void tick(); }, 500);
   };
-  setTimeout(tick, 500);
-  // 自分がまだ登録中の時だけ Map から外す。後から別の watcher に差し替わっていた場合に
-  // 遅れて呼ばれた cancel が現役の登録を消してしまわないようにするため。
-  const entry: TuiWatcher = {
-    toolUseId,
-    cancel: () => { cancelled = true; if (tuiWatchers.get(tmuxName) === entry) tuiWatchers.delete(tmuxName); },
-  };
+  timer = setTimeout(() => { void tick(); }, 500);
   tuiWatchers.set(tmuxName, entry);
 }
 
@@ -736,8 +796,8 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   const effSource: 'claude' | 'codex' | undefined =
     owner?.source ?? session?.source ?? (det ? 'claude' : codexDet ? 'codex' : undefined);
   // store が現在の主と別 agent の残骸なら、その chat/transcript/status/pending は出さない
-  // (表示の抑止のみ。store は書き換えない)。
-  const storeIsStale = !!owner && !!session?.source && owner.source !== session.source;
+  // (表示の抑止のみ。store は書き換えない)。/pending も同じ判定を使う。
+  const storeIsStale = isStoreStale(session, owner);
 
   // hook 経由で記録された chat (現在の主と一致する store のみ採用)
   const hookChat = storeIsStale ? [] : (session?.chat ?? []);
@@ -891,44 +951,81 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
 claudeRouter.get('/claude/sessions/:tmuxName/pending', async (c) => {
   const tmuxName = c.req.param('tmuxName');
   await clearStaleCodexPermissionIfTmuxNoLongerAsking(tmuxName);
-  const pending = store.getPending(tmuxName);
+  const session = store.getSession(tmuxName);
+  // chat エンドポイントと同じ stale 判定を掛ける。ここだけ素通しすると、chat 側が
+  // 「別 agent の残骸なので出さない」と決めた用件が pending だけ降ってきて、
+  // クライアントが存在しない用件の応答画面を開いてしまう。
+  // detectLiveOwners は TTL キャッシュ + singleflight なので追加コストはほぼ無い。
+  const liveOwners = await detectLiveOwners().catch(() => null);
+  if (isStoreStale(session, liveOwners?.get(tmuxName))) return c.json({ pending: null });
+  const pending = session?.pending;
   if (!pending) return c.json({ pending: null });
   return c.json({ pending });
 });
 
+// 応答処理の流れ (この順序に意味がある):
+//   1. ボディ読み取り     … await を挟むので、この間に用件が入れ替わりうる
+//   2. mutex 取得         … 同じ tmux への応答処理は同時に 1 本だけ (2 本目は 409)
+//   3. 最新 pending 取得  … 取るのは必ず mutex の中。外で取ると、待たされている間に
+//                           入れ替わった用件を掴んだまま処理してしまう
+//   4. pendingId 検証     … クライアントが明示した用件と一致するか
+//   5. キー注入           … 各質問の直前と最終 Enter の直前で 3 の id を再検証する
+//   6. ID 条件付き clear  … 自分が答えた用件が今も現役の時だけ消す
+//   7. mutex 解放         … finally で必ず
 claudeRouter.post('/claude/sessions/:tmuxName/respond', async (c) => {
   const tmuxName = c.req.param('tmuxName');
-  // ボディ読み取りは await を挟むので、その間に用件が入れ替わりうる。
-  // なぜ: 先に pending を取ってからボディを読むと、検査 (pendingId 照合) と claim の
-  // 対象が「読み取り前の古い pending」になり、実際に処理する用件とずれる。
-  // 必ずボディを読み切ってから最新の pending を取り、その 1 つに対して検査→claim する。
   const body = (await c.req.json().catch(() => null)) as RespondInput | null;
   if (!body) return c.json({ error: 'invalid body' }, 400);
-  const pending = store.getPending(tmuxName);
-  if (!pending) return c.json({ error: 'no pending interaction' }, 404);
-  // クライアントが応答対象を明示している場合、現在の pending と食い違っていたら受理しない。
-  // 画面を開いている間に用件が入れ替わると、古い画面で作った回答が別の用件に適用されるため。
-  // pendingId を送ってこない旧クライアントは従来どおり受理する (後方互換)。
-  if (body.pendingId && body.pendingId !== pending.id) {
-    console.log(`[respond] pending mismatch: body=${body.pendingId} current=${pending.id}`);
-    return c.json({ error: 'pending mismatch', code: 'pending_mismatch', currentPendingId: pending.id }, 409);
-  }
-  // 応答処理の開始をここで原子的に宣言する (最初の await より前)。
-  // なぜ: 応答処理には tmux へのキー注入など時間の掛かる await が挟まるので、
-  // 同じ用件へ 2 件目 (グラスの再タップ / 別クライアント) が入ると同じキーを二度送り、
-  // 片方の後始末が他方の状態を消してしまう。
-  if (!store.claimPendingForRespond(pending.id)) {
-    console.log(`[respond] already processing: pending=${pending.id}`);
-    return c.json({ error: 'already processing this pending', code: 'already_processing', currentPendingId: pending.id }, 409);
+  // tmux 単位の mutex。応答処理には tmux へのキー注入という時間の掛かる await が
+  // 挟まるので、2 本目 (グラスの再タップ / 別クライアント / 入れ替わった別用件) が
+  // 並走すると同じ TUI に 2 本ぶんのキーが混ざる。
+  if (!store.acquireRespondLock(tmuxName)) {
+    const cur = store.getPending(tmuxName);
+    console.log(`[respond] already processing: tmux=${tmuxName}`);
+    return c.json(
+      { error: 'already processing a response for this session', code: 'already_processing', currentPendingId: cur?.id ?? null },
+      409,
+    );
   }
   try {
+    // 最新の pending は mutex を取った後に読む (待たされている間の入れ替わりを拾う)。
+    const pending = store.getPending(tmuxName);
+    if (!pending) return c.json({ error: 'no pending interaction' }, 404);
+    // クライアントが応答対象を明示している場合、現在の pending と食い違っていたら受理しない。
+    // 画面を開いている間に用件が入れ替わると、古い画面で作った回答が別の用件に適用されるため。
+    // pendingId を送ってこない旧クライアントは従来どおり受理する (後方互換)。
+    if (body.pendingId && body.pendingId !== pending.id) {
+      console.log(`[respond] pending mismatch: body=${body.pendingId} current=${pending.id}`);
+      return c.json({ error: 'pending mismatch', code: 'pending_mismatch', currentPendingId: pending.id }, 409);
+    }
     return await processRespond(c, tmuxName, pending, body);
   } finally {
-    store.releasePendingForRespond(pending.id);
+    store.releaseRespondLock(tmuxName);
   }
 });
 
-/** respond の本処理。claim 済みの pending に対してのみ呼ばれる。 */
+/**
+ * 複数選択の質問なのに 1 つも選ばれていない回答の index を返す (無ければ -1)。
+ * なぜ弾くか: TUI では「何も選ばずに Submit」を撃つことになり、選択の無い回答が
+ * そのまま確定してしまう。クライアント側でも 0 件確定は no-op にしているが、
+ * 別クライアント/旧クライアントからも来るのでサーバでも受理しない。
+ */
+function findEmptyMultiSelectAnswer(
+  answers: Array<{ option?: string; options?: string[]; answerKind?: 'predefined' | 'type-something' | 'chat-about-this' }>,
+  questions: AskQuestion[],
+): number {
+  for (let i = 0; i < answers.length; i++) {
+    const a = answers[i];
+    const kind = a.answerKind ?? 'predefined';
+    if (kind !== 'predefined') continue;
+    if (!questions[i]?.multiSelect) continue;
+    const selected = a.options && a.options.length > 0 ? a.options : a.option ? [a.option] : [];
+    if (selected.length === 0) return i;
+  }
+  return -1;
+}
+
+/** respond の本処理。mutex を握った状態でのみ呼ばれる。 */
 async function processRespond(
   c: Context,
   tmuxName: string,
@@ -936,6 +1033,18 @@ async function processRespond(
   body: RespondInput,
 ): Promise<Response> {
   console.log(`[respond] tmux=${tmuxName} kind=${body.kind} hookEvent=${pending.hookEvent}`);
+
+  // 検証はキー注入 (= 取り返しのつかない副作用) より前にまとめて済ませる。
+  if (body.kind === 'question') {
+    const emptyIdx = findEmptyMultiSelectAnswer(body.answers, pending.questions ?? []);
+    if (emptyIdx >= 0) {
+      console.log(`[respond] empty multi-select answer at q${emptyIdx}`);
+      return c.json(
+        { error: 'multi-select answer has no selected option', code: 'empty_multi_select', index: emptyIdx },
+        400,
+      );
+    }
+  }
 
   let decision: HookDecision;
   if (pending.hookEvent === 'PreToolUse') {
@@ -951,8 +1060,16 @@ async function processRespond(
       // TUI が回答を処理 → tool_result が transcript に書かれる → watcher が pending clear。
       // クライアント側にはここで成功を返してすぐ pending を消したフリ(楽観表示)をする。
       try {
-        await sendAnswersToTui(tmuxName, body.answers, pending.questions ?? []);
+        await sendAnswersToTui(tmuxName, body.answers, pending.questions ?? [], pending.id);
       } catch (e) {
+        if (e instanceof PendingChangedError) {
+          // 注入の途中で用件が入れ替わった。以降のキーは撃っていないので、クライアントは
+          // 「用件が入れ替わった」時と同じ後始末 (回答を捨てて取り直す) をすればよい。
+          return c.json(
+            { error: 'pending changed while sending keys', code: 'pending_mismatch', currentPendingId: e.currentPendingId ?? null },
+            409,
+          );
+        }
         console.log(`[respond] sendAnswersToTui failed: ${(e as Error).message}`);
         return c.json({ error: `failed to send keys to tmux: ${(e as Error).message}` }, 500);
       }

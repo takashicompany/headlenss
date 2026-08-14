@@ -214,6 +214,8 @@ type HistoryEntry = {
 let bridge: EvenAppBridge | null = null
 let settings: Settings = { ...DEFAULT_SETTINGS }
 let phase: Phase = 'boot'
+/** await を挟んだ後の phase 読み出し用。直接読むと await 前の絞り込みが残るため。 */
+function currentPhase(): Phase { return phase }
 let serverProbeOk = false
 let serverErrorMsg = ''
 let lastSessions: Session[] = []
@@ -253,8 +255,8 @@ let scrollAnimActive = false
 let rootCursorKey: string | null = null
 let rootListStart = 0 // rootlist 表示窓の先頭 index。カーソル追従方式で cursor が窓外に出た時だけスライドする
 let ccListStart = 0   // cc-response 画面の表示窓の先頭行 index (rootlist と同じカーソル追従方式)
-// cc-message (メッセージ全文閲覧) 画面の表示窓の先頭行 index。0 = 本文の先頭。
-let ccMsgScrollOffset = 0
+// cc-message (メッセージ全文閲覧) 画面の読み位置は respondFlow.msgScrollOffset が持つ
+// (用件 1 件に属する状態なので、応答フローの他の状態と一緒に生まれて一緒に消える)。
 // cc-message の本文を折り返した結果。ポーリングのたびに全文を px 計測し直すと重いので、
 // 元テキスト (pending / 質問 index を含む) が変わった時だけ計算する。
 let ccMsgLinesCache: string[] = []
@@ -320,19 +322,64 @@ let refreshAbortCtrl: AbortController | null = null
 function abortInFlightRefresh(): void {
   if (refreshAbortCtrl) { refreshAbortCtrl.abort(); refreshAbortCtrl = null }
 }
-let respondCursor = 0                            // cc-response 画面のカーソル位置(現在質問の行 index)
-let respondQIdx = 0                              // 複数質問時、現在表示中の質問 index
-// 応答画面 (cc-message / cc-response) が対象にしている pending の id。
-// なぜ: 画面を開いている間もポーリングは走り続けるので、用件が入れ替わった (別の承認/質問に
-// なった) ことに気付かないと、古い画面で作った回答を新しい用件へ送ってしまう。
-let respondPendingId: string | null = null
-// 応答 POST の実行中フラグ。
-// なぜ: 送信は数百ms〜秒単位かかる (サーバが tmux にキーを注入して確認するまで) ので、
-// その間の再タップで同じ用件へ 2 通目を送ってしまう。送信中は応答画面の入力を捨てる。
-let respondInFlight = false
-/** 応答 POST 中の応答画面 (cc-message / cc-response) の入力か。true なら無視する。 */
+// AskUserQuestion 回答ビルド用: 各質問について構築中の回答を保持
+type RespondAnswer =
+  | { kind: 'predefined'; option?: string; options?: string[] }   // single or multi
+  | { kind: 'type-something'; text: string }
+  | { kind: 'chat-about-this' }
+
+/**
+ * 用件 (pending) 1 件への応答フローが持つ状態。
+ *
+ * なぜ 1 つのオブジェクトにまとめるか:
+ * 「本文を読む → 選択肢を選ぶ → (必要なら) 音声入力 → POST」は一続きの流れで、
+ * 途中の状態はすべて「今答えている 1 件」に属する。以前はこれが 6 本の独立した
+ * 変数に散らばっていて、後始末を書く場所が 5 か所に重複していた。1 か所でも
+ * 書き漏らすと「カーソルだけ前の用件のまま」「録音の用途だけ残る」といった
+ * 非対称が生まれる。フロー全体を 1 つの参照にして、生成と破棄を遷移関数に
+ * 集約する = 「全部残る」か「全部消える」しか作れない形にする。
+ *
+ * 不変条件 (assertRespondFlowInvariant で実行時にも守る):
+ *   - phase が cc-message / cc-response なら respondFlow は必ず非 null
+ *   - respondFlow が非 null なら、phase は cc-message / cc-response、または
+ *     Type something の録音中 (recording=true) か POST 中 (inFlight=true)
+ */
+type RespondFlow = {
+  /** どの用件に答えているか。ポーリング結果との突き合わせに使う。 */
+  pendingId: string
+  /** 複数質問時、現在表示中の質問 index */
+  qIdx: number
+  /** cc-response 画面のカーソル位置 (現在質問の行 index) */
+  cursor: number
+  /** cc-message (本文閲覧) 画面の窓の先頭行 index。0 = 本文の先頭。 */
+  msgScrollOffset: number
+  /** 各質問について構築中の回答 (質問 index → 回答) */
+  answers: Record<number, RespondAnswer>
+  /** Type something の音声入力中 (録音 / 確定待ち) か。録音の用途フラグを兼ねる。 */
+  recording: boolean
+  /**
+   * 応答 POST の実行中か。
+   * 送信は数百ms〜秒単位かかる (サーバが tmux にキーを注入して確認するまで) ので、
+   * その間の入力を全部捨てないと同じ用件へ 2 通目を送ってしまう。
+   */
+  inFlight: boolean
+  /** 直近の送信失敗の表示文言 (null = 無し)。次の操作か時間経過で消える。 */
+  error: string | null
+}
+let respondFlow: RespondFlow | null = null
+
+/** 現在表示中の質問 index。フローが無い間 (描画の隙間) は 0 として扱う。 */
+function flowQIdx(): number { return respondFlow?.qIdx ?? 0 }
+/** cc-response のカーソル位置。フローが無い間は 0 として扱う。 */
+function flowCursor(): number { return respondFlow?.cursor ?? 0 }
+/** cc-message の読み位置。フローが無い間は先頭として扱う。 */
+function flowMsgScroll(): number { return respondFlow?.msgScrollOffset ?? 0 }
+/** 構築中の回答表 (読み取り専用に使う)。フローが無い間は空。 */
+function flowAnswers(): Record<number, RespondAnswer> { return respondFlow?.answers ?? {} }
+
+/** 応答 POST 中の G2 入力か。true ならその入力は無視する (全ジェスチャー共通)。 */
 function respondInputBlocked(): boolean {
-  return respondInFlight && (phase === 'cc-message' || phase === 'cc-response')
+  return respondFlow?.inFlight === true
 }
 /**
  * 用件への応答フロー (本文閲覧 → 選択肢 → Type something の録音 → POST) の最中か。
@@ -340,19 +387,12 @@ function respondInputBlocked(): boolean {
  * 自動 (ユーザ操作以外) の切替はこれが true の間だけ保留する。
  */
 function isRespondFlowActive(): boolean {
-  if (phase === 'cc-message' || phase === 'cc-response') return true
-  // Type something の録音中 (と、その確定待ち) も応答フローの一部
-  if ((phase === 'recording' || phase === 'finalizing') && recordingPurpose === 'respond-type-something') return true
-  return respondInFlight
+  return respondFlow !== null || phase === 'cc-message' || phase === 'cc-response'
 }
-// AskUserQuestion 回答ビルド用: 各質問について構築中の回答を保持
-type RespondAnswer =
-  | { kind: 'predefined'; option?: string; options?: string[] }   // single or multi
-  | { kind: 'type-something'; text: string }
-  | { kind: 'chat-about-this' }
-let respondAnswers: Record<number, RespondAnswer> = {}
-// recording の用途: 通常 (tmux に送る) / cc-response の Type something 回答用
-let recordingPurpose: 'tmux' | 'respond-type-something' = 'tmux'
+/** 今の録音が cc-response の Type something 用か (通常の tmux 送信用なら false)。 */
+function recordingIsForRespond(): boolean {
+  return respondFlow?.recording === true
+}
 // THROTTLE_MS だけ十分過去に置いておくことで、boot 直後の最初の refreshG2 が必ず発火するようにする
 let g2RefreshLastAt = -G2_REFRESH_THROTTLE_MS - 1000
 const client = new HeadlenssClient('')
@@ -715,7 +755,7 @@ function ccMessageLines(): string[] {
   // 同じなので、id + 種類 + 質問 index で一意に決まる (言語は省略表示行の文言に効く)。
   // なぜ本文を含めないか: 本文の構築 (summarizeToolInput の JSON 整形と slice) 自体が
   // 重く、キーに含めるとポーリングのたびに必ず実行されてキャッシュの意味が無い。
-  const key = `${pending.id}#${pending.kind}#${respondQIdx}#${getLanguage()}`
+  const key = `${pending.id}#${pending.kind}#${flowQIdx()}#${getLanguage()}`
   if (key === ccMsgLinesCacheKey) return ccMsgLinesCache
 
   // 段落 (折り返し前) の配列。空文字は空行として扱う。
@@ -731,7 +771,7 @@ function ccMessageLines(): string[] {
     if (summary) paras.push(summary)
     if (full.length > summary.length) fullLength = full.length
   } else {
-    const q = pending.questions?.[respondQIdx]
+    const q = pending.questions?.[flowQIdx()]
     if (!q) {
       ccMsgLinesCache = []
       ccMsgLinesCacheKey = ''
@@ -775,23 +815,28 @@ function maxCcMsgScrollOffset(): number {
 
 /** cc-message: 前 (メッセージ先頭) 方向へ戻る */
 function ccMsgScrollBack(): void {
-  if (ccMsgScrollOffset === 0) return
-  ccMsgScrollOffset = Math.max(0, ccMsgScrollOffset - scrollLinesPerGesture())
+  const flow = respondFlow
+  if (!flow || flow.msgScrollOffset === 0) return
+  clearRespondError()
+  flow.msgScrollOffset = Math.max(0, flow.msgScrollOffset - scrollLinesPerGesture())
   void refreshG2(true)
 }
 
 /** cc-message: 次 (メッセージ末尾) 方向へ進む */
 function ccMsgScrollForward(): void {
+  const flow = respondFlow
+  if (!flow) return
   const max = maxCcMsgScrollOffset()
-  const next = Math.min(max, ccMsgScrollOffset + scrollLinesPerGesture())
-  if (next === ccMsgScrollOffset) return
-  ccMsgScrollOffset = next
+  const next = Math.min(max, flow.msgScrollOffset + scrollLinesPerGesture())
+  if (next === flow.msgScrollOffset) return
+  clearRespondError()
+  flow.msgScrollOffset = next
   void refreshG2(true)
 }
 
 /**
  * Claude Code 承認/質問の本文を全文読むための画面。
- * 選択肢は出さず、CC_LIST_VISIBLE 行の窓を ccMsgScrollOffset でスクロールさせる。
+ * 選択肢は出さず、CC_LIST_VISIBLE 行の窓を respondFlow.msgScrollOffset でスクロールさせる。
  */
 function buildCcMessageView(): string {
   if (!claudePending) return '(no pending)'
@@ -801,8 +846,9 @@ function buildCcMessageView(): string {
     return claudePending.kind === 'permission' ? '(no tool input)' : '(question is empty)'
   }
   // 本文が短くなった場合に窓が範囲外へ出ないようクランプする
-  ccMsgScrollOffset = Math.max(0, Math.min(ccMsgScrollOffset, Math.max(0, all.length - CC_LIST_VISIBLE)))
-  return all.slice(ccMsgScrollOffset, ccMsgScrollOffset + CC_LIST_VISIBLE).join('\n')
+  const start = Math.max(0, Math.min(flowMsgScroll(), Math.max(0, all.length - CC_LIST_VISIBLE)))
+  if (respondFlow) respondFlow.msgScrollOffset = start
+  return all.slice(start, start + CC_LIST_VISIBLE).join('\n')
 }
 
 /** Claude Code 承認/質問への応答画面 */
@@ -813,6 +859,8 @@ function buildCcResponseView(): string {
   // 最後のスクロール窓計算で、カーソルが最初の選択肢に戻ったらヘッダから見せるために使う。
   let cursorLineIdx = -1
   let firstCursorLineIdx = -1
+  const qIdx = flowQIdx()
+  const cursor = flowCursor()
   if (claudePending.kind === 'permission') {
     // ツール名はヘッダ (buildG2Header) に出しているので本文では繰り返さない。
     // 7 行しかない窓を選択肢と要約に使い切るため。
@@ -825,8 +873,8 @@ function buildCcResponseView(): string {
     const opts = ['Allow', 'Deny']
     for (let i = 0; i < opts.length; i++) {
       if (i === 0) firstCursorLineIdx = lines.length
-      if (i === respondCursor) cursorLineIdx = lines.length
-      lines.push((i === respondCursor ? '▶ ' : '  ') + opts[i])
+      if (i === cursor) cursorLineIdx = lines.length
+      lines.push((i === cursor ? '▶ ' : '  ') + opts[i])
     }
     return applyCcScrollWindow(lines, cursorLineIdx, firstCursorLineIdx)
   }
@@ -834,7 +882,7 @@ function buildCcResponseView(): string {
   const questions = claudePending.questions ?? []
   const totalQ = questions.length
   if (totalQ === 0) return '(question is empty)'
-  const q = questions[respondQIdx]
+  const q = questions[qIdx]
   if (!q) return '(question is empty)'
   // 1 行目は質問文の抜粋だけ。質問番号 (i/n) と [複数] バッジはヘッダ側で出しているので
   // ここでは付けない (同じ情報を 2 か所に出すと、狭い窓がさらに削られる)。
@@ -843,9 +891,9 @@ function buildCcResponseView(): string {
   lines.push('')
   // 行構成: predefined options → (multi のみ) Submit → Type something → Chat about this
   const opts = q.options ?? []
-  const builtAnswer = respondAnswers[respondQIdx]
+  const builtAnswer = flowAnswers()[qIdx]
   for (let i = 0; i < opts.length; i++) {
-    const marker = i === respondCursor ? '▶' : ' '
+    const marker = i === cursor ? '▶' : ' '
     let check = ''
     if (q.multiSelect) {
       const sel = builtAnswer?.kind === 'predefined' ? builtAnswer.options ?? [] : []
@@ -855,26 +903,30 @@ function buildCcResponseView(): string {
       check = sel === opts[i].label ? '● ' : '○ '
     }
     if (i === 0) firstCursorLineIdx = lines.length
-    if (i === respondCursor) cursorLineIdx = lines.length
+    if (i === cursor) cursorLineIdx = lines.length
     lines.push(`${marker} ${check}${opts[i].label}`)
   }
   let extraIdx = opts.length
   if (q.multiSelect) {
-    const m = extraIdx === respondCursor ? '▶' : ' '
-    if (extraIdx === respondCursor) cursorLineIdx = lines.length
-    lines.push(`${m} ${t('submitOption')}`)
+    const m = extraIdx === cursor ? '▶' : ' '
+    if (extraIdx === cursor) cursorLineIdx = lines.length
+    // 0 件のまま Submit しても確定できないので、その旨をこの行自体に出す
+    // (フッターは multi 用の操作案内で埋まっている)。
+    const selected = builtAnswer?.kind === 'predefined' ? builtAnswer.options ?? [] : []
+    const hint = selected.length === 0 ? ` ${t('submitNeedsPick')}` : ''
+    lines.push(`${m} ${t('submitOption')}${hint}`)
     extraIdx++
   }
   {
-    const m = extraIdx === respondCursor ? '▶' : ' '
+    const m = extraIdx === cursor ? '▶' : ' '
     const built = builtAnswer?.kind === 'type-something' ? builtAnswer.text : ''
-    if (extraIdx === respondCursor) cursorLineIdx = lines.length
+    if (extraIdx === cursor) cursorLineIdx = lines.length
     lines.push(`${m} T Type something${built ? ` (${built.slice(0, 16)}…)` : t('voiceInputBadge')}`)
     extraIdx++
   }
   {
-    const m = extraIdx === respondCursor ? '▶' : ' '
-    if (extraIdx === respondCursor) cursorLineIdx = lines.length
+    const m = extraIdx === cursor ? '▶' : ' '
+    if (extraIdx === cursor) cursorLineIdx = lines.length
     lines.push(`${m} C Chat about this`)
   }
   return applyCcScrollWindow(lines, cursorLineIdx, firstCursorLineIdx)
@@ -912,7 +964,7 @@ function applyCcScrollWindow(lines: string[], cursorLineIdx: number, firstCursor
 function currentRespondRowCount(): number {
   if (!claudePending) return 0
   if (claudePending.kind === 'permission') return 2
-  const q = claudePending.questions?.[respondQIdx]
+  const q = claudePending.questions?.[flowQIdx()]
   if (!q) return 0
   return (q.options ?? []).length + (q.multiSelect ? 1 : 0) + 2
 }
@@ -1115,6 +1167,42 @@ function maxChatScrollOffset(): number {
   return Math.max(0, chatDisplayCount() - chatDisplayLines())
 }
 
+/** 末尾突き合わせで使う行数。これだけ一致すれば同じ位置と見なす。 */
+const TAIL_MATCH_PROBE = 8
+/** 末尾のズレを探す範囲。これを超える変化は「別物」として補正しない。 */
+const TAIL_MATCH_MAX_SHIFT = 64
+
+/**
+ * 旧表示行列と新表示行列を末尾で突き合わせ、「末尾に何行足されたか」を返す。
+ * 負なら末尾から減った行数。一致が見つからない (内容が総取っ替え) なら null。
+ *
+ * なぜ「差し引きの行数」ではなく「末尾の増減」なのか:
+ * scrollOffset は「末尾から何行戻ったか」なので、読んでいる位置が動くのは
+ * 末尾が動いた時だけ。tail 窓の先頭から古い行が落ちても末尾は動かないので、
+ * 基準は 1 行も動かしてはいけない。総行数の差 (旧コード) だと、先頭の脱落を
+ * 末尾の減少と取り違えて、読んでいる位置が脱落したぶんだけ末尾方向へ滑る。
+ */
+function tailAppendedLines(prev: string[], next: string[]): number | null {
+  if (prev.length === 0) return next.length
+  const limit = Math.min(TAIL_MATCH_MAX_SHIFT, Math.max(prev.length, next.length))
+  // ズレの小さい順に試す (最小の説明を採る)。d>0 = 末尾に追記、d<0 = 末尾から減少。
+  for (let mag = 0; mag <= limit; mag++) {
+    for (const d of mag === 0 ? [0] : [mag, -mag]) {
+      // d ぶんズラした時に重なる「末尾」の位置
+      const a = next.length - Math.max(d, 0)
+      const b = prev.length + Math.min(d, 0)
+      const probe = Math.min(TAIL_MATCH_PROBE, a, b)
+      if (probe <= 0) continue
+      let ok = true
+      for (let i = 1; i <= probe; i++) {
+        if (next[a - i] !== prev[b - i]) { ok = false; break }
+      }
+      if (ok) return d
+    }
+  }
+  return null
+}
+
 function isScrolled(): boolean {
   return scrollOffset > 0
 }
@@ -1133,15 +1221,21 @@ function scrollForward(): void {
   startScrollAnimation()
 }
 
-/** scroll アニメ終了時に延期された full render を発火する */
+/**
+ * scroll アニメ終了時に延期された full render を発火する。
+ *
+ * 待機枠 (g2RenderPending) はここでは絶対に消さない。以前は「枠を消してから
+ * refreshG2 を呼び直す」形だったが、refreshG2 はスロットル / bridge 無し /
+ * プラグイン遷移中に bail するので、bail した回の描画要求がそのまま消えていた
+ * (スクロールを止めた瞬間の画面が古いまま残る)。枠は残したままポンプに取りに
+ * 行かせ、実際にクリアするのはポンプが送信を始める時だけにする。
+ */
 function flushDeferredRender(): void {
   g2RenderDeferredAt = null
-  if (g2RenderPending) {
-    const force = g2RenderPendingForce
-    g2RenderPending = false
-    g2RenderPendingForce = false
-    void refreshG2(force)
-  }
+  if (!g2RenderPending) return
+  // 今は送れない状況。待機枠を残しておけば、送れるようになった次の要求で一緒に出る。
+  if (!bridge || pluginNavBlocksG2Render) return
+  void pumpG2Sends()
 }
 
 /** 1 行ずつ scrollOffset を進めるアニメーションループ。
@@ -1195,19 +1289,19 @@ function resetScroll(): void {
 
 /** 現在の cc-response 質問が multi-select か? */
 function currentRespondQuestionIsMulti(): boolean {
-  const q = claudePending?.questions?.[respondQIdx]
+  const q = claudePending?.questions?.[flowQIdx()]
   return !!q?.multiSelect
 }
 
-/** 現在の respondCursor 行が Type something か? */
+/** 現在のカーソル行が Type something か? */
 function currentRespondRowIsTypeSomething(): boolean {
   if (!claudePending) return false
-  const q = claudePending.questions?.[respondQIdx]
+  const q = claudePending.questions?.[flowQIdx()]
   if (!q) return false
   const optsCount = (q.options ?? []).length
   // rows: 0..N-1=predefined, N=submit(multi only), N+s=Type something, last=Chat about this
   const submitOffset = q.multiSelect ? 1 : 0
-  return respondCursor === optsCount + submitOffset
+  return flowCursor() === optsCount + submitOffset
 }
 
 function buildG2Footer(): string {
@@ -1220,19 +1314,22 @@ function buildG2Footer(): string {
       return `${t('g2FootRoot')} (${resolveRootCursorIndex() + 1}/${rows})`
     }
     case 'cc-message': {
+      // 送信に失敗した直後は、その事実と再試行の案内を最優先で出す
+      if (respondFlow?.error) return respondFlow.error
       // 収まりきらない本文はスクロールで読む。今どこまで読んだかを rootlist と同じ書式で出す
       const total = ccMessageLines().length
       if (total <= CC_LIST_VISIBLE) return t('g2FootCcMessage')
-      const shownEnd = Math.min(total, ccMsgScrollOffset + CC_LIST_VISIBLE)
+      const shownEnd = Math.min(total, flowMsgScroll() + CC_LIST_VISIBLE)
       return `${t('g2FootCcMessage')} (${shownEnd}/${total})`
     }
     case 'cc-response':
+      if (respondFlow?.error) return respondFlow.error
       // multi-select 中の Submit 行を強調するため、multi-select 質問のときは別文言
       if (currentRespondQuestionIsMulti()) return t('g2FootCcRespMulti')
       return t('g2FootCcResponse')
     case 'recording': {
       // cc-response の Type something で録音中なら専用文言
-      const base = recordingPurpose === 'respond-type-something' ? t('g2FootCcRespRec') : t('g2FootRecOff')
+      const base = recordingIsForRespond() ? t('g2FootCcRespRec') : t('g2FootRecOff')
       // 遡って読んでいる間は戻り行数を出す (idle の chat と同じ表記)
       return recordingScrollOffset > 0 ? `${base}  (-${recordingScrollOffset})` : base
     }
@@ -1277,9 +1374,9 @@ function buildG2Header(): string {
         return t('approveTool').replace('{name}', claudePending.toolName).slice(0, 56)
       }
       const questions = claudePending.questions ?? []
-      const q = questions[respondQIdx]
+      const q = questions[flowQIdx()]
       // 単一質問でも (1/1) を出す (2 画面で番号の見え方を揃える)
-      const num = questions.length > 0 ? ` (${respondQIdx + 1}/${questions.length})` : ''
+      const num = questions.length > 0 ? ` (${flowQIdx() + 1}/${questions.length})` : ''
       const badge = q?.multiSelect ? t('multiBadge') : ''
       return `${t('g2HeadCcResponse')}${num}${badge}`.slice(0, 56)
     }
@@ -1771,8 +1868,10 @@ async function refreshClaudeData(): Promise<void> {
     // 指紋が毎回変わって全文の再整形が走り続ける、という問題も同時に消える。
     const chat = chatResponse.chat.filter((c) => !c.synthetic)
     currentAgentSource = chatResponse.source ?? claudeSessions.find((s) => s.tmuxSessionName === targetSession)?.source
-    // 差し替え前の表示行数 (待機行込み)。scrollback 中の繰り上げ量の計算に使う。
-    const prevDisplayLen = chatDisplayCount()
+    // 差し替え前の表示行列 (待機行込み)。scrollback 中の繰り上げ量の計算に使う。
+    // chatLinesCache は常に丸ごと差し替えられる (要素を書き換えない) ので、
+    // ここで掴んだ配列は後の更新に影響されない = 旧状態のスナップショットになる。
+    const prevDisplayLines = scrollOffset > 0 ? chatLinesForDisplay() : null
     // 取得内容が前回と同一なら整形をまるごと省く。無操作でもポーリングは 1.5 秒毎に
     // 走るので、ここを毎回計算すると会話が長いほどメインスレッドが埋まる。
     // source も鍵に含める (タグ表記が変わると整形結果も変わるため)。
@@ -1788,14 +1887,15 @@ async function refreshClaudeData(): Promise<void> {
     // pending の出現/消滅のたびに読んでいる位置が 1 行ずれる。
     claudeChatStatus = chatResponse.status
     claudePending = pending
-    // chat: scrollback 中なら増減したぶんだけオフセットを補正して読んでいる位置を保つ。
-    // 減った側 (待機行が消えた / 履歴が縮んだ) も補正するのは、増加時だけ繰り上げると
-    // busy⇔idle を往復するたびにオフセットが片道ぶんずつ溜まり、読み位置が上へ漂うため。
+    // chat: scrollback 中なら「末尾に増減したぶん」だけオフセットを補正して読み位置を保つ。
+    //  - 追記 (新しい発言 / 待機行が出た)      → その行数ぶん繰り上げる
+    //  - 末尾の減少 (待機行が消えた)           → その行数ぶん繰り下げる
+    //    (増加時だけ繰り上げると busy⇔idle の往復でオフセットが片道ぶんずつ溜まる)
+    //  - tail 窓の先頭からの脱落                → 末尾は動いていないので何もしない
     if (scrollOffset > 0) {
-      const delta = chatDisplayCount() - prevDisplayLen
-      if (delta !== 0) {
-        scrollOffset = Math.max(0, Math.min(maxChatScrollOffset(), scrollOffset + delta))
-      }
+      const added = prevDisplayLines ? tailAppendedLines(prevDisplayLines, chatLinesForDisplay()) : 0
+      // null = 内容が総取っ替えで対応が付かない。動かす根拠が無いので基準は据え置き。
+      scrollOffset = Math.max(0, Math.min(maxChatScrollOffset(), scrollOffset + (added ?? 0)))
     }
     claudeChat = chat
     claudeChatLoading = false
@@ -2398,15 +2498,26 @@ async function startRecording(): Promise<void> {
   rtSession = session
 
   const revertToIdle = () => {
-    if (rtSession === session && phase === 'recording') {
-      stopRecordingTimer()
-      try { session.abort() } catch { /* ignore */ }
-      rtSession = null
+    if (rtSession !== session || phase !== 'recording') return
+    stopRecordingTimer()
+    try { session.abort() } catch { /* ignore */ }
+    rtSession = null
+    const flow = respondFlow
+    if (flow?.recording) {
+      // Type something の録音だった。idle に落とすと応答フローだけが宙に浮くので、
+      // 戻り先の用件が健在なら応答画面へ戻し、消えていればフローごと畳む。
+      flow.recording = false
+      if (!claudePending || claudePending.id !== flow.pendingId) {
+        resetRespondFlow('pending-gone', flow)
+        return
+      }
+      phase = 'cc-response'
+    } else {
       phase = 'idle'
-      paintStatus()
-      updateRecordButton()
-      void refreshG2(true)
     }
+    paintStatus()
+    updateRecordButton()
+    void refreshG2(true)
   }
 
   void (async () => {
@@ -2473,15 +2584,29 @@ async function stopRecordingToPending(): Promise<void> {
     log(`Stop error: ${err}`)
   }
 
+  // 録音を始めた時点の用途を控える。確定するまでの間 (ASR の最終結果待ち) に
+  // セッション切替などでフローが畳まれることがあるので、「今の状態」ではなく
+  // 「始めた時の用途」で分岐する。今の状態で見ると、応答用に喋った内容が行き先を
+  // 失った拍子に tmux 送信の待ち行列へ紛れ込む。
+  const recordingFlow = respondFlow?.recording ? respondFlow : null
+
   /** 録音終了時の戻り先を決める共通ハンドラ。
-   *  recordingPurpose によって tmux 用 pending か cc-response の type-something かを分ける。 */
+   *  録音が cc-response の Type something 用なら応答画面へ、そうでなければ tmux 用 pending へ。 */
   const finishWithText = (text: string): void => {
-    const purpose = recordingPurpose
-    recordingPurpose = 'tmux' // reset
-    if (purpose === 'respond-type-something') {
+    if (recordingFlow) {
+      recordingFlow.recording = false
+      // 喋っている間に戻り先が消えていることがある (別経路で承認された / セッションを
+      // kill された / ポーリングで用件が入れ替わった)。戻る先が無いのに cc-response へ
+      // 帰すと、pending 無しの応答画面という作れないはずの状態になる。
+      const flow = respondFlow
+      if (flow !== recordingFlow || !claudePending || claudePending.id !== recordingFlow.pendingId) {
+        log('respond type-something: 戻り先の用件が消えていたので idle に戻ります')
+        resetRespondFlow('pending-gone', recordingFlow)
+        return
+      }
       // cc-response の type-something 回答として記録、cc-response に戻る
       if (text) {
-        respondAnswers[respondQIdx] = { kind: 'type-something', text }
+        flow.answers[flow.qIdx] = { kind: 'type-something', text }
         log(`respond type-something: "${text.slice(0, 40)}"`)
       } else {
         log('respond type-something: empty, cancel')
@@ -2650,9 +2775,19 @@ async function abortRecording(): Promise<void> {
   liveTranscript = ''
   durationEl.textContent = '0.0s'
   recordingReady = false
-  // 録音の用途が cc-response の type-something なら、cc-response に戻る
-  if (recordingPurpose === 'respond-type-something') {
-    recordingPurpose = 'tmux'
+  // 録音の用途が cc-response の type-something なら、cc-response に戻る。
+  // ただし戻り先の用件が消えていたら応答フローごと畳んで idle へ落とす
+  // (pending 無しの応答画面を作らない)。
+  const flow = respondFlow
+  if (flow?.recording) {
+    flow.recording = false
+    if (!claudePending || claudePending.id !== flow.pendingId) {
+      log('録音中止: 戻り先の用件が消えていたので idle に戻ります')
+      resetRespondFlow('pending-gone')
+      updateRecordButton()
+      updatePendingUI()
+      return
+    }
     phase = 'cc-response'
   } else {
     phase = pendingSentences.length > 0 ? 'pending' : 'idle'
@@ -2678,23 +2813,16 @@ async function toggleRecording(): Promise<void> {
   } else if (phase === 'idle') {
     // pending があるなら音声入力ではなく、まずメッセージ全文の閲覧画面に遷移
     if (claudePending) {
-      respondCursor = 0
-      respondQIdx = 0
-      respondAnswers = {}
-      // どの用件に答えているかをここで束縛する (以降ポーリングで突き合わせる)
-      respondPendingId = claudePending.id
-      recordingPurpose = 'tmux'
-      ccMsgScrollOffset = 0
-      phase = 'cc-message'
-      paintStatus()
-      void refreshG2(true)
-      updateRecordButton()
+      enterRespondFlow(claudePending)
     } else {
       await startRecording()
     }
   } else if (phase === 'cc-message') {
     // 本文を読み終えた → 選択肢画面へ
-    respondCursor = 0
+    const flow = respondFlow
+    if (!flow) { assertRespondFlowInvariant('cc-message tap'); return }
+    clearRespondError()
+    flow.cursor = 0
     phase = 'cc-response'
     paintStatus()
     void refreshG2(true)
@@ -2913,20 +3041,26 @@ function openSelectedFromRoot(): void {
 
 function moveRespondCursor(delta: number): void {
   if (phase !== 'cc-response') return
+  const flow = respondFlow
+  if (!flow) { assertRespondFlowInvariant('moveRespondCursor'); return }
   const total = currentRespondRowCount()
   if (total === 0) return
-  respondCursor = (respondCursor + delta + total) % total
+  clearRespondError()
+  flow.cursor = (flow.cursor + delta + total) % total
   void refreshG2(true)
 }
 
 /** cc-response 画面で click(タップ) された時の処理 */
 async function handleCcResponseClick(): Promise<void> {
   if (phase !== 'cc-response' || !claudePending) return
+  const flow = respondFlow
+  if (!flow) { assertRespondFlowInvariant('handleCcResponseClick'); return }
+  clearRespondError()
   if (claudePending.kind === 'permission') {
     await sendPendingResponseAndFinish()
     return
   }
-  const q = claudePending.questions?.[respondQIdx]
+  const q = claudePending.questions?.[flow.qIdx]
   if (!q) return
   const opts = q.options ?? []
   const submitRowIdx = q.multiSelect ? opts.length : -1
@@ -2934,50 +3068,63 @@ async function handleCcResponseClick(): Promise<void> {
   const chatRowIdx = typeRowIdx + 1
 
   // Chat about this 行: その質問のみ chat-about-this として全体キャンセル
-  if (respondCursor === chatRowIdx) {
-    respondAnswers[respondQIdx] = { kind: 'chat-about-this' }
+  if (flow.cursor === chatRowIdx) {
+    flow.answers[flow.qIdx] = { kind: 'chat-about-this' }
     await sendPendingResponseAndFinish()
     return
   }
 
   // Type something 行: 音声入力モードを開始
-  if (respondCursor === typeRowIdx) {
-    recordingPurpose = 'respond-type-something'
+  if (flow.cursor === typeRowIdx) {
+    flow.recording = true
     await startRecording()
+    // 起動できなかった (ブリッジ無し / 未設定) 場合は用途フラグを戻す。
+    // 立てっぱなしにすると、以降フローを畳むたびに存在しない録音を止めに行く。
+    if (currentPhase() !== 'recording' && respondFlow === flow) flow.recording = false
     return
   }
 
   // Submit (multi-select のみ): 現在質問の選択を確定して次へ
-  if (respondCursor === submitRowIdx) {
+  if (flow.cursor === submitRowIdx) {
+    // 1 つも選ばずに確定すると「選択の無い回答」が TUI で確定してしまうので no-op。
+    // 選び直せることが分かるよう、Submit 行に出している注意書きを描き直すだけにする。
+    const cur = flow.answers[flow.qIdx]
+    const selected = cur?.kind === 'predefined' ? cur.options ?? [] : []
+    if (selected.length === 0) {
+      log('multi-select: 選択が 0 件なので確定しません')
+      void refreshG2(true)
+      return
+    }
     advanceToNextQuestionOrSubmit()
     return
   }
 
   // predefined option 行
-  if (respondCursor < opts.length) {
-    const label = opts[respondCursor].label
+  if (flow.cursor < opts.length) {
+    const label = opts[flow.cursor].label
     if (q.multiSelect) {
       // toggle
-      const cur = respondAnswers[respondQIdx]
+      const cur = flow.answers[flow.qIdx]
       let arr = cur?.kind === 'predefined' ? cur.options ?? [] : []
       arr = arr.includes(label) ? arr.filter((l) => l !== label) : [...arr, label]
-      respondAnswers[respondQIdx] = { kind: 'predefined', options: arr }
+      flow.answers[flow.qIdx] = { kind: 'predefined', options: arr }
       void refreshG2(true)
     } else {
       // single-select: 即その値を answer に入れて次へ
-      respondAnswers[respondQIdx] = { kind: 'predefined', option: label }
+      flow.answers[flow.qIdx] = { kind: 'predefined', option: label }
       advanceToNextQuestionOrSubmit()
     }
   }
 }
 
 function advanceToNextQuestionOrSubmit(): void {
-  if (!claudePending) return
+  const flow = respondFlow
+  if (!claudePending || !flow) return
   const total = claudePending.questions?.length ?? 0
-  if (respondQIdx + 1 < total) {
+  if (flow.qIdx + 1 < total) {
     // 次の質問はまず本文を読ませたいので、選択肢画面ではなく cc-message に戻る
-    respondQIdx++
-    respondCursor = 0
+    flow.qIdx++
+    flow.cursor = 0
     backToCcMessage()
   } else {
     void sendPendingResponseAndFinish()
@@ -2986,47 +3133,164 @@ function advanceToNextQuestionOrSubmit(): void {
 
 /** cc-response → メッセージ閲覧画面 (cc-message) へ戻る。読み位置は先頭に戻す */
 function backToCcMessage(): void {
-  ccMsgScrollOffset = 0
+  const flow = respondFlow
+  if (!flow) { assertRespondFlowInvariant('backToCcMessage'); return }
+  flow.msgScrollOffset = 0
   phase = 'cc-message'
   paintStatus()
   void refreshG2(true)
   updateRecordButton()
 }
 
-/** 応答をやめて idle に戻る (構築中の回答も破棄) */
-function cancelCcRespond(): void {
-  phase = 'idle'
-  respondCursor = 0
-  respondQIdx = 0
-  respondAnswers = {}
-  respondPendingId = null
-  recordingPurpose = 'tmux'
-  ccMsgScrollOffset = 0
+// ─── 応答フローの遷移 ──────────────────────────────────────────────────
+// respondFlow を作る・畳む・差し替えるのはこの 4 つだけ。散らばった代入で
+// 「一部だけ残る」状態を作らないための唯一の入り口。
+//   enter(pending)   idle → cc-message (新しい用件への応答を始める)
+//   rebind(pending)  応答中に用件が別物へ入れ替わった → 新しい用件の先頭から
+//   complete()       送信が決着した (成功 / 用件入れ替わり) → 畳んで idle
+//   reset(reason)    それ以外の理由で畳む (キャンセル / セッション切替 / 用件消滅)
+
+/** 応答フローを開始する (idle → cc-message)。 */
+function enterRespondFlow(pending: Pending): void {
+  clearRespondError()
+  respondFlow = {
+    pendingId: pending.id,
+    qIdx: 0,
+    cursor: 0,
+    msgScrollOffset: 0,
+    answers: {},
+    recording: false,
+    inFlight: false,
+    error: null,
+  }
+  phase = 'cc-message'
+  paintStatus()
+  void refreshG2(true)
+  updateRecordButton()
+}
+
+/** 応答中に用件が別物へ入れ替わった時、新しい用件で組み直す (回答は引き継がない)。 */
+function rebindRespondFlow(pending: Pending): void {
+  clearRespondError()
+  if (respondFlow?.recording) discardRespondRecording()
+  respondFlow = {
+    pendingId: pending.id,
+    qIdx: 0,
+    cursor: 0,
+    msgScrollOffset: 0,
+    answers: {},
+    recording: false,
+    inFlight: false,
+    error: null,
+  }
+  phase = 'cc-message'
   paintStatus()
   void refreshG2(true)
   updateRecordButton()
 }
 
 /**
- * セッションが切り替わった時の応答系の後始末。
- * なぜ: 用件 (pending) はセッションごとのものなので、切替後もそのまま持っていると
- * 前のセッションの用件に対する作りかけの回答が、次に来た用件の画面に混ざる。
- * 応答画面を開いていた場合は idle に戻す (呼び出し側で描画を更新すること)。
+ * 応答フローを畳んで idle に戻す。
+ * 録音 (Type something) の最中でも録音ごと捨てる: 戻る先の用件がもう無いのに
+ * 録音だけ生かしておくと、確定した瞬間に行き先の無い回答ができる。
+ *
+ * @param endedFlow 「この処理が属していたフロー」。respondFlow が先に畳まれた後で
+ *   遅れて決着した処理 (ASR の確定待ちなど) から呼ぶ時に渡す。渡すと respondFlow が
+ *   既に null でも「応答フローの画面/録音に居た」と判断して idle まで戻す。
+ *   通常の tmux 録音を巻き添えにしないよう、この判断は明示的に渡された時だけ行う。
  */
-function resetRespondStateForSessionChange(): void {
-  const wasResponding = phase === 'cc-message' || phase === 'cc-response'
-  claudePending = null
-  respondPendingId = null
-  respondCursor = 0
-  respondQIdx = 0
-  respondAnswers = {}
-  recordingPurpose = 'tmux'
-  ccMsgScrollOffset = 0
-  if (!wasResponding) return
-  phase = 'idle'
+function resetRespondFlow(reason: string, endedFlow?: RespondFlow): void {
+  const flow = respondFlow
+  const wasActive = flow !== null || endedFlow != null || phase === 'cc-message' || phase === 'cc-response'
+  clearRespondError()
+  if (flow?.recording || endedFlow?.recording) discardRespondRecording()
+  respondFlow = null
+  if (!wasActive) return
+  log(`応答フローを終了しました (${reason})`)
+  if (phase === 'cc-message' || phase === 'cc-response' || phase === 'recording' || phase === 'finalizing') {
+    phase = 'idle'
+  }
   paintStatus()
   updateRecordButton()
   void refreshG2(true)
+}
+
+/** 送信が決着したので畳む。楽観的に用件も消す (取り違えないよう id 一致時だけ)。 */
+function completeRespondFlow(pendingId: string): void {
+  if (claudePending?.id === pendingId) claudePending = null
+  resetRespondFlow('completed')
+}
+
+/**
+ * Type something の録音を、確定させずに丸ごと捨てる。
+ * 応答フローを畳む側から呼ぶので、ここでは phase を触らない (呼び出し側が決める)。
+ */
+function discardRespondRecording(): void {
+  stopRecordingTimer()
+  try { void bridge?.audioControl(false) } catch { /* ignore */ }
+  rtSession?.abort()
+  rtSession = null
+  resetPcmCounter()
+  recordingScrollOffset = 0
+  recordingLinesCache = []
+  recordingLinesCacheKey = ''
+  liveTranscript = ''
+  durationEl.textContent = '0.0s'
+  recordingReady = false
+}
+
+/** 送信失敗の表示を消す (ユーザが次の操作をした時 / フローを畳む時)。 */
+function clearRespondError(): void {
+  if (respondErrorTimer) { clearTimeout(respondErrorTimer); respondErrorTimer = null }
+  if (respondFlow) respondFlow.error = null
+}
+
+/** 送信失敗の表示を出し、一定時間後に自動で消す。 */
+let respondErrorTimer: ReturnType<typeof setTimeout> | null = null
+const RESPOND_ERROR_SHOW_MS = 8000
+function showRespondError(message: string): void {
+  if (!respondFlow) return
+  respondFlow.error = message
+  if (respondErrorTimer) clearTimeout(respondErrorTimer)
+  respondErrorTimer = setTimeout(() => {
+    respondErrorTimer = null
+    if (!respondFlow?.error) return
+    respondFlow.error = null
+    void refreshG2(true)
+  }, RESPOND_ERROR_SHOW_MS)
+}
+
+/**
+ * phase と respondFlow の整合を実行時にも確かめる。
+ * 「cc-* に居るのに flow が無い」状態が作れてしまうと、以降の操作が全部
+ * 無反応になり (画面から出られない)、原因も画面に出ない。見つけたら記録して
+ * idle へ落として自己回復する。
+ */
+function assertRespondFlowInvariant(where: string): void {
+  const inRespondPhase = phase === 'cc-message' || phase === 'cc-response'
+  if (inRespondPhase && !respondFlow) {
+    log(`[bug] 応答画面なのに respondFlow が無い (${where}) — idle に戻します`)
+    phase = 'idle'
+    paintStatus()
+    updateRecordButton()
+    void refreshG2(true)
+    return
+  }
+  if (!inRespondPhase && respondFlow && !respondFlow.inFlight && !respondFlow.recording) {
+    log(`[bug] 応答画面を離れているのに respondFlow が残っている (${where}) — 破棄します`)
+    respondFlow = null
+  }
+}
+
+/**
+ * セッションが切り替わった時の応答系の後始末。
+ * なぜ: 用件 (pending) はセッションごとのものなので、切替後もそのまま持っていると
+ * 前のセッションの用件に対する作りかけの回答が、次に来た用件の画面に混ざる。
+ * Type something の録音中 / 確定待ちでも、録音を捨てて idle へ落とす。
+ */
+function resetRespondStateForSessionChange(): void {
+  claudePending = null
+  resetRespondFlow('session-change')
 }
 
 /**
@@ -3035,51 +3299,47 @@ function resetRespondStateForSessionChange(): void {
  * なぜ: 気付かずに操作を続けると、古い用件のつもりで作った回答が別の用件に送られる。
  *   - 消えた (別経路で承認済み等) → 構築中の回答を捨てて idle へ戻す
  *   - id が変わった → 回答を捨て、新しい用件の本文 (cc-message) の先頭から読み直させる
+ * 送信中 (inFlight) は触らない: 決着の後始末は送信側が自分で行う。
  */
 function reconcileRespondPending(): void {
-  if (phase !== 'cc-message' && phase !== 'cc-response') return
+  // ポーリングのたびに phase と respondFlow の整合も確かめる (片方だけ残る状態の検出口)
+  assertRespondFlowInvariant('poll')
+  const flow = respondFlow
+  if (!flow) return
+  if (flow.inFlight) return
   if (!claudePending) {
     log('応答対象の pending が消えたので idle に戻ります')
-    cancelCcRespond()
+    resetRespondFlow('pending-gone')
     return
   }
-  if (respondPendingId === null) {
-    // 画面に入った時点の束縛が無い (旧経路) 場合は、今の pending を対象として採用する
-    respondPendingId = claudePending.id
-    return
-  }
-  if (respondPendingId === claudePending.id) return
+  if (flow.pendingId === claudePending.id) return
   log('応答対象の pending が入れ替わったので、新しい用件の先頭から読み直します')
-  respondPendingId = claudePending.id
-  respondCursor = 0
-  respondQIdx = 0
-  respondAnswers = {}
-  recordingPurpose = 'tmux'
-  ccMsgScrollOffset = 0
-  phase = 'cc-message'
-  paintStatus()
-  void refreshG2(true)
-  updateRecordButton()
+  rebindRespondFlow(claudePending)
 }
 
 async function sendPendingResponseAndFinish(): Promise<void> {
-  if (!claudePending) return
+  const flow = respondFlow
+  if (!claudePending || !flow) return
   const sessionName = settings.sessionName
   if (!sessionName) return
   // 応答は「この用件に対する回答」であることを id で明示する。サーバ側で現在の
   // pending と食い違っていたら 409 が返るので、取り違えた回答が通ることはない。
   const pendingId = claudePending.id
-  if (respondInFlight) return   // 同じ用件への 2 通目 (再タップ) は出さない
-  respondInFlight = true
+  if (flow.inFlight) return   // 同じ用件への 2 通目 (再タップ) は出さない
+  flow.inFlight = true
+  flow.error = null
+  // 失敗したら回答を残して画面に留まる (作り直させない)。捨てるのは決着した時だけ。
+  let outcome: 'sent' | 'stale' | 'failed' = 'failed'
+  let failureMessage = ''
   try {
     if (claudePending.kind === 'permission') {
-      const decision = respondCursor === 0 ? 'allow' : 'deny'
-      await client.respondClaude(sessionName, { kind: 'permission', decision, pendingId })
+      const decision = flow.cursor === 0 ? 'allow' : 'deny'
+      await client.respondClaude(sessionName, { kind: 'permission', decision, pendingId, lang: getLanguage() })
       log(`responded permission: ${decision}`)
     } else {
       const questions = claudePending.questions ?? []
       const answers = questions.map((q, i) => {
-        const a = respondAnswers[i]
+        const a = flow.answers[i]
         if (a?.kind === 'chat-about-this') {
           return { question: q.question, answerKind: 'chat-about-this' as const }
         }
@@ -3095,35 +3355,36 @@ async function sendPendingResponseAndFinish(): Promise<void> {
         // 未回答 → 空回答 (サーバ側で弾かれる可能性あり)
         return { question: q.question, answerKind: 'predefined' as const, option: '' }
       })
-      await client.respondClaude(sessionName, { kind: 'question', answers, pendingId })
+      // lang は chat 履歴に残す回答整形文の言語 (Web UI と同じ扱いにする)
+      await client.respondClaude(sessionName, { kind: 'question', answers, pendingId, lang: getLanguage() })
       log(`responded question (${answers.length} answers)`)
     }
+    outcome = 'sent'
   } catch (e) {
     if (e instanceof PendingConflictError) {
-      // 送信中に用件が入れ替わっていた。作った回答は捨て、下の finally で idle に戻して
-      // 取り直す (新しい用件は次のポーリングでヘッダのバナーとして出る)。
+      // 送信中に用件が入れ替わっていた (サーバ側でキー注入前に打ち切られている)。
+      // 作った回答はもう行き先が無いので捨て、次のポーリングで新しい用件を取り直す。
       log('respond conflict: 応答先の用件が入れ替わっていたため回答を破棄します')
+      outcome = 'stale'
     } else {
-      log(`respond error: ${(e as Error).message}`)
+      // タイムアウト / 500 / 別理由の 409。回答は残して画面に留まり、再試行させる。
+      failureMessage = (e as Error).message
+      log(`respond error: ${failureMessage}`)
+      outcome = 'failed'
     }
   } finally {
-    respondInFlight = false
+    flow.inFlight = false
     // POST の間に画面が別の用件へ移っていた (ポーリングで入れ替わり検知 / セッション切替 /
     // ダブルタップでキャンセル) 場合、新しい回答フローの状態を壊さないよう何もしない。
     // 後始末をするのは「今も自分が答えた用件を対象にしている」時だけ。
-    if (respondPendingId === pendingId) {
-      // 楽観的に用件を消す。取り違え防止のため、消すのも自分が答えた用件の時だけ。
-      if (claudePending?.id === pendingId) claudePending = null
-      respondCursor = 0
-      respondQIdx = 0
-      respondAnswers = {}
-      respondPendingId = null
-      recordingPurpose = 'tmux'
-      ccMsgScrollOffset = 0
-      phase = 'idle'
-      paintStatus()
-      updateRecordButton()
-      void refreshG2(true)
+    if (respondFlow === flow && flow.pendingId === pendingId) {
+      if (outcome === 'failed') {
+        // 回答も cc-response 画面もそのまま残す。フッターに再試行の案内を出すだけ。
+        showRespondError(t('respondFailedRetry'))
+        void refreshG2(true)
+      } else {
+        completeRespondFlow(pendingId)
+      }
     }
     // 状態の再同期はどちらの場合も行う (新しい用件の有無をサーバに聞き直す)
     void refreshClaudeData()
@@ -3593,18 +3854,25 @@ async function boot(): Promise<void> {
         else if (phase === 'cc-message') ccMsgScrollForward()
         else if (phase === 'cc-response') moveRespondCursor(1)
       },
-      onClick: () => { void toggleRecording() },
+      onClick: () => {
+        if (respondInputBlocked()) return  // 応答 POST 中はタップも無視
+        void toggleRecording()
+      },
       // 二重クリック: 各 phase での「戻る/キャンセル」操作
       onDoubleClick: () => {
         // プラグインへの遷移待ちで固まっている場合は、まずそれを中止する。
         // (接続先が落ちていると Connecting 表示のまま戻れなくなるため)
         // 描画停止だけが残っている状態 (取り込み直前で失敗した等) も同じ口で解く。
         if (navigatingToPlugin || pluginNavBlocksG2Render) { cancelPluginNavigation(); return }
+        // 応答 POST 中は「戻る/キャンセル」も無視する。ここだけ通していたので、
+        // 送信中のダブルタップでフロー (と対象 pending の束縛) が消え、返ってきた
+        // 応答の後始末が迷子になっていた。返事が来るまで待たせる。
+        if (respondInputBlocked()) return
         if (phase === 'idle') backToRoot()
         else if (phase === 'recording') void abortRecording()  // 録音中止 (新しい文は追加しない)
         else if (phase === 'pending') discardPending()         // pending 全破棄 → idle
         else if (phase === 'cc-response') backToCcMessage()  // 選択肢画面 → 本文閲覧画面へ戻る
-        else if (phase === 'cc-message') cancelCcRespond()   // 応答キャンセル → idle へ
+        else if (phase === 'cc-message') resetRespondFlow('cancel')  // 応答キャンセル → idle へ
         else if (
           phase === 'rootlist' ||
           phase === 'unconfigured' ||

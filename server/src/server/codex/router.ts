@@ -116,23 +116,32 @@ codexRouter.post('/hooks/codex/stop', async (c) => {
   console.log('[codex-hook] stop tmux=' + tmuxName + ' transcript=' + (body.transcript_path ?? '').slice(-40));
   if (!tmuxName) return emptyHookResponse(c);
   upsertCodexSession(tmuxName, c, body);
+  // 「このフックが始まった時点で待っていた用件」を控える。以降 transcript 読みで
+  // await を挟むので、その間に新しい用件が立っていることがある。無条件に消すと、
+  // 後から出てきた用件を「終わった古い用件のつもり」で消してしまう。
+  const pendingIdAtEntry = store.getPending(tmuxName)?.id;
   const transcriptPath = body.transcript_path ?? '';
   if (transcriptPath) {
     const text = await extractLastCodexAssistantText(transcriptPath);
     if (text) store.appendChat(tmuxName, 'assistant', text, { agent: 'codex' });
   }
   store.markStopped(tmuxName);
-  store.clearPending(tmuxName);
-  store.setStatus(tmuxName, 'idle');
+  if (pendingIdAtEntry) store.clearPendingIfId(tmuxName, pendingIdAtEntry);
+  // status も同じ理屈で、新しい用件が立っていたらその waiting-* を潰さない。
+  if (!store.getPending(tmuxName)) store.setStatus(tmuxName, 'idle');
   return emptyHookResponse(c);
 });
 
 codexRouter.post('/hooks/codex/post-tool-use', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as CodexHookPayload;
+  // pending の控えは tmux 名が分かった直後 (= このハンドラで最初に用件を観測できる
+  // 時点) に取る。getOwnedTmuxName / upsert より後の処理で用件が入れ替わっても、
+  // 消すのは「自分が始まった時に待っていた用件」だけにする。
   const tmuxName = await getOwnedTmuxName(c);
   if (!tmuxName) return emptyHookResponse(c);
+  const pendingIdAtEntry = store.getPending(tmuxName)?.id;
   upsertCodexSession(tmuxName, c, body);
-  store.clearPending(tmuxName);
+  if (pendingIdAtEntry) store.clearPendingIfId(tmuxName, pendingIdAtEntry);
   return emptyHookResponse(c);
 });
 

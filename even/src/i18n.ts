@@ -59,7 +59,11 @@ const STRINGS = {
   ccMsgTruncated:      { en: '… (showing {shown} of {total} chars)',
                          ja: '… (全{total}文字中{shown}文字まで表示)' },
   submitOption:        { en: '> Submit',                        ja: '> Submit (確定)' },
+  // 複数選択で 1 つも選ばれていない時、Submit 行に添える注意書き (押しても確定しない)
+  submitNeedsPick:     { en: '(pick at least one)',             ja: '(1つ以上選択)' },
   voiceInputBadge:     { en: '(voice input)',                   ja: '(音声入力)' },
+  // 応答の送信に失敗した時にフッターへ出す一時的な案内。回答は残したままなので再試行できる
+  respondFailedRetry:  { en: 'Send failed — tap to retry',      ja: '送信に失敗 (タップで再試行)' },
 
   // ─── New Agent session detection ────────────────────────────
   newClaudeDetecting:  { en: '(detecting…)',                    ja: '(検出中…)' },

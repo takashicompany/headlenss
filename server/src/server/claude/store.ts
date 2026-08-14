@@ -157,20 +157,31 @@ export function clearPendingIfId(tmuxName: string, pendingId: string): boolean {
   return true;
 }
 
-// 応答処理中の pending id。同じ用件への 2 件目の応答 (再タップ / 複数クライアント) を
-// 弾くために持つ。pending id は UUID なので tmux セッションを跨いでも衝突しない。
-const respondingPendingIds = new Set<string>();
+// 応答処理中の tmux セッション名。
+//
+// なぜ「用件 (pending id) 単位」ではなく「tmux セッション単位」か:
+// 応答処理が実際に触る資源は用件ではなく「その tmux の TUI」で、キー注入は
+// 前後関係のある一連の操作 (Down x N → Enter → …) になっている。用件単位で
+// 排他すると、注入の途中で用件が入れ替わった直後に別 id の応答が並走でき、
+// 2 本ぶんの矢印と Enter が同じ TUI に混ざって選択が壊れる。同じ tmux への
+// 応答処理は常に 1 本だけ通す。
+const respondingTmuxNames = new Set<string>();
 
-/** 応答処理の開始を宣言する (原子的 claim)。既に同じ用件を処理中なら false。 */
-export function claimPendingForRespond(pendingId: string): boolean {
-  if (respondingPendingIds.has(pendingId)) return false;
-  respondingPendingIds.add(pendingId);
+/** 応答処理の開始を宣言する (原子的な try-lock)。既にその tmux を処理中なら false。 */
+export function acquireRespondLock(tmuxName: string): boolean {
+  if (respondingTmuxNames.has(tmuxName)) return false;
+  respondingTmuxNames.add(tmuxName);
   return true;
 }
 
-/** claimPendingForRespond の解放。応答処理の finally で必ず呼ぶ。 */
-export function releasePendingForRespond(pendingId: string): void {
-  respondingPendingIds.delete(pendingId);
+/** acquireRespondLock の解放。応答処理の finally で必ず呼ぶ。 */
+export function releaseRespondLock(tmuxName: string): void {
+  respondingTmuxNames.delete(tmuxName);
+}
+
+/** テスト/診断用: その tmux が応答処理中か。 */
+export function isRespondLocked(tmuxName: string): boolean {
+  return respondingTmuxNames.has(tmuxName);
 }
 
 /**

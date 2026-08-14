@@ -4,18 +4,20 @@ import { claudeRouter } from './claude/router.ts';
 import * as store from './claude/store.ts';
 
 const NAME = 'respond-test';
+const OTHER = 'respond-test-other';
 
 /** pending を 1 件持つセッションを用意し、その pending id を返す。 */
-function setupPending(): string {
-  store.removeSession(NAME);
+function setupPending(name = NAME): string {
+  store.removeSession(name);
+  store.releaseRespondLock(name);
   store.upsertSession({
     ccSessionId: 'cc-1',
     tmuxPane: '%1',
-    tmuxSessionName: NAME,
+    tmuxSessionName: name,
     cwd: '/tmp',
     source: 'claude',
   });
-  return store.createPending(NAME, {
+  return store.createPending(name, {
     kind: 'permission',
     hookEvent: 'PreToolUse',
     toolName: 'Bash',
@@ -23,8 +25,8 @@ function setupPending(): string {
   }).id;
 }
 
-async function respond(body: unknown): Promise<Response> {
-  return await claudeRouter.request(`/claude/sessions/${NAME}/respond`, {
+async function respond(body: unknown, name = NAME): Promise<Response> {
+  return await claudeRouter.request(`/claude/sessions/${name}/respond`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -43,21 +45,70 @@ test('pendingId が現在の pending と違う応答は 409 で弾く', async ()
   store.removeSession(NAME);
 });
 
-test('同じ用件を処理中に来た 2 件目は already_processing で弾く', async () => {
+test('同じ tmux を処理中に来た 2 件目は already_processing で弾く', async () => {
   const id = setupPending();
   // 1 件目が「応答処理中」の状態を作る。実際の処理は tmux へのキー注入などで
-  // 数百 ms 掛かるが、claim は最初の await より前に立つので、この状態と等価。
-  assert.equal(store.claimPendingForRespond(id), true);
+  // 数百 ms 掛かるが、mutex はボディ読み取り直後に立つので、この状態と等価。
+  assert.equal(store.acquireRespondLock(NAME), true);
   const res = await respond({ kind: 'permission', decision: 'allow', pendingId: id });
   assert.equal(res.status, 409);
   const json = (await res.json()) as { code: string; currentPendingId: string };
   assert.equal(json.code, 'already_processing');
   assert.equal(json.currentPendingId, id);
-  // 1 件目が終われば claim は解放され、次の応答は弾かれない
-  store.releasePendingForRespond(id);
+  // 1 件目が終われば mutex は解放され、次の応答は弾かれない
+  store.releaseRespondLock(NAME);
   const after = await respond({ kind: 'permission', decision: 'allow', pendingId: id });
   const afterJson = (await after.json()) as { code?: string };
   assert.notEqual(afterJson.code, 'already_processing');
+  store.removeSession(NAME);
+});
+
+test('処理中の tmux へは「別の用件」への応答も弾く (キー注入が混ざらない)', async () => {
+  setupPending();
+  // 1 本目がキー注入している最中に用件が入れ替わり、新しい用件への応答が飛んできた状況。
+  // 用件 id 単位の排他だと id が違うので素通りし、同じ TUI に 2 本ぶんの矢印と Enter が
+  // 混ざる。tmux 単位の mutex なら、用件が違っても 2 本目は通さない。
+  assert.equal(store.acquireRespondLock(NAME), true);
+  const next = store.createPending(NAME, {
+    kind: 'permission',
+    hookEvent: 'PreToolUse',
+    toolName: 'Write',
+    toolInput: { file_path: '/tmp/x' },
+  });
+  const res = await respond({ kind: 'permission', decision: 'allow', pendingId: next.id });
+  assert.equal(res.status, 409);
+  const json = (await res.json()) as { code: string; currentPendingId: string };
+  assert.equal(json.code, 'already_processing');
+  // 「今どの用件を待っているか」はクライアントの取り直しに使うので返す
+  assert.equal(json.currentPendingId, next.id);
+  store.releaseRespondLock(NAME);
+  store.removeSession(NAME);
+});
+
+test('mutex は tmux 単位なので、別セッションの応答は同時に処理できる', async () => {
+  const id = setupPending();
+  const otherId = setupPending(OTHER);
+  assert.equal(store.acquireRespondLock(NAME), true);
+  // 別 tmux は別の TUI なので待たせる理由が無い
+  assert.equal(store.isRespondLocked(OTHER), false);
+  const res = await respond({ kind: 'permission', decision: 'allow', pendingId: otherId }, OTHER);
+  const json = (await res.json()) as { code?: string };
+  assert.notEqual(json.code, 'already_processing');
+  assert.equal(store.isRespondLocked(NAME), true);
+  store.releaseRespondLock(NAME);
+  assert.equal(id.length > 0, true);
+  store.removeSession(NAME);
+  store.removeSession(OTHER);
+});
+
+test('弾かれた 2 件目は mutex を横取り解放しない', async () => {
+  const id = setupPending();
+  assert.equal(store.acquireRespondLock(NAME), true);
+  const res = await respond({ kind: 'permission', decision: 'allow', pendingId: id });
+  assert.equal(res.status, 409);
+  // 2 件目の finally が動いてしまうと、まだ処理中の 1 件目のロックが外れる
+  assert.equal(store.isRespondLocked(NAME), true);
+  store.releaseRespondLock(NAME);
   store.removeSession(NAME);
 });
 
@@ -116,9 +167,8 @@ test('ボディ読み取り中に用件が入れ替わったら、読み取り�
   // 差し替え後の用件が判定基準になっていること
   assert.notEqual(nextId, '');
   assert.equal(json.currentPendingId, nextId);
-  // 弾かれた応答は claim を握ったままにしない
-  assert.equal(store.claimPendingForRespond(nextId), true);
-  store.releasePendingForRespond(nextId);
+  // 弾かれた応答は mutex を握ったままにしない
+  assert.equal(store.isRespondLocked(NAME), false);
   store.removeSession(NAME);
 });
 
@@ -133,8 +183,71 @@ test('pendingId が一致する / 送ってこない応答は不一致では弾�
     // hook の待ち受け (resolver) が無いテスト環境なので解決自体は失敗するが、
     // 少なくとも「不一致」では弾かれずに応答処理まで進んでいることを確認する。
     assert.notEqual(json.error, 'pending mismatch');
-    // 前の応答の claim が解放されずに残っていないこと (2 周目も処理まで進める)
+    // 前の応答の mutex が解放されずに残っていないこと (2 周目も処理まで進める)
     assert.notEqual(json.code, 'already_processing');
   }
+  assert.equal(store.isRespondLocked(NAME), false);
+  store.removeSession(NAME);
+});
+
+test('複数選択で 1 つも選ばれていない回答は 400 で弾く (キー注入前)', async () => {
+  store.removeSession(NAME);
+  store.releaseRespondLock(NAME);
+  store.upsertSession({
+    ccSessionId: 'cc-1',
+    tmuxPane: '%1',
+    tmuxSessionName: NAME,
+    cwd: '/tmp',
+    source: 'claude',
+  });
+  const pending = store.createPending(NAME, {
+    kind: 'question',
+    hookEvent: 'PreToolUse',
+    toolName: 'AskUserQuestion',
+    toolInput: {},
+    questions: [
+      { question: 'pick some', multiSelect: true, options: [{ label: 'A' }, { label: 'B' }] },
+    ],
+  });
+  const res = await respond({
+    kind: 'question',
+    pendingId: pending.id,
+    answers: [{ question: 'pick some', answerKind: 'predefined', options: [] }],
+  });
+  assert.equal(res.status, 400);
+  const json = (await res.json()) as { code: string; index: number };
+  assert.equal(json.code, 'empty_multi_select');
+  assert.equal(json.index, 0);
+  // 弾いた時点で用件は残したまま (答え直させる) / mutex も解放されている
+  assert.equal(store.getPending(NAME)?.id, pending.id);
+  assert.equal(store.isRespondLocked(NAME), false);
+  store.removeSession(NAME);
+});
+
+test('複数選択でも 1 件以上選ばれていれば検証は通る', async () => {
+  store.removeSession(NAME);
+  store.upsertSession({
+    ccSessionId: 'cc-1',
+    tmuxPane: '%1',
+    tmuxSessionName: NAME,
+    cwd: '/tmp',
+    source: 'claude',
+  });
+  const pending = store.createPending(NAME, {
+    kind: 'question',
+    hookEvent: 'PreToolUse',
+    toolName: 'AskUserQuestion',
+    toolInput: {},
+    questions: [
+      { question: 'pick some', multiSelect: true, options: [{ label: 'A' }, { label: 'B' }] },
+    ],
+  });
+  const res = await respond({
+    kind: 'question',
+    pendingId: pending.id,
+    answers: [{ question: 'pick some', answerKind: 'predefined', options: ['A'] }],
+  });
+  // tmux が無い環境ではキー注入で 500 になるが、少なくとも検証では弾かれない
+  assert.notEqual(res.status, 400);
   store.removeSession(NAME);
 });

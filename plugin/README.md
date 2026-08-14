@@ -44,8 +44,12 @@ node /path/to/headlenss/plugin/skills/install.mjs
 
 - シンボリックリンクではなくコピーなので、リポジトリを移動・削除しても壊れない。
   更新は `git pull` 後にもう一度実行するだけ (冪等。中身が同じなら何もしない)。
-- 同名スキルが既にあり、それが headlenss 由来でない場合は `<dir>.bak.<timestamp>` に退避してから上書きする。
-- スキル本文のサーバ URL は `HEADLENSS_SERVER_URL=http://<host>:3000` を付けて実行すると差し替わる。
+- 同名スキルが既にあり、それが headlenss 由来でない場合は `~/.claude/skills-backup/<name>.bak.<timestamp>/`
+  に退避してから上書きする。退避したものは uninstall しても自動では戻らない (必要なら手で
+  `~/.claude/skills/<name>/` へ戻す)。
+- `HEADLENSS_SERVER_URL=http://<host>:3000` を付けて実行すると、`headlenss-new-session` スキル本文の
+  API URL がそのホストに差し替わる。他のスキル (`headlenss-dev-server` / `headlenss-g2-plugin`) は
+  headlenss と同じマシンで実行する手順書なので、本文のループバック URL はそのまま残す。
 
 外すとき:
 

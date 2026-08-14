@@ -162,7 +162,7 @@ npm run skills:install   # copies plugin/skills/* into ~/.claude/skills/
 ```
 
 - Copies (not symlinks), so the skills keep working even if you move the repo. Re-run it after `git pull` to update; remove with `npm run skills:uninstall`.
-- If your server is not `http://127.0.0.1:3000`: `HEADLENSS_SERVER_URL=http://<host>:3000 npm run skills:install`.
+- If your server is not `http://127.0.0.1:3000`: `HEADLENSS_SERVER_URL=http://<host>:3000 npm run skills:install`. This only rewrites the `headlenss-new-session` skill (the other skills assume they run on the machine hosting headlenss, so their loopback URLs are kept as-is).
 
 ### 5. (Optional) Install the G2 app on your smartphone
 
