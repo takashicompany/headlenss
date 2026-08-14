@@ -14,6 +14,7 @@ import {
   MAIN_INNER_WIDTH,
   markPageAlreadyBuilt,
   resetPageState,
+  setRendererExclusiveSender,
   setRendererLog,
   showScreen,
   updateContent,
@@ -29,6 +30,7 @@ import {
 import { fetchTargetHtml, isProxyInjected, performTakeover } from './plugin-takeover'
 import {
   HeadlenssClient,
+  PendingConflictError,
   type AgentSource,
   type ChatItem,
   type ClaudeSessionInfo,
@@ -242,6 +244,10 @@ let recordingLinesCache: string[] = []
 let recordingLinesCacheKey = ''
 let scrollAnimPending = 0  // アニメーションでまだ消化していない残り行数。正=back, 負=forward
 let scrollAnimTimer: ReturnType<typeof setTimeout> | null = null
+// スクロールアニメの実行中フラグ。開始〜終了 (中断含む) を通して true。
+// なぜ: tick は sendContentDirect の前に scrollAnimTimer を null に戻すため、
+// タイマーの有無で「アニメ中か」を判定すると full render の延期が一度も効かない。
+let scrollAnimActive = false
 // rootlist 内のカーソルが指す行のキー (index ではなくキーで追跡し、一覧が入れ替わっても位置を保つ)
 let rootCursorKey: string | null = null
 let rootListStart = 0 // rootlist 表示窓の先頭 index。カーソル追従方式で cursor が窓外に出た時だけスライドする
@@ -306,6 +312,10 @@ function abortInFlightRefresh(): void {
 }
 let respondCursor = 0                            // cc-response 画面のカーソル位置(現在質問の行 index)
 let respondQIdx = 0                              // 複数質問時、現在表示中の質問 index
+// 応答画面 (cc-message / cc-response) が対象にしている pending の id。
+// なぜ: 画面を開いている間もポーリングは走り続けるので、用件が入れ替わった (別の承認/質問に
+// なった) ことに気付かないと、古い画面で作った回答を新しい用件へ送ってしまう。
+let respondPendingId: string | null = null
 // AskUserQuestion 回答ビルド用: 各質問について構築中の回答を保持
 type RespondAnswer =
   | { kind: 'predefined'; option?: string; options?: string[] }   // single or multi
@@ -664,34 +674,55 @@ function buildRootListView(): string {
  * 本文が長いほど重くなるため。recordingLines と同じキャッシュ方式)。
  */
 function ccMessageLines(): string[] {
-  if (!claudePending) {
+  const pending = claudePending
+  if (!pending) {
     ccMsgLinesCache = []
     ccMsgLinesCacheKey = ''
     return ccMsgLinesCache
   }
+  // 指紋は「本文を作る前に分かるもの」だけで構成する。pending は id が同じなら中身も
+  // 同じなので、id + 種類 + 質問 index で一意に決まる (言語は省略表示行の文言に効く)。
+  // なぜ本文を含めないか: 本文の構築 (summarizeToolInput の JSON 整形と slice) 自体が
+  // 重く、キーに含めるとポーリングのたびに必ず実行されてキャッシュの意味が無い。
+  const key = `${pending.id}#${pending.kind}#${respondQIdx}#${getLanguage()}`
+  if (key === ccMsgLinesCacheKey) return ccMsgLinesCache
+
   // 段落 (折り返し前) の配列。空文字は空行として扱う。
   // 質問番号 / multi バッジ / ツール名といったメタ情報はヘッダ (buildG2Header) が
   // 受け持つので、ここは本題だけを載せる (7 行しかない窓を無駄遣いしない)。
   const paras: string[] = []
-  if (claudePending.kind === 'permission') {
+  let fullLength = 0   // 切り詰め前の文字数 (0 = 切り詰めていない)
+  if (pending.kind === 'permission') {
     // 選択肢画面と違いここは切り詰めない (全文を読ませるのがこの画面の役目)。
     // 巨大な toolInput で描画が固まらないよう文字数だけ上限を掛ける。
-    const summary = summarizeToolInput(claudePending.toolInput).slice(0, CC_MSG_MAX_CHARS)
+    const full = summarizeToolInput(pending.toolInput)
+    const summary = full.slice(0, CC_MSG_MAX_CHARS)
     if (summary) paras.push(summary)
+    if (full.length > summary.length) fullLength = full.length
   } else {
-    const q = claudePending.questions?.[respondQIdx]
-    if (!q) return []
+    const q = pending.questions?.[respondQIdx]
+    if (!q) {
+      ccMsgLinesCache = []
+      ccMsgLinesCacheKey = ''
+      return ccMsgLinesCache
+    }
     // header は AskUserQuestion が付ける短い見出し (無い場合もある)
     if (q.header) {
       paras.push(q.header)
       paras.push('')
     }
     paras.push(q.question.slice(0, CC_MSG_MAX_CHARS))
+    if (q.question.length > CC_MSG_MAX_CHARS) fullLength = q.question.length
   }
-
-  // 指紋: 同じ pending / 同じ質問 / 同じ本文なら折り返しをまるごと省く
-  const key = `${claudePending.id}#${respondQIdx}#${paras.join('\n')}`
-  if (key === ccMsgLinesCacheKey) return ccMsgLinesCache
+  // 切り詰めたことを黙っていると「読み切った」と誤解されるので末尾に明示する
+  if (fullLength > 0) {
+    paras.push('')
+    paras.push(
+      t('ccMsgTruncated')
+        .replace('{shown}', String(CC_MSG_MAX_CHARS))
+        .replace('{total}', String(fullLength)),
+    )
+  }
 
   const out: string[] = []
   for (const para of paras) {
@@ -748,11 +779,13 @@ function buildCcResponseView(): string {
   let cursorLineIdx = -1
   let firstCursorLineIdx = -1
   if (claudePending.kind === 'permission') {
-    lines.push(t('approveTool').replace('{name}', claudePending.toolName))
-    lines.push('')
+    // ツール名はヘッダ (buildG2Header) に出しているので本文では繰り返さない。
+    // 7 行しかない窓を選択肢と要約に使い切るため。
     const summary = summarizeToolInput(claudePending.toolInput).slice(0, CHAT_WRAP_WIDTH * 3)
-    if (summary) lines.push(summary)
-    lines.push('')
+    if (summary) {
+      lines.push(summary)
+      lines.push('')
+    }
     const opts = ['Allow', 'Deny']
     for (let i = 0; i < opts.length; i++) {
       if (i === 0) firstCursorLineIdx = lines.length
@@ -767,10 +800,10 @@ function buildCcResponseView(): string {
   if (totalQ === 0) return '(question is empty)'
   const q = questions[respondQIdx]
   if (!q) return '(question is empty)'
-  // ヘッダ: 質問番号と質問本文
-  const head = totalQ > 1 ? `? (${respondQIdx + 1}/${totalQ}) ` : '? '
-  const multiBadge = q.multiSelect ? t('multiBadge') : ''
-  lines.push(head + q.question.slice(0, CHAT_WRAP_WIDTH - 12) + multiBadge)
+  // 1 行目は質問文の抜粋だけ。質問番号 (i/n) と [複数] バッジはヘッダ側で出しているので
+  // ここでは付けない (同じ情報を 2 か所に出すと、狭い窓がさらに削られる)。
+  // 抜粋の長さは従来と同じ幅予算 (1 行に収まる長さ) を維持する。
+  lines.push(q.question.slice(0, CHAT_WRAP_WIDTH - 12))
   lines.push('')
   // 行構成: predefined options → (multi のみ) Submit → Type something → Chat about this
   const opts = q.options ?? []
@@ -990,6 +1023,12 @@ function lensWindow(text: string, n: number): string {
  * 表示はここで作る (言語設定に追従させるため)。ドットのアニメーションは再現しない。
  */
 function chatStatusLine(): string | null {
+  // 回答待ちが実在する間は、その告知をヘッダのバナー (buildG2Header) に一本化する。
+  // 本文末尾にも出すと、同じことをスクロールしても消えないヘッダと本文の 2 か所で
+  // 言うことになり、狭い窓が 1 行無駄になる。busy (考え中) は従来どおり本文に出す。
+  if (claudePending && (claudeChatStatus === 'waiting-permission' || claudeChatStatus === 'waiting-question')) {
+    return null
+  }
   switch (claudeChatStatus) {
     case 'busy':               return t('chatStatusThinking')
     case 'waiting-permission': return t('chatStatusWaitPerm')
@@ -1057,7 +1096,7 @@ function startScrollAnimation(): void {
   }
   const tick = async (): Promise<void> => {
     scrollAnimTimer = null
-    if (phase !== 'idle') { scrollAnimPending = 0; flushDeferredRender(); return }
+    if (phase !== 'idle') { scrollAnimPending = 0; scrollAnimActive = false; flushDeferredRender(); return }
     let changed = false
     if (scrollAnimPending > 0) {
       const max = maxChatScrollOffset()
@@ -1074,9 +1113,11 @@ function startScrollAnimation(): void {
       scrollAnimTimer = setTimeout(() => { void tick() }, scrollAnimTickMs())
     } else {
       // アニメーション終了 — 延期された full render があれば発火する
+      scrollAnimActive = false
       flushDeferredRender()
     }
   }
+  scrollAnimActive = true
   scrollAnimTimer = setTimeout(() => { void tick() }, scrollAnimTickMs())
 }
 
@@ -1224,6 +1265,31 @@ let g2ContentQueued: string | null = null     // content-only の待機枠 (late
 /** scroll アニメ中に full render を延期できる上限 (ms)。超えたら安全弁として実行する。 */
 const G2_RENDER_DEFER_MAX_MS = 2000
 
+// プラグイン遷移中はレンズを headlenss の内容で塗り替えない。
+// なぜ: openG2Plugin は「接続中」を出してから遷移するが、その間もポーリング
+// (reloadClaudeSessions / reloadSessions / refreshClaudeData) は完了ごとに
+// refreshG2(true) を要求してくるので、放っておくと接続中表示が一覧で上書きされる。
+// 遷移をキャンセルした時 (ダブルタップ) だけ解除する。取り込み (performTakeover) や
+// トップレベル遷移まで進んだ場合は、以降 headlenss の画面を出す理由が無いので立てたまま。
+let pluginNavBlocksG2Render = false
+
+/** 最後に実際にレンズへ送信した時刻 (performance.now)。低頻度の強制再同期の基準。 */
+let g2LastSentAt = performance.now()
+/** 無変更スキップで取りこぼしたフレームを自己修復するための強制再同期間隔 (ms)。 */
+const G2_FORCED_RESYNC_MS = 15000
+
+/**
+ * 「変化が無くても 1 回描き直すべきか」。
+ * なぜ: 無変更スキップを入れたことで、1.5 秒ごとの無条件再送という自己修復が消えた。
+ * ホスト側がフレームを取りこぼすとレンズが古いまま永久に直らないので、送信が
+ * 途絶えて G2_FORCED_RESYNC_MS 経ったら dedup 基準を捨てて 1 回だけ通す。
+ */
+function isForcedResyncDue(): boolean {
+  // そもそも送れない状況 (ブリッジ無し / プラグイン遷移中) では起点も進まないので数えない
+  if (!bridge || pluginNavBlocksG2Render) return false
+  return performance.now() - g2LastSentAt >= G2_FORCED_RESYNC_MS
+}
+
 // 直近でレンズへ送った (= 送信を予約した) 各コンテナの内容。同一なら送らない。
 // ポーリング由来の再描画要求も、この 3 つと突き合わせて変化が無ければ丸ごと捨てる
 // (g2WouldChange 参照)。dedup の基準はここ 1 箇所だけに持つ。
@@ -1245,8 +1311,9 @@ function invalidateG2Dedup(): void {
  * G2_RENDER_DEFER_MAX_MS の安全弁を持つ。
  */
 function isFullRenderDeferred(now: number): boolean {
-  // speed-0 パスは timer を使わないので scrollAnimTimer === null → 延期しない
-  if (scrollAnimTimer === null) {
+  // 判定はタイマーではなく明示フラグで行う (tick が送信前にタイマーを null に戻すため)。
+  // speed-0 パスはアニメを回さないのでフラグが立たない → 延期しない。
+  if (!scrollAnimActive) {
     g2RenderDeferredAt = null
     return false
   }
@@ -1297,6 +1364,7 @@ async function pumpG2Sends(): Promise<void> {
       g2ContentQueued = null
       try {
         await updateContent(content)
+        g2LastSentAt = performance.now()
       } catch (err) {
         // ブリッジ側のタイムアウト/失敗。送れていない内容を送信済みにしない
         if (g2ContentLastSent === content) g2ContentLastSent = null
@@ -1318,6 +1386,11 @@ async function pumpG2Sends(): Promise<void> {
 async function refreshG2(force = false): Promise<void> {
   if (!bridge) {
     console.log('[refreshG2] bailed: no bridge')
+    return
+  }
+  if (pluginNavBlocksG2Render) {
+    // プラグイン遷移中。ここで弾かないとポーリング由来の再描画が「接続中」を上書きする
+    console.log('[refreshG2] bailed: plugin navigation in progress')
     return
   }
   const now = performance.now()
@@ -1351,6 +1424,7 @@ async function executeFullRender(force: boolean): Promise<void> {
     await updateHeader(header)
     await updateContent(content)
     await updateFooter(footer)
+    g2LastSentAt = performance.now()  // 強制再同期の起点 (実際に送れた時だけ更新する)
   } catch (err) {
     invalidateG2Dedup()
     log(`G2 refresh error: ${err}`)
@@ -1391,6 +1465,7 @@ async function sendShowScreen(header: string, content: string, footer: string): 
     g2FooterLastSent = footer
     try {
       await showScreen(header, content, footer)
+      g2LastSentAt = performance.now()
     } catch (err) {
       invalidateG2Dedup()
       throw err
@@ -1612,6 +1687,8 @@ async function refreshClaudeData(): Promise<void> {
     claudeChat = chat
     claudeChatLoading = false
     claudePending = pending
+    // 応答画面を開いている間に、対象の用件そのものが入れ替わっていないかを突き合わせる
+    reconcileRespondPending()
     if (chat.length > 0) {
       const lastUser = [...chat].reverse().find((c) => c.role === 'user')?.text ?? ''
       const lastAssistant = [...chat].reverse().find((c) => c.role === 'assistant')?.text ?? ''
@@ -1632,7 +1709,14 @@ async function refreshClaudeData(): Promise<void> {
       // ポーリング由来の再描画は「表示が変わる時だけ」。変わらないのに 1.5 秒ごとに
       // 全面送信 (3 フレーム) を掛け続けると、レンズ側の消化が追いつかない環境では
       // それだけで滞留が育つ (g2WouldChange 参照)。
-      if (g2WouldChange()) void refreshG2(true)
+      // ただし送信が途絶えて久しい場合は、取りこぼし対策として dedup を捨てて 1 回通す。
+      if (isForcedResyncDue()) {
+        console.log('[refreshG2] forced resync: no send for a while')
+        invalidateG2Dedup()
+        void refreshG2(true)
+      } else if (g2WouldChange()) {
+        void refreshG2(true)
+      }
       // chat を実際に取得して描画している = ユーザは見ている前提なので既読化
       markAsRead(targetSession)
     }
@@ -1753,6 +1837,8 @@ function stopAllBackgroundWork(): void {
   }
   probeDebounceTimer = null
   scrollAnimTimer = null
+  scrollAnimPending = 0
+  scrollAnimActive = false  // タイマーを止めた = アニメも終わり。延期判定を残さない
   lastReadPersistTimer = null
   obProbeTimer = null
   toastHideTimer = null
@@ -2424,6 +2510,8 @@ async function toggleRecording(): Promise<void> {
       respondCursor = 0
       respondQIdx = 0
       respondAnswers = {}
+      // どの用件に答えているかをここで束縛する (以降ポーリングで突き合わせる)
+      respondPendingId = claudePending.id
       recordingPurpose = 'tmux'
       ccMsgScrollOffset = 0
       phase = 'cc-message'
@@ -2478,6 +2566,10 @@ function openG2Plugin(plugin: G2PluginInfo): void {
   const url = plugin.url
   if (!url) return
   navigatingToPlugin = true
+  // 「接続中」を出した後、遷移が完了するまでポーリング由来の再描画で上書きされないよう
+  // レンズ描画を止める。取り込み経路 (performTakeover) / トップレベル遷移 (location.assign)
+  // のどちらに進んでも解除しない (キャンセル時のみ解除する)。
+  pluginNavBlocksG2Render = true
   pluginNavAbort = new AbortController()
   log(`plugin を開きます: ${plugin.name} -> ${url}`)
   void (async () => {
@@ -2536,6 +2628,8 @@ function openG2Plugin(plugin: G2PluginInfo): void {
 function cancelPluginNavigation(): void {
   if (!navigatingToPlugin) return
   navigatingToPlugin = false
+  // 遷移しないのでレンズは headlenss のもの。描画停止を解除する (この後の refreshG2 用)
+  pluginNavBlocksG2Render = false
   log('plugin を開くのを中止しました')
   // 取り込み用 fetch と、保留中のトップレベル遷移の両方を止める
   pluginNavAbort?.abort()
@@ -2577,6 +2671,7 @@ function openSelectedFromRoot(): void {
   claudeChatLoading = true
   currentAgentSource = sel.source
   claudePending = null
+  respondPendingId = null
   resetScroll()
   phase = 'idle'
   paintStatus()
@@ -2675,8 +2770,42 @@ function cancelCcRespond(): void {
   respondCursor = 0
   respondQIdx = 0
   respondAnswers = {}
+  respondPendingId = null
   recordingPurpose = 'tmux'
   ccMsgScrollOffset = 0
+  paintStatus()
+  void refreshG2(true)
+  updateRecordButton()
+}
+
+/**
+ * ポーリング結果と応答画面の突き合わせ。cc-message / cc-response を開いている間に
+ * 対象の pending が消えた / 別物に入れ替わった場合の始末をする。
+ * なぜ: 気付かずに操作を続けると、古い用件のつもりで作った回答が別の用件に送られる。
+ *   - 消えた (別経路で承認済み等) → 構築中の回答を捨てて idle へ戻す
+ *   - id が変わった → 回答を捨て、新しい用件の本文 (cc-message) の先頭から読み直させる
+ */
+function reconcileRespondPending(): void {
+  if (phase !== 'cc-message' && phase !== 'cc-response') return
+  if (!claudePending) {
+    log('応答対象の pending が消えたので idle に戻ります')
+    cancelCcRespond()
+    return
+  }
+  if (respondPendingId === null) {
+    // 画面に入った時点の束縛が無い (旧経路) 場合は、今の pending を対象として採用する
+    respondPendingId = claudePending.id
+    return
+  }
+  if (respondPendingId === claudePending.id) return
+  log('応答対象の pending が入れ替わったので、新しい用件の先頭から読み直します')
+  respondPendingId = claudePending.id
+  respondCursor = 0
+  respondQIdx = 0
+  respondAnswers = {}
+  recordingPurpose = 'tmux'
+  ccMsgScrollOffset = 0
+  phase = 'cc-message'
   paintStatus()
   void refreshG2(true)
   updateRecordButton()
@@ -2686,10 +2815,13 @@ async function sendPendingResponseAndFinish(): Promise<void> {
   if (!claudePending) return
   const sessionName = settings.sessionName
   if (!sessionName) return
+  // 応答は「この用件に対する回答」であることを id で明示する。サーバ側で現在の
+  // pending と食い違っていたら 409 が返るので、取り違えた回答が通ることはない。
+  const pendingId = claudePending.id
   try {
     if (claudePending.kind === 'permission') {
       const decision = respondCursor === 0 ? 'allow' : 'deny'
-      await client.respondClaude(sessionName, { kind: 'permission', decision })
+      await client.respondClaude(sessionName, { kind: 'permission', decision, pendingId })
       log(`responded permission: ${decision}`)
     } else {
       const questions = claudePending.questions ?? []
@@ -2710,16 +2842,23 @@ async function sendPendingResponseAndFinish(): Promise<void> {
         // 未回答 → 空回答 (サーバ側で弾かれる可能性あり)
         return { question: q.question, answerKind: 'predefined' as const, option: '' }
       })
-      await client.respondClaude(sessionName, { kind: 'question', answers })
+      await client.respondClaude(sessionName, { kind: 'question', answers, pendingId })
       log(`responded question (${answers.length} answers)`)
     }
   } catch (e) {
-    log(`respond error: ${(e as Error).message}`)
+    if (e instanceof PendingConflictError) {
+      // 送信中に用件が入れ替わっていた。作った回答は捨て、下の finally で idle に戻して
+      // 取り直す (新しい用件は次のポーリングでヘッダのバナーとして出る)。
+      log('respond conflict: 応答先の用件が入れ替わっていたため回答を破棄します')
+    } else {
+      log(`respond error: ${(e as Error).message}`)
+    }
   } finally {
     claudePending = null
     respondCursor = 0
     respondQIdx = 0
     respondAnswers = {}
+    respondPendingId = null
     recordingPurpose = 'tmux'
     ccMsgScrollOffset = 0
     phase = 'idle'
@@ -3154,6 +3293,8 @@ async function boot(): Promise<void> {
   // 2. G2画面初期化
   if (bridge) {
     initRenderer(bridge)
+    // renderer 内から出る例外的な送信 (復帰後ガード再描画) も、この 1 本の直列路を通す
+    setRendererExclusiveSender(runExclusiveG2Send)
     setEventHandlers({
       // rootlist: 上下=カーソル / click=open / dbl=OS終了
       // pending:  上=送信 / 下=テキスト削除 / dbl=破棄して idle へ

@@ -9,8 +9,12 @@
 // インストールしたディレクトリには .headlenss-skill.json (マーカー) を置く。
 // uninstall.mjs はこのマーカーがあるものだけを消すので、同名の自作スキルは巻き込まない。
 //
-// スキル本文に書かれたサーバ URL は HEADLENSS_SERVER_URL で差し替えられる。
+// スキル本文に書かれた headlenss サーバの API ベース URL は HEADLENSS_SERVER_URL で
+// 差し替えられる。
 //   例: HEADLENSS_SERVER_URL=http://my-pc:3000 node plugin/skills/install.mjs
+// 差し替えるのは「API のベースとして使われている箇所」(直後に /api が続くもの) だけ。
+// tailscale serve のバックエンド指定のように、ループバックのまま残さないと壊れる記述が
+// 本文にあるため、URL 文字列を無差別に置換しない。
 
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -25,14 +29,36 @@ const backupRoot = resolve(homedir(), '.claude', 'skills-backup');
 
 const MARKER_NAME = '.headlenss-skill.json';
 const DEFAULT_BASES = ['http://127.0.0.1:3000', 'http://localhost:3000'];
-const serverUrl = (process.env.HEADLENSS_SERVER_URL || '').replace(/\/+$/, '');
+// API ベースとしての使用箇所 (直後に /api が続くもの) だけを差し替える。
+// 例: http://127.0.0.1:3000/api/health -> <HEADLENSS_SERVER_URL>/api/health
+//     sudo tailscale serve --https=443 --bg http://127.0.0.1:3000  (← 置換しない)
+const API_BASE_RE = /http:\/\/(?:127\.0\.0\.1|localhost):3000(?=\/api\b)/g;
+// 置換してはいけない行の目印 (tailscale のバックエンドは必ずループバック)。
+const LOOPBACK_ONLY_HINTS = ['tailscale serve', '/ proxy '];
+
+const rawServerUrl = (process.env.HEADLENSS_SERVER_URL || '').replace(/\/+$/, '');
+// 既定値と同じ URL を渡された場合は置換不要 (下の検証も誤検知するのでここで落とす)。
+const serverUrl = DEFAULT_BASES.includes(rawServerUrl) ? '' : rawServerUrl;
 
 // SKILL.md 等の本文だけ URL を差し替える (バイナリ資材はそのままコピー)。
-function renderText(text) {
+function renderText(text, label) {
   if (!serverUrl) return text;
-  let out = text;
-  for (const base of DEFAULT_BASES) out = out.split(base).join(serverUrl);
+  const out = text.replace(API_BASE_RE, serverUrl);
+  assertLoopbackKept(out, label);
   return out;
+}
+
+// tailscale serve のバックエンド等、ループバックのまま残すべき行に
+// 差し替え後の URL が混入していないことを確認する (混入するとプロキシがループする)。
+function assertLoopbackKept(text, label) {
+  const bad = text
+    .split('\n')
+    .filter((line) => line.includes(serverUrl) && LOOPBACK_ONLY_HINTS.some((hint) => line.includes(hint)));
+  if (bad.length === 0) return;
+  throw new Error(
+    `${label || 'skill text'}: ${serverUrl} が loopback 固定の行に混入しました。` +
+      `該当行:\n${bad.map((l) => `  ${l.trim()}`).join('\n')}`,
+  );
 }
 
 function isText(name) {
@@ -55,15 +81,15 @@ function collectFiles(dir, render, base = dir, acc = new Map()) {
       collectFiles(full, render, base, acc);
     } else if (entry.isFile()) {
       const buf = readFileSync(full);
-      acc.set(rel, render && isText(entry.name) ? Buffer.from(renderText(buf.toString('utf8'))) : buf);
+      acc.set(rel, render && isText(entry.name) ? Buffer.from(renderText(buf.toString('utf8'), full)) : buf);
     }
   }
   return acc;
 }
 
-function sameContent(sourceDir, destDir) {
+// want は collectFiles(sourceDir, true) の結果 (= レンダリング後の期待内容)。
+function sameContent(want, destDir) {
   if (!existsSync(destDir)) return false;
-  const want = collectFiles(sourceDir, true);
   const have = collectFiles(destDir, false);
   have.delete(MARKER_NAME);
   if (want.size !== have.size) return false;
@@ -74,10 +100,10 @@ function sameContent(sourceDir, destDir) {
   return true;
 }
 
-function copySkill(sourceDir, destDir, name) {
+function copySkill(want, sourceDir, destDir, name) {
   rmSync(destDir, { recursive: true, force: true });
   mkdirSync(destDir, { recursive: true });
-  for (const [rel, buf] of collectFiles(sourceDir, true)) {
+  for (const [rel, buf] of want) {
     const target = join(destDir, rel);
     mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, buf);
@@ -111,7 +137,11 @@ function install() {
       throw new Error(`${destDir} exists but is not a directory; move it away and retry.`);
     }
 
-    if (sameContent(sourceDir, destDir) && existsSync(marker)) {
+    // ソースは 1 スキルにつき 1 回だけ読む (比較にも書き込みにも同じ結果を使う)。
+    const want = collectFiles(sourceDir, true);
+
+    // 安いマーカー確認を先に済ませてから、内容比較を行う。
+    if (existsSync(marker) && sameContent(want, destDir)) {
       console.log(`HeadLenss skill "${name}" is already installed in ${destDir}`);
       continue;
     }
@@ -128,7 +158,7 @@ function install() {
       }
     }
 
-    copySkill(sourceDir, destDir, name);
+    copySkill(want, sourceDir, destDir, name);
     console.log(`Installed HeadLenss skill "${name}" to ${destDir}`);
     changed += 1;
   }

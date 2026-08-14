@@ -889,6 +889,13 @@ claudeRouter.post('/claude/sessions/:tmuxName/respond', async (c) => {
 
   const body = (await c.req.json().catch(() => null)) as RespondInput | null;
   if (!body) return c.json({ error: 'invalid body' }, 400);
+  // クライアントが応答対象を明示している場合、現在の pending と食い違っていたら受理しない。
+  // 画面を開いている間に用件が入れ替わると、古い画面で作った回答が別の用件に適用されるため。
+  // pendingId を送ってこない旧クライアントは従来どおり受理する (後方互換)。
+  if (body.pendingId && body.pendingId !== pending.id) {
+    console.log(`[respond] pending mismatch: body=${body.pendingId} current=${pending.id}`);
+    return c.json({ error: 'pending mismatch', currentPendingId: pending.id }, 409);
+  }
   console.log(`[respond] tmux=${tmuxName} kind=${body.kind} hookEvent=${pending.hookEvent}`);
 
   let decision: HookDecision;

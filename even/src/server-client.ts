@@ -80,7 +80,7 @@ export type Pending = {
   createdAt: number
 }
 
-export type RespondInput =
+export type RespondInput = (
   | { kind: 'permission'; decision: 'allow' | 'deny'; message?: string }
   | {
       kind: 'question';
@@ -93,6 +93,21 @@ export type RespondInput =
         notes?: string;
       }>;
     }
+) & {
+  /** どの pending への回答かを明示する。サーバは現在の pending と不一致なら 409 を返す。 */
+  pendingId?: string
+}
+
+/**
+ * 応答 POST が「対象の用件が既に入れ替わっている」で弾かれた (409) ことを表す。
+ * 呼び出し側は構築中の回答を捨てて取り直す判断に使う。
+ */
+export class PendingConflictError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'PendingConflictError'
+  }
+}
 
 export class HeadlenssClient {
   constructor(private base: string) {}
@@ -207,6 +222,11 @@ export class HeadlenssClient {
     })
     if (!res.ok) {
       const body = await res.text().catch(() => '')
+      // 409 = 応答先の用件が入れ替わっている (pendingId 不一致 / 既に解決済み)。
+      // 呼び出し側が「回答を捨てて取り直す」判断をできるよう型で区別する。
+      if (res.status === 409) {
+        throw new PendingConflictError(`respondClaude HTTP 409: ${body.slice(0, 200)}`)
+      }
       throw new Error(`respondClaude HTTP ${res.status}: ${body.slice(0, 200)}`)
     }
   }

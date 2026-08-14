@@ -9,7 +9,7 @@ headlenss サーバのセッション作成 API を 1 回叩くだけ。tmux を
 (サーバが tmux 設定・検出・永続化まで面倒を見るため、`tmux new-session` を
 手で打つとそれらが揃わない)。
 
-以下のコマンドは headlenss サーバが `http://127.0.0.1:3000` で動いている前提。
+以下のコマンドは headlenss サーバの API が `http://127.0.0.1:3000/api` で使える前提。
 別のホスト・ポートの環境では URL を読み替える。
 
 ## 手順
@@ -72,5 +72,5 @@ curl -s http://127.0.0.1:3000/api/sessions | python3 -c "import json,sys; print(
 ## 前提
 
 - headlenss サーバが稼働していること
-- サーバのアドレスが `http://127.0.0.1:3000` 以外の環境では読み替える
+- API のベース URL が `http://127.0.0.1:3000/api` 以外の環境では読み替える
   (別 PC の headlenss を操作する場合も同様に URL を差し替えるだけでよい)

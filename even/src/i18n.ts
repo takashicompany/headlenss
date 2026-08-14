@@ -55,6 +55,9 @@ const STRINGS = {
   // ─── G2 cc-response (approve / answer) ───────────────────────
   approveTool:         { en: '⏸ Approve {name}',                ja: '⏸ {name} の承認' },
   multiBadge:          { en: ' [multi]',                        ja: ' [複数]' },
+  // cc-message で本文を上限文字数で切り詰めた時に末尾へ出す省略表示
+  ccMsgTruncated:      { en: '… (showing {shown} of {total} chars)',
+                         ja: '… (全{total}文字中{shown}文字まで表示)' },
   submitOption:        { en: '> Submit',                        ja: '> Submit (確定)' },
   voiceInputBadge:     { en: '(voice input)',                   ja: '(音声入力)' },
 
