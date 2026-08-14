@@ -80,6 +80,48 @@ test('処理中に用件が入れ替わったら、新しい pending は消さ�
   store.removeSession(NAME);
 });
 
+test('ボディ読み取り中に用件が入れ替わったら、読み取り後の pending を基準に判定する', async () => {
+  const id = setupPending();
+  let nextId = '';
+  const payload = JSON.stringify({ kind: 'permission', decision: 'allow', pendingId: id });
+  const enc = new TextEncoder();
+  // ボディを分割して流し、後半を流す直前に用件を差し替える。
+  // サーバがボディ読み取り「前」の pending を掴んでいると、この差し替えを取りこぼす。
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(enc.encode(payload.slice(0, 10)));
+      setTimeout(() => {
+        nextId = store.createPending(NAME, {
+          kind: 'permission',
+          hookEvent: 'PreToolUse',
+          toolName: 'Write',
+          toolInput: { file_path: '/tmp/x' },
+        }).id;
+        controller.enqueue(enc.encode(payload.slice(10)));
+        controller.close();
+      }, 20);
+    },
+  });
+  const req = new Request(`http://localhost/claude/sessions/${NAME}/respond`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: stream,
+    // Node の fetch は stream ボディに duplex 指定を要求する
+    duplex: 'half',
+  } as RequestInit & { duplex: 'half' });
+  const res = await claudeRouter.request(req);
+  assert.equal(res.status, 409);
+  const json = (await res.json()) as { code: string; currentPendingId: string };
+  assert.equal(json.code, 'pending_mismatch');
+  // 差し替え後の用件が判定基準になっていること
+  assert.notEqual(nextId, '');
+  assert.equal(json.currentPendingId, nextId);
+  // 弾かれた応答は claim を握ったままにしない
+  assert.equal(store.claimPendingForRespond(nextId), true);
+  store.releasePendingForRespond(nextId);
+  store.removeSession(NAME);
+});
+
 test('pendingId が一致する / 送ってこない応答は不一致では弾かない (後方互換)', async () => {
   const id = setupPending();
   for (const body of [

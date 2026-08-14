@@ -431,7 +431,10 @@ async function sendAnswersToTui(
 
 /** transcript JSONL を polling して、指定 tool_use_id の tool_result が現れたら pending clear。
  *  TUI 側でユーザが直接回答した場合の自動検出用。 */
-const tuiWatchers = new Map<string, { cancel: () => void }>();
+type TuiWatcher = { toolUseId: string; cancel: () => void };
+// toolUseId を持たせるのは、止めてよい watcher かを呼び出し側が照合できるようにするため
+// (別の用件の watcher を巻き添えで止めると、その用件の TUI 回答検出が孤児になる)。
+const tuiWatchers = new Map<string, TuiWatcher>();
 function startTuiAnswerWatcher(tmuxName: string, toolUseId: string, transcriptPath: string): void {
   if (!toolUseId || !transcriptPath) return;
   // 既存 watcher があれば止める(ありえないが念のため)
@@ -476,7 +479,13 @@ function startTuiAnswerWatcher(tmuxName: string, toolUseId: string, transcriptPa
     if (!cancelled) setTimeout(tick, 500);
   };
   setTimeout(tick, 500);
-  tuiWatchers.set(tmuxName, { cancel: () => { cancelled = true; tuiWatchers.delete(tmuxName); } });
+  // 自分がまだ登録中の時だけ Map から外す。後から別の watcher に差し替わっていた場合に
+  // 遅れて呼ばれた cancel が現役の登録を消してしまわないようにするため。
+  const entry: TuiWatcher = {
+    toolUseId,
+    cancel: () => { cancelled = true; if (tuiWatchers.get(tmuxName) === entry) tuiWatchers.delete(tmuxName); },
+  };
+  tuiWatchers.set(tmuxName, entry);
 }
 
 claudeRouter.post('/hooks/permission-request', async (c) => {
@@ -889,11 +898,14 @@ claudeRouter.get('/claude/sessions/:tmuxName/pending', async (c) => {
 
 claudeRouter.post('/claude/sessions/:tmuxName/respond', async (c) => {
   const tmuxName = c.req.param('tmuxName');
-  const pending = store.getPending(tmuxName);
-  if (!pending) return c.json({ error: 'no pending interaction' }, 404);
-
+  // ボディ読み取りは await を挟むので、その間に用件が入れ替わりうる。
+  // なぜ: 先に pending を取ってからボディを読むと、検査 (pendingId 照合) と claim の
+  // 対象が「読み取り前の古い pending」になり、実際に処理する用件とずれる。
+  // 必ずボディを読み切ってから最新の pending を取り、その 1 つに対して検査→claim する。
   const body = (await c.req.json().catch(() => null)) as RespondInput | null;
   if (!body) return c.json({ error: 'invalid body' }, 400);
+  const pending = store.getPending(tmuxName);
+  if (!pending) return c.json({ error: 'no pending interaction' }, 404);
   // クライアントが応答対象を明示している場合、現在の pending と食い違っていたら受理しない。
   // 画面を開いている間に用件が入れ替わると、古い画面で作った回答が別の用件に適用されるため。
   // pendingId を送ってこない旧クライアントは従来どおり受理する (後方互換)。
@@ -976,7 +988,11 @@ async function processRespond(
       // キー注入の間に用件が入れ替わっていることがあるので、消すのは自分が答えた
       // 用件が今も現役の時だけ (新しい用件を巻き込んで消さない)。
       store.clearPendingIfId(tmuxName, pending.id);
-      tuiWatchers.get(tmuxName)?.cancel();
+      // watcher も「自分が答えた用件を見ているもの」の時だけ止める。
+      // なぜ: キー注入の間に次の用件の watcher へ差し替わっていることがあり、
+      // 無条件に止めると新しい用件の TUI 回答が検出されず pending が残り続ける。
+      const watcher = tuiWatchers.get(tmuxName);
+      if (watcher && watcher.toolUseId === pending.toolUseId) watcher.cancel();
       return c.json({ ok: true });
     } else {
       return c.json({ error: 'invalid response kind' }, 400);

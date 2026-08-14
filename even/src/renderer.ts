@@ -123,6 +123,15 @@ export function initRenderer(appBridge: EvenAppBridge): void {
   bridge = appBridge
 }
 
+/**
+ * ホスト側にこのページのコンテナが既にあるとみなしているか。
+ * false の間は差分更新 (textContainerUpgrade) を送っても何も出ないので、
+ * 呼び出し側は showScreen (ページ再構築) から描き直す必要がある。
+ */
+export function isPageBuilt(): boolean {
+  return startupRendered
+}
+
 /** Foreground 再入場後など、レンズページを再生成したいときに呼ぶ */
 export function resetPageState(): void {
   startupRendered = false

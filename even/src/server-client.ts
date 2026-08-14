@@ -104,6 +104,21 @@ export type RespondInput = (
  * 同じ 409 でも二重送信 (already_processing) 等はこれに含めない
  * (入れ替わっていないのに「入れ替わった」と案内してしまうため)。
  */
+/** 応答 POST の上限時間 (ms)。サーバ側のキー注入と確認 (数百 ms〜数秒) より十分長く取る。 */
+const RESPOND_TIMEOUT_MS = 15000
+
+/**
+ * ms 後に abort する signal。
+ * AbortSignal.timeout を持たない古い WebView では、それを呼ぶこと自体が例外になり
+ * 「タイムアウトを付けたせいで送信できない」になるので、手組みの controller へ退避する。
+ */
+function timeoutSignal(ms: number): AbortSignal {
+  if (typeof AbortSignal.timeout === 'function') return AbortSignal.timeout(ms)
+  const ctrl = new AbortController()
+  setTimeout(() => ctrl.abort(), ms)
+  return ctrl.signal
+}
+
 export class PendingConflictError extends Error {
   constructor(message: string) {
     super(message)
@@ -217,11 +232,24 @@ export class HeadlenssClient {
   }
 
   async respondClaude(name: string, input: RespondInput): Promise<void> {
-    const res = await fetch(this.url(`/api/claude/sessions/${encodeURIComponent(name)}/respond`), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(input),
-    })
+    // 必ず決着させる。サーバは tmux にキーを注入して確認するまで応答しないので
+    // 数百 ms〜数秒かかるが、返ってこないままだと呼び出し側の送信中フラグが
+    // 解除されず、以降その画面が一切操作できなくなる。
+    let res: Response
+    try {
+      res = await fetch(this.url(`/api/claude/sessions/${encodeURIComponent(name)}/respond`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+        signal: timeoutSignal(RESPOND_TIMEOUT_MS),
+      })
+    } catch (e) {
+      // タイムアウトは通常のエラーとして投げる (用件の入れ替わりではないので再試行可)
+      if ((e as Error).name === 'TimeoutError' || (e as Error).name === 'AbortError') {
+        throw new Error(`respondClaude timeout after ${RESPOND_TIMEOUT_MS}ms`)
+      }
+      throw e
+    }
     if (!res.ok) {
       const body = await res.text().catch(() => '')
       // 409 のうち「応答先の用件が入れ替わっている」(code=pending_mismatch) だけを

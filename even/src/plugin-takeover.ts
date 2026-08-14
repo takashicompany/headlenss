@@ -97,12 +97,26 @@ function injectBaseTag(html: string, targetUrl: string): string {
   return baseTag + html
 }
 
+// document.open() を呼んだ後は、成功・失敗にかかわらずheadlenssの DOM は失われている。
+// 取り込みが途中で失敗した時に、呼び出し側が「headlenssの画面へ戻す復旧をしてよいか」を
+// 判断するためのフラグ (置き換え後は復旧描画もポーリング再開も成立しない)。
+let documentReplaced = false
+
+/** document.open() まで進んだか (= headlenss の DOM がもう無いか)。 */
+export function isDocumentReplaced(): boolean {
+  return documentReplaced
+}
+
 /**
  * ドキュメントを対象 HTML に置き換え、シム相当を仕込む。
  * 呼び出し後、このページはheadlenssではなく対象プラグインとして動く。
  */
 export function performTakeover(html: string, targetUrl: string, log: (msg: string) => void): void {
+  // ここまで (文字列組み立て) は DOM に触らないので、失敗しても headlenss は無傷。
   const withBase = injectBaseTag(html, targetUrl)
+  // 置き換えの直前に立てる。document.open() 自体が途中で失敗した場合も
+  // 「DOM は壊れたかもしれない」側に倒す (復旧描画で二重に壊さない)。
+  documentReplaced = true
   document.open()
   document.write(withBase)
   document.close()

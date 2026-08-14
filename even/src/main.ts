@@ -11,6 +11,7 @@ import {
 import { onEvenHubEvent, setEventHandlers, setScrollCooldownMs } from './events'
 import {
   initRenderer,
+  isPageBuilt,
   MAIN_INNER_WIDTH,
   markPageAlreadyBuilt,
   resetPageState,
@@ -27,7 +28,7 @@ import {
   markReturnReload,
   withLoaderParam,
 } from './plugin-launch'
-import { fetchTargetHtml, isProxyInjected, performTakeover } from './plugin-takeover'
+import { fetchTargetHtml, isDocumentReplaced, isProxyInjected, performTakeover } from './plugin-takeover'
 import {
   HeadlenssClient,
   PendingConflictError,
@@ -270,14 +271,24 @@ const lastReadAt: Record<string, number> = (() => {
   } catch { return {} }
 })()
 let lastReadPersistTimer: ReturnType<typeof setTimeout> | null = null
+function persistLastRead(): void {
+  try { localStorage.setItem(LAST_READ_KEY, JSON.stringify(lastReadAt)) } catch {}
+}
 function markAsRead(name: string): void {
   if (!name) return
   lastReadAt[name] = Date.now()
   if (lastReadPersistTimer) return
   lastReadPersistTimer = setTimeout(() => {
     lastReadPersistTimer = null
-    try { localStorage.setItem(LAST_READ_KEY, JSON.stringify(lastReadAt)) } catch {}
+    persistLastRead()
   }, 1000)
+}
+/** 保留中の既読位置の書き込みを今すぐ済ませる (debounce タイマーを捨てる前に呼ぶ)。 */
+function flushLastReadPersist(): void {
+  if (!lastReadPersistTimer) return
+  clearTimeout(lastReadPersistTimer)
+  lastReadPersistTimer = null
+  persistLastRead()
 }
 function isUnread(s: ClaudeSessionInfo): boolean {
   const last = lastReadAt[s.tmuxSessionName] ?? 0
@@ -303,7 +314,6 @@ let currentAgentSource: AgentSource | undefined = undefined
 let claudeChatStatus: string | undefined = undefined
 let claudePending: Pending | null = null         // 現在選択中セッションの承認/質問待ち
 let claudeChatLoading = false                    // セッション切替直後のロード中フラグ
-let claudePollTimer: ReturnType<typeof setInterval> | null = null
 // refreshClaudeData の非同期レース防止: 実行中の fetch を abort し、完了時にセッション名を検証する
 let refreshAbortCtrl: AbortController | null = null
 /** 実行中の refreshClaudeData fetch を中断する (セッション切替時に呼ぶ) */
@@ -323,6 +333,17 @@ let respondInFlight = false
 /** 応答 POST 中の応答画面 (cc-message / cc-response) の入力か。true なら無視する。 */
 function respondInputBlocked(): boolean {
   return respondInFlight && (phase === 'cc-message' || phase === 'cc-response')
+}
+/**
+ * 用件への応答フロー (本文閲覧 → 選択肢 → Type something の録音 → POST) の最中か。
+ * なぜ: この間に足元のセッションが差し替わると、組み立て中の回答ごと操作が消える。
+ * 自動 (ユーザ操作以外) の切替はこれが true の間だけ保留する。
+ */
+function isRespondFlowActive(): boolean {
+  if (phase === 'cc-message' || phase === 'cc-response') return true
+  // Type something の録音中 (と、その確定待ち) も応答フローの一部
+  if ((phase === 'recording' || phase === 'finalizing') && recordingPurpose === 'respond-type-something') return true
+  return respondInFlight
 }
 // AskUserQuestion 回答ビルド用: 各質問について構築中の回答を保持
 type RespondAnswer =
@@ -594,9 +615,11 @@ function recordingLines(): string[] {
   }
   if (recordingScrollOffset > 0) {
     const delta = out.length - recordingLinesCache.length
-    if (delta > 0) {
+    // 増減どちらも補正する (chat 側と同じ理由: 片方向だけだと partial が縮んだ分の
+    // ズレが戻らず、遡って読んでいる位置が少しずつ漂う)。
+    if (delta !== 0) {
       const max = Math.max(0, out.length - chatDisplayLines())
-      recordingScrollOffset = Math.min(max, recordingScrollOffset + delta)
+      recordingScrollOffset = Math.max(0, Math.min(max, recordingScrollOffset + delta))
     }
   }
   recordingLinesCache = out
@@ -703,7 +726,7 @@ function ccMessageLines(): string[] {
   if (pending.kind === 'permission') {
     // 選択肢画面と違いここは切り詰めない (全文を読ませるのがこの画面の役目)。
     // 巨大な toolInput で描画が固まらないよう文字数だけ上限を掛ける。
-    const full = summarizeToolInput(pending.toolInput)
+    const full = toolInputSummaryFor(pending)
     const summary = full.slice(0, CC_MSG_MAX_CHARS)
     if (summary) paras.push(summary)
     if (full.length > summary.length) fullLength = full.length
@@ -793,7 +816,8 @@ function buildCcResponseView(): string {
   if (claudePending.kind === 'permission') {
     // ツール名はヘッダ (buildG2Header) に出しているので本文では繰り返さない。
     // 7 行しかない窓を選択肢と要約に使い切るため。
-    const summary = summarizeToolInput(claudePending.toolInput).slice(0, CHAT_WRAP_WIDTH * 3)
+    // 要約はポーリング/カーソル移動のたびに組み直されるので、用件単位のキャッシュを使う
+    const summary = toolInputSummaryFor(claudePending).slice(0, CHAT_WRAP_WIDTH * 3)
     if (summary) {
       lines.push(summary)
       lines.push('')
@@ -891,6 +915,19 @@ function currentRespondRowCount(): number {
   const q = claudePending.questions?.[respondQIdx]
   if (!q) return 0
   return (q.options ?? []).length + (q.multiSelect ? 1 : 0) + 2
+}
+
+// summarizeToolInput の結果を用件 (pending.id) 単位でキャッシュする。
+// なぜ: toolInput 全体の JSON 化 + 正規表現置換なので入力が大きいほど重く、
+// cc-message / cc-response はポーリングやスクロールのたびに再描画される。
+// 同じ pending なら toolInput も同じなので id をキーにできる (ccMessageLines と同じ方式)。
+let toolSummaryCache = ''
+let toolSummaryCacheKey = ''
+function toolInputSummaryFor(pending: Pending): string {
+  if (pending.id === toolSummaryCacheKey) return toolSummaryCache
+  toolSummaryCache = summarizeToolInput(pending.toolInput)
+  toolSummaryCacheKey = pending.id
+  return toolSummaryCache
 }
 
 function summarizeToolInput(input: unknown): string {
@@ -1049,14 +1086,33 @@ function chatStatusLine(): string | null {
   }
 }
 
+// chatLinesForDisplay の結果キャッシュ。(chatLinesCache, 待機行) の組が変わった時だけ
+// 作り直す。なぜ: 毎回 [...chatLinesCache, status] を組むと、スクロールの 1 tick ごとに
+// 会話全体ぶんの配列コピー (O(n)) が走り、会話が長いほどスクロールが重くなる。
+// chatLinesCache は常に丸ごと差し替えられる (要素を書き換えない) ので、参照一致で判定できる。
+let chatDisplayCache: string[] = []
+let chatDisplayCacheSource: string[] | null = null
+let chatDisplayCacheStatus: string | null = null
+
 /** 表示用の chat 行配列 = 整形済みキャッシュ + (あれば) 末尾の待機行 */
 function chatLinesForDisplay(): string[] {
   const status = chatStatusLine()
-  return status ? [...chatLinesCache, status] : chatLinesCache
+  if (chatDisplayCacheSource === chatLinesCache && chatDisplayCacheStatus === status) {
+    return chatDisplayCache
+  }
+  chatDisplayCache = status ? [...chatLinesCache, status] : chatLinesCache
+  chatDisplayCacheSource = chatLinesCache
+  chatDisplayCacheStatus = status
+  return chatDisplayCache
+}
+
+/** 表示用 chat の行数だけが要る呼び出し用。配列を組まずに数える (スクロール中に毎 tick 呼ばれる)。 */
+function chatDisplayCount(): number {
+  return chatLinesCache.length + (chatStatusLine() ? 1 : 0)
 }
 
 function maxChatScrollOffset(): number {
-  return Math.max(0, chatLinesForDisplay().length - chatDisplayLines())
+  return Math.max(0, chatDisplayCount() - chatDisplayLines())
 }
 
 function isScrolled(): boolean {
@@ -1268,9 +1324,16 @@ function buildG2Header(): string {
 //   高々 1 件なので、どれだけ速く要求が来ても構造的に滞留が起きない。
 //   full render は content も送り直すので、実行時に content-only の待機枠は捨てる。
 //   スクロールの中間コマは落ちるが、最後のコマは必ず待機枠に残る = 着地点は必ず届く。
+/** レンズ 1 画面ぶんのスナップショット (同じ状態から組んだ 3 コンテナの内容)。 */
+type G2Frame = { header: string; content: string; footer: string }
+
 let g2SendLock = false            // ブリッジ送信中 (全経路共通の in-flight フラグ)
 let g2RenderPending = false       // full render の待機枠 (latest-wins)
 let g2RenderPendingForce = false  // 待機要求の force を OR で蓄積
+// 待機中の full render に添えられたスナップショット (無ければ実行時に組み直す)。
+// なぜ: 「変化したか」の判定で既に 3 つとも組んでいる場合、それをそのまま描けば
+// 二重ビルドが消え、判定した内容と実際に描く内容が必ず一致する。
+let g2RenderPendingFrame: G2Frame | null = null
 let g2RenderDeferredAt: number | null = null  // scroll 中の full render 延期開始時刻
 let g2ContentQueued: string | null = null     // content-only の待機枠 (latest-wins)
 
@@ -1305,7 +1368,7 @@ function isForcedResyncDue(): boolean {
 
 // 直近でレンズへ送った (= 送信を予約した) 各コンテナの内容。同一なら送らない。
 // ポーリング由来の再描画要求も、この 3 つと突き合わせて変化が無ければ丸ごと捨てる
-// (g2WouldChange 参照)。dedup の基準はここ 1 箇所だけに持つ。
+// (g2FrameWouldChange 参照)。dedup の基準はここ 1 箇所だけに持つ。
 let g2ContentLastSent: string | null = null
 let g2HeaderLastSent: string | null = null
 let g2FooterLastSent: string | null = null
@@ -1350,6 +1413,9 @@ function sendContentDirect(content: string): void {
   if (content === g2ContentLastSent) return
   g2ContentLastSent = content
   g2ContentQueued = content
+  // スクロールは refreshG2 を通さずに表示状態 (scrollOffset) を動かす唯一の経路なので、
+  // 待機中の full render のスナップショットはここで古くなる。捨てて実行時に組み直させる。
+  g2RenderPendingFrame = null
   void pumpG2Sends()
 }
 
@@ -1365,11 +1431,13 @@ async function pumpG2Sends(): Promise<void> {
       // full render を優先する (content-only より新しい状態を丸ごと反映するため)
       if (g2RenderPending && !isFullRenderDeferred(performance.now())) {
         const force = g2RenderPendingForce
+        const frame = g2RenderPendingFrame
         g2RenderPending = false
         g2RenderPendingForce = false
+        g2RenderPendingFrame = null
         // full render は content も送り直すので、待機中の content-only は用済み
         g2ContentQueued = null
-        await executeFullRender(force)
+        await executeFullRender(force, frame)
         continue
       }
       const content = g2ContentQueued
@@ -1395,8 +1463,10 @@ async function pumpG2Sends(): Promise<void> {
  * G2 レンズの全面更新 (header + content + footer) を要求する。
  * 実際の送信はポンプが直列に行い、実行中の要求は待機枠で latest-wins に畳まれる。
  * force=false の場合はスロットル (G2_REFRESH_THROTTLE_MS) が適用される。
+ * frame を渡すと、実行時に組み直さずそのスナップショットを描く (呼び出し側が
+ * 既に 3 つとも組んでいる場合用。判定と描画で内容がずれないようにする)。
  */
-async function refreshG2(force = false): Promise<void> {
+async function refreshG2(force = false, frame: G2Frame | null = null): Promise<void> {
   if (!bridge) {
     console.log('[refreshG2] bailed: no bridge')
     return
@@ -1414,6 +1484,9 @@ async function refreshG2(force = false): Promise<void> {
   // 待機枠に積むだけ (latest-wins)。送信するかどうか/いつかはポンプが決める。
   g2RenderPending = true
   g2RenderPendingForce = g2RenderPendingForce || force
+  // スナップショットも latest-wins。添えずに要求された場合は「今の状態で組み直す」が
+  // 正しいので、古いスナップショットは必ず捨てる。
+  g2RenderPendingFrame = frame
   await pumpG2Sends()
 }
 
@@ -1421,14 +1494,13 @@ async function refreshG2(force = false): Promise<void> {
  * full render を 1 回だけ実行する。ポンプからのみ呼ぶ
  * (g2SendLock は呼び出し側が握っている前提)。
  */
-async function executeFullRender(force: boolean): Promise<void> {
+async function executeFullRender(force: boolean, frame: G2Frame | null = null): Promise<void> {
   g2RefreshLastAt = performance.now()
   // ここで例外を外に出さない (ポンプのループを止めないため)。
   try {
-    // header / content / footer を同期的に一括ビルド (同一 phase スナップショット)
-    const header = buildG2Header()
-    const content = buildG2Content()
-    const footer = buildG2Footer()
+    // header / content / footer を同期的に一括ビルド (同一 phase スナップショット)。
+    // 呼び出し側が既に組んだスナップショットがあればそれを使う (二重ビルドの解消)。
+    const { header, content, footer } = frame ?? buildG2Frame()
     // dedup 基準を更新: scroll tick とポーリング由来の再描画がこの 3 つと突き合わせる
     g2HeaderLastSent = header
     g2ContentLastSent = content
@@ -1494,10 +1566,15 @@ async function sendShowScreen(header: string, content: string, footer: string): 
  * 続くため、これがキューへの定常的な負荷源になっていた。変化の無いポーリング
  * 由来の要求はここで捨てる。ユーザ操作起因の描画はこのチェックを通さず即時に描く。
  */
-function g2WouldChange(): boolean {
-  return buildG2Header() !== g2HeaderLastSent
-    || buildG2Content() !== g2ContentLastSent
-    || buildG2Footer() !== g2FooterLastSent
+function g2FrameWouldChange(frame: G2Frame): boolean {
+  return frame.header !== g2HeaderLastSent
+    || frame.content !== g2ContentLastSent
+    || frame.footer !== g2FooterLastSent
+}
+
+/** 現在の状態から 3 コンテナぶんの内容を一度に組む (同一スナップショット)。 */
+function buildG2Frame(): G2Frame {
+  return { header: buildG2Header(), content: buildG2Content(), footer: buildG2Footer() }
 }
 
 // ─── Sessions ──────────────────────────────────────────────────────────
@@ -1577,11 +1654,19 @@ async function reloadSessions(verbose = false): Promise<void> {
     lastSessions = await client.listSessions()
     if (verbose) log(`sessions: ${lastSessions.map((s) => s.name).join(', ') || '(none)'}`)
     if (lastSessions.length > 0 && !lastSessions.some((s) => s.name === settings.sessionName)) {
-      abortInFlightRefresh()
-      settings.sessionName = lastSessions[0].name
-      void persistSettings()
-      // 見ていたセッションが無くなって別セッションへ移った。前の用件は捨てる
-      resetRespondStateForSessionChange()
+      if (isRespondFlowActive()) {
+        // 応答フローの最中は自動切替を保留する。
+        // なぜ: 回答を組んでいる最中に足元のセッションを差し替えると、作りかけの回答が
+        // 捨てられて操作が消える。一覧に無いセッションを見ているだけなら実害は小さいので、
+        // フローが終わった後の次回実行 (15 秒ごと) で切り替われば足りる。
+        log('応答フロー中なのでセッションの自動切替を保留します')
+      } else {
+        abortInFlightRefresh()
+        settings.sessionName = lastSessions[0].name
+        void persistSettings()
+        // 見ていたセッションが無くなって別セッションへ移った。前の用件は捨てる
+        resetRespondStateForSessionChange()
+      }
     }
     // rootlist のカーソル位置がオーバーランしないよう名前解決でクランプ
     resolveRootCursorIndex()
@@ -1603,6 +1688,8 @@ async function createAndSelectSession(name: string): Promise<void> {
     log(`created session: ${name}`)
     abortInFlightRefresh()
     settings.sessionName = name
+    // 新しいセッションへ移った = 前セッションの用件と作りかけの回答は無効
+    resetRespondStateForSessionChange()
     await persistSettings()
     newSessionInput.value = ''
     await reloadSessions()
@@ -1685,7 +1772,7 @@ async function refreshClaudeData(): Promise<void> {
     const chat = chatResponse.chat.filter((c) => !c.synthetic)
     currentAgentSource = chatResponse.source ?? claudeSessions.find((s) => s.tmuxSessionName === targetSession)?.source
     // 差し替え前の表示行数 (待機行込み)。scrollback 中の繰り上げ量の計算に使う。
-    const prevDisplayLen = chatLinesForDisplay().length
+    const prevDisplayLen = chatDisplayCount()
     // 取得内容が前回と同一なら整形をまるごと省く。無操作でもポーリングは 1.5 秒毎に
     // 走るので、ここを毎回計算すると会話が長いほどメインスレッドが埋まる。
     // source も鍵に含める (タグ表記が変わると整形結果も変わるため)。
@@ -1701,10 +1788,14 @@ async function refreshClaudeData(): Promise<void> {
     // pending の出現/消滅のたびに読んでいる位置が 1 行ずれる。
     claudeChatStatus = chatResponse.status
     claudePending = pending
-    // chat: scrollback 中なら増えたぶんだけオフセットを繰り上げて読んでいる位置を保つ
+    // chat: scrollback 中なら増減したぶんだけオフセットを補正して読んでいる位置を保つ。
+    // 減った側 (待機行が消えた / 履歴が縮んだ) も補正するのは、増加時だけ繰り上げると
+    // busy⇔idle を往復するたびにオフセットが片道ぶんずつ溜まり、読み位置が上へ漂うため。
     if (scrollOffset > 0) {
-      const delta = chatLinesForDisplay().length - prevDisplayLen
-      if (delta > 0) scrollOffset = Math.min(maxChatScrollOffset(), scrollOffset + delta)
+      const delta = chatDisplayCount() - prevDisplayLen
+      if (delta !== 0) {
+        scrollOffset = Math.max(0, Math.min(maxChatScrollOffset(), scrollOffset + delta))
+      }
     }
     claudeChat = chat
     claudeChatLoading = false
@@ -1729,14 +1820,17 @@ async function refreshClaudeData(): Promise<void> {
     if (phase === 'idle' || phase === 'cc-message' || phase === 'cc-response') {
       // ポーリング由来の再描画は「表示が変わる時だけ」。変わらないのに 1.5 秒ごとに
       // 全面送信 (3 フレーム) を掛け続けると、レンズ側の消化が追いつかない環境では
-      // それだけで滞留が育つ (g2WouldChange 参照)。
+      // それだけで滞留が育つ (g2FrameWouldChange 参照)。
       // ただし送信が途絶えて久しい場合は、取りこぼし対策として dedup を捨てて 1 回通す。
       if (isForcedResyncDue()) {
         console.log('[refreshG2] forced resync: no send for a while')
         invalidateG2Dedup()
         void refreshG2(true)
-      } else if (g2WouldChange()) {
-        void refreshG2(true)
+      } else {
+        // 判定で組んだスナップショットをそのまま描画に渡す。組み直さないので
+        // 「変化すると判定した内容」と「実際に描く内容」が必ず一致する。
+        const frame = buildG2Frame()
+        if (g2FrameWouldChange(frame)) void refreshG2(true, frame)
       }
       // chat を実際に取得して描画している = ユーザは見ている前提なので既読化
       markAsRead(targetSession)
@@ -1837,7 +1931,23 @@ clearHistoryBtn.addEventListener('click', () => {
   renderHistory()
 })
 
-const historyRenderTimer = setInterval(renderHistory, 60_000)
+// 履歴の相対時刻 ("3m ago") を定期的に描き直すタイマー。
+// stopAllBackgroundWork で止めて復旧経路で再開できるよう、const ではなく開始関数を持つ。
+let historyRenderTimer: ReturnType<typeof setInterval> | null = null
+function startHistoryRenderTimer(): void {
+  if (historyRenderTimer) clearInterval(historyRenderTimer)
+  historyRenderTimer = setInterval(renderHistory, 60_000)
+}
+startHistoryRenderTimer()
+
+/** セッション一覧の定期更新。boot と、取り込み失敗からの復旧の両方から呼ぶ。 */
+function startSessionsRefreshTimer(): void {
+  if (sessionsRefreshTimer) clearInterval(sessionsRefreshTimer)
+  sessionsRefreshTimer = setInterval(() => {
+    if (phase === 'recording' || phase === 'finalizing' || phase === 'pending' || phase === 'sending') return
+    void reloadSessions()
+  }, SESSIONS_REFRESH_MS)
+}
 
 /**
  * headlenss 自身の常駐処理を全部止める。
@@ -1846,31 +1956,39 @@ const historyRenderTimer = setInterval(renderHistory, 60_000)
  * document.open() はイベントリスナーは消すが**タイマーは消さない**ため、
  * 止めないと headlenss のポーリングが裏で回り続け、プラグインの描画と
  * 奪い合ってレンズがちらつく (1.5 秒ごとに一覧の内容を送ってしまう)。
+ *
+ * ここで止めた常駐処理のうち、再開が要るものは restartAllBackgroundWork が受け持つ
+ * (取り込みに失敗して headlenss に戻る経路)。止める側と再開する側は必ず対で更新すること。
  */
 function stopAllBackgroundWork(): void {
-  for (const t of [recordingTimer, sessionsRefreshTimer, outputPollTimer, claudePollTimer, historyRenderTimer]) {
+  for (const t of [recordingTimer, sessionsRefreshTimer, outputPollTimer, historyRenderTimer]) {
     if (t) clearInterval(t)
   }
   recordingTimer = null
   sessionsRefreshTimer = null
   outputPollTimer = null
-  claudePollTimer = null
-  for (const t of [probeDebounceTimer, scrollAnimTimer, lastReadPersistTimer, obProbeTimer, toastHideTimer]) {
+  historyRenderTimer = null
+  // 未書き込みの既読位置はここで書き切る。debounce タイマーを捨てるだけだと、
+  // 直前に見ていたセッションの既読化が失われる (再開しても書く材料が残らない)。
+  flushLastReadPersist()
+  for (const t of [probeDebounceTimer, scrollAnimTimer, obProbeTimer, toastHideTimer]) {
     if (t) clearTimeout(t)
   }
   probeDebounceTimer = null
   scrollAnimTimer = null
   scrollAnimPending = 0
   scrollAnimActive = false  // タイマーを止めた = アニメも終わり。延期判定を残さない
-  lastReadPersistTimer = null
   obProbeTimer = null
+  // 自動で消えるはずの toast は、消すタイマーごと止めるとここで消し切っておく必要がある
   toastHideTimer = null
+  hideToastNow()
   // 実行中の取得も打ち切る (完了時に描画へ回るため)
   abortInFlightRefresh()
   // レンズ送信の待機枠も捨てる。残しておくと in-flight が捌けた瞬間に headlenss の
   // フレームがプラグインのページに 1 枚だけ被さる。
   g2RenderPending = false
   g2RenderPendingForce = false
+  g2RenderPendingFrame = null
   g2ContentQueued = null
   // 取り込み後、SDK がブリッジ単例を再利用する実装でも headlenss のハンドラが誤発火しないよう無効化する
   setEventHandlers({
@@ -1881,6 +1999,31 @@ function stopAllBackgroundWork(): void {
     onAudio: () => {},
   })
   navigatingToPlugin = false
+}
+
+/**
+ * stopAllBackgroundWork で止めた常駐処理を再開する。
+ * 取り込み (performTakeover) が document を置き換える前に失敗し、headlenss の画面へ
+ * 戻す時にだけ呼ぶ。document を置き換えた後は headlenss の DOM が無いので呼ばない。
+ *
+ * 対応 (stopAllBackgroundWork で止めるもの → ここでの扱い):
+ *   recordingTimer      … 録音中だった場合のみ再開 (rootlist からしか遷移しないので通常は無い)
+ *   sessionsRefreshTimer… 再開
+ *   outputPollTimer     … 再開 (startOutputPolling)
+ *   historyRenderTimer  … 再開
+ *   probeDebounceTimer  … 再開しない (URL 入力の debounce。次の入力で張り直される)
+ *   obProbeTimer        … 同上 (オンボーディングの入力 debounce)
+ *   scrollAnimTimer     … 再開しない (アニメの残り行数ごと破棄済み)
+ *   lastReadPersistTimer… 停止時に書き切っているので再開不要 (次の markAsRead が張り直す)
+ *   toastHideTimer      … 停止時に toast ごと消しているので再開不要
+ *   G2 入力ハンドラ     … 呼び出し側が reinstallG2EventHandlers で戻す
+ *   レンズ送信の待機枠  … 呼び出し側の再描画要求 (cancelPluginNavigation) で積み直す
+ */
+function restartAllBackgroundWork(): void {
+  startHistoryRenderTimer()
+  startSessionsRefreshTimer()
+  startOutputPolling()
+  if (phase === 'recording') startRecordingTimer()
 }
 
 // ─── Settings UI ───────────────────────────────────────────────────────
@@ -2154,6 +2297,9 @@ async function finishOnboarding(): Promise<void> {
       abortInFlightRefresh()
       settings.sessionName = sessions[0].name
     }
+    // 初期設定中なので用件を持っているはずはないが、セッション名を書き換える経路は
+    // 例外なく同じ後始末を通す (「ここだけ通さない」を作らない)。
+    resetRespondStateForSessionChange()
     await persistSettings()
   } catch (e) {
     log(`finishOnboarding session setup error: ${(e as Error).message}`)
@@ -2635,13 +2781,21 @@ function openG2Plugin(plugin: G2PluginInfo): void {
         performTakeover(html, url, log)
         return
       } catch (err) {
-        // 取り込みに失敗するとレンズは「接続中」のまま、背景処理も入力ハンドラも
-        // 止めた後なので、何も起きない画面で固まる。描画停止を解いて headlenss の
-        // 画面へ戻し、操作とポーリングも復活させる。
+        if (isDocumentReplaced()) {
+          // document を置き換えた後の失敗。headlenss の DOM もイベントリスナーも既に
+          // 無いので、ここで復旧描画やポーリング再開をしても「消えたページのための
+          // 処理」が裏で回るだけで、プラグイン側の描画を奪い合う。開発者向けに記録
+          // するだけにして何も動かさない (log は画面の <pre> を触るので使わない)。
+          console.log(`[headlenss] plugin の取り込みが document 置換後に失敗しました: ${err}`)
+          return
+        }
+        // 置き換え前の失敗。レンズは「接続中」のまま、背景処理も入力ハンドラも止めた
+        // 後なので、何も起きない画面で固まる。描画停止を解いて headlenss の画面へ戻し、
+        // 操作と常駐処理も復活させる。
         log(`plugin の取り込みに失敗しました: ${err}`)
         reinstallG2EventHandlers?.()
         cancelPluginNavigation()
-        startOutputPolling()
+        restartAllBackgroundWork()
         return
       }
     }
@@ -2674,10 +2828,7 @@ function cancelPluginNavigation(): void {
   pluginNavBlocksG2Render = false
   if (!navigatingToPlugin) {
     // 遷移中でなければ中止すべきものは無い。描画だけ止まっていたなら描き直す。
-    if (wasBlocked) {
-      markPageAlreadyBuilt()
-      void refreshG2(true)
-    }
+    if (wasBlocked) redrawAfterPluginNavigationCancelled()
     return
   }
   navigatingToPlugin = false
@@ -2688,7 +2839,34 @@ function cancelPluginNavigation(): void {
   try { window.stop() } catch { /* ignore */ }
   // 遷移前に立てた復帰フラグを撤回する (遷移しなかったので次回 boot は通常経路でよい)
   void consumeReturnFlag(bridge)
-  // レンズを一覧へ戻す。このページは構築済みなので rebuild 経路で描き直す。
+  // レンズを一覧へ戻す
+  redrawAfterPluginNavigationCancelled()
+}
+
+/**
+ * プラグイン遷移を中止した後、レンズを headlenss の画面へ戻す描画。
+ *
+ * 通常は差分更新で足りるが、遷移をブロックしている間に onForegroundExit
+ * (グラスを外す等) が来ているとページ状態が落ちている。この状態で差分更新
+ * (textContainerUpgrade) を送っても対象のコンテナが無く、レンズは「接続中」の
+ * まま何も変わらない。ページ状態が落ちていたら foreground 再入場と同じく
+ * ページごと組み直す。
+ */
+function redrawAfterPluginNavigationCancelled(): void {
+  if (!isPageBuilt()) {
+    log('遷移ブロック中にページ状態がリセットされていたので、ページごと再構築します')
+    resetPageState()
+    void (async () => {
+      try {
+        const { header, content, footer } = buildG2Frame()
+        await sendShowScreen(header, content, footer)
+      } catch (err) {
+        log(`plugin 中止後のページ再構築エラー: ${err}`)
+      }
+    })()
+    return
+  }
+  // このページは構築済みなので、次の showScreen が create にならないよう印を付けて差分更新
   markPageAlreadyBuilt()
   void refreshG2(true)
 }
@@ -3030,6 +3208,12 @@ function showToast(text: string, ms = 2500): void {
   }, ms)
 }
 
+/** toast を即座に消す。自動で消すタイマーを止める側が、出しっぱなしを残さないために呼ぶ。 */
+function hideToastNow(): void {
+  toastEl.classList.remove('visible')
+  toastEl.hidden = true
+}
+
 // ─── Claude セッション一覧 (WebView) ───────────────────────────────────
 function claudeStatusLabel(status: string): string {
   switch (status) {
@@ -3108,6 +3292,10 @@ claudeSessionsListEl.addEventListener('click', (e) => {
   if (settings.sessionName !== name) {
     abortInFlightRefresh()
     settings.sessionName = name
+    // 前セッションの用件と作りかけの回答を捨てる (G2 側の選択と同じ後始末)。
+    // 応答画面を開いたままここから切り替えると、古い用件への回答が新しい
+    // セッションの用件に適用されてしまうため。
+    resetRespondStateForSessionChange()
     void persistSettings()
     renderClaudeSessionsList()
     renderSessionPills()
@@ -3528,11 +3716,7 @@ async function boot(): Promise<void> {
   }
 
   // セッション一覧を定期的に更新
-  if (sessionsRefreshTimer) clearInterval(sessionsRefreshTimer)
-  sessionsRefreshTimer = setInterval(() => {
-    if (phase === 'recording' || phase === 'finalizing' || phase === 'pending' || phase === 'sending') return
-    void reloadSessions()
-  }, SESSIONS_REFRESH_MS)
+  startSessionsRefreshTimer()
 
   // tmux 出力ポーリング (idle時のみ実行)
   startOutputPolling()
