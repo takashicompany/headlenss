@@ -1188,28 +1188,131 @@ function buildG2Header(): string {
   }
 }
 
-// ─── G2 レンダリング直列化 ──────────────────────────────────────────────
-// full render: g2SendLock で直列化し、scroll アニメ中は延期する (アニメ終了時に発火)。
-//   2000ms 安全弁で長期ブロックを防ぐ。
-// scroll content: fire-and-forget で SDK bridge に直送する。同一内容のみ dedup する。
-//   意図的に直列化しない (SDK bridge がコール順にフレームをキューイングする。
-//   ここで coalesce/ロックを掛けるとフレームが飛んでカクつきの原因になっていた)。
-let g2SendLock = false            // SDK 送信中 (full render)
-let g2RenderPending = false       // full render の待機要求あり
+// ─── G2 レンダリング直列化 (送信背圧) ──────────────────────────────────
+// レンズへの送信は例外なくこの 1 本の直列路 (pumpG2Sends) を通す。
+//
+// なぜ背圧が要るか:
+//   SDK ブリッジは呼ばれたぶんだけフレームを内部キューに積むが、実際に消化できる
+//   速度は BLE 側で決まる。アプリが消化速度を超えて投げ続けると未処理が単調に
+//   増え続け、レンズ表示が操作から数十秒遅れる。長時間使うほど遅延が伸びるので
+//   「使い続けると全体が重くなる」という体感になる。送信レートを消化レートに
+//   律速する = 背圧を掛けるしか止める手が無い。
+//
+// 経緯:
+//   cc3286d で content-only 送信を latest-wins に coalesce したが、d13bc26 で
+//   「フレームが飛んでカクつく」と判断して fire-and-forget に戻した。その後
+//   6153e41 の計測で、fire-and-forget では滞留がピーク 1198 フレーム / 1 フレームの
+//   完了に 97 秒かかることが判明した (背圧ありでは 2 フレーム / 0.2 秒)。
+//   カクつきの実体は「送りすぎて遅れていた」側だったため、背圧を正式に戻す。
+//
+// 構造:
+//   g2SendLock … ブリッジへ送信中か。全経路共通の唯一の相互排他で、
+//                どの瞬間も SDK への in-flight は高々 1 本。
+//   待機枠は 2 つだけ。どちらも latest-wins で、古い要求は捨てる:
+//     full render (header+content+footer) … g2RenderPending / g2RenderPendingForce
+//     content-only (スクロール 1 行送り)  … g2ContentQueued
+//   送信が終わるたびポンプが待機枠から次の 1 件を取り出す。アプリ内の待機も
+//   高々 1 件なので、どれだけ速く要求が来ても構造的に滞留が起きない。
+//   full render は content も送り直すので、実行時に content-only の待機枠は捨てる。
+//   スクロールの中間コマは落ちるが、最後のコマは必ず待機枠に残る = 着地点は必ず届く。
+let g2SendLock = false            // ブリッジ送信中 (全経路共通の in-flight フラグ)
+let g2RenderPending = false       // full render の待機枠 (latest-wins)
 let g2RenderPendingForce = false  // 待機要求の force を OR で蓄積
 let g2RenderDeferredAt: number | null = null  // scroll 中の full render 延期開始時刻
+let g2ContentQueued: string | null = null     // content-only の待機枠 (latest-wins)
 
+/** scroll アニメ中に full render を延期できる上限 (ms)。超えたら安全弁として実行する。 */
+const G2_RENDER_DEFER_MAX_MS = 2000
+
+// 直近でレンズへ送った (= 送信を予約した) 各コンテナの内容。同一なら送らない。
+// ポーリング由来の再描画要求も、この 3 つと突き合わせて変化が無ければ丸ごと捨てる
+// (g2WouldChange 参照)。dedup の基準はここ 1 箇所だけに持つ。
 let g2ContentLastSent: string | null = null
+let g2HeaderLastSent: string | null = null
+let g2FooterLastSent: string | null = null
 
+/** 送信済みマークを取り消す。送信に失敗した内容が「送った」ままだと再送されないため。 */
+function invalidateG2Dedup(): void {
+  g2ContentLastSent = null
+  g2HeaderLastSent = null
+  g2FooterLastSent = null
+}
+
+/**
+ * いま full render を実行してよいか (true = 延期する)。
+ * scroll アニメ中は content-only で足りるので full render を先送りし、
+ * アニメ終了時に flushDeferredRender から発火させる。長期ブロックを防ぐため
+ * G2_RENDER_DEFER_MAX_MS の安全弁を持つ。
+ */
+function isFullRenderDeferred(now: number): boolean {
+  // speed-0 パスは timer を使わないので scrollAnimTimer === null → 延期しない
+  if (scrollAnimTimer === null) {
+    g2RenderDeferredAt = null
+    return false
+  }
+  if (g2RenderDeferredAt === null) {
+    g2RenderDeferredAt = now
+    console.log('[refreshG2] deferred: scroll anim active')
+  }
+  if (now - g2RenderDeferredAt < G2_RENDER_DEFER_MAX_MS) return true
+  // 安全弁: 延期しすぎ — 解除して実行させる
+  console.log(`[refreshG2] safety valve: deferred >${G2_RENDER_DEFER_MAX_MS}ms, executing`)
+  g2RenderDeferredAt = null
+  return false
+}
+
+/**
+ * scroll 中のレンズ本文更新 (content コンテナのみ)。
+ * 送信中なら待機枠に置くだけで、待機枠は常に最新で上書きされる (途中のコマは捨てる)。
+ * 送信そのものはポンプが直列に行うので、ここから SDK へ直接投げることはない。
+ */
 function sendContentDirect(content: string): void {
   if (content === g2ContentLastSent) return
   g2ContentLastSent = content
-  void updateContent(content).catch((err) => log(`G2 content-direct error: ${err}`))
+  g2ContentQueued = content
+  void pumpG2Sends()
+}
+
+/**
+ * レンズ送信路のポンプ。待機枠が空になるまで 1 件ずつ、必ず完了を待って送る。
+ * g2SendLock を握れなかった呼び出しは即座に戻る (握っている側が解放時に呼び直す)。
+ */
+async function pumpG2Sends(): Promise<void> {
+  if (g2SendLock) return  // 誰かが送信路を握っている。解放時に必ずここが再度呼ばれる
+  g2SendLock = true
+  try {
+    for (;;) {
+      // full render を優先する (content-only より新しい状態を丸ごと反映するため)
+      if (g2RenderPending && !isFullRenderDeferred(performance.now())) {
+        const force = g2RenderPendingForce
+        g2RenderPending = false
+        g2RenderPendingForce = false
+        // full render は content も送り直すので、待機中の content-only は用済み
+        g2ContentQueued = null
+        await executeFullRender(force)
+        continue
+      }
+      const content = g2ContentQueued
+      if (content === null) break  // full render が延期中ならここで抜ける (アニメ終了時に再開)
+      g2ContentQueued = null
+      try {
+        await updateContent(content)
+      } catch (err) {
+        // ブリッジ側のタイムアウト/失敗。送れていない内容を送信済みにしない
+        if (g2ContentLastSent === content) g2ContentLastSent = null
+        log(`G2 content-direct error: ${err}`)
+      }
+    }
+  } finally {
+    // renderer 側の 5 秒タイムアウトが必ず reject/resolve を返すので、
+    // ここに到達せずロックが漏れることはない
+    g2SendLock = false
+  }
 }
 
 /**
  * G2 レンズの全面更新 (header + content + footer) を要求する。
- * 同時に 1 つしか実行されず、実行中の要求は coalesce されて完了後に 1 回だけ再描画。
+ * 実際の送信はポンプが直列に行い、実行中の要求は待機枠で latest-wins に畳まれる。
  * force=false の場合はスロットル (G2_REFRESH_THROTTLE_MS) が適用される。
  */
 async function refreshG2(force = false): Promise<void> {
@@ -1222,90 +1325,91 @@ async function refreshG2(force = false): Promise<void> {
     console.log(`[refreshG2] throttled (Δ=${(now - g2RefreshLastAt).toFixed(0)}ms)`)
     return
   }
-  // scroll アニメ中は full render を延期する (content-only で十分)。
-  // ただし 2000ms 安全弁を超えたら強制実行する。
-  // speed-0 パスは timer を使わないので scrollAnimTimer === null → 延期しない。
-  if (scrollAnimTimer !== null) {
-    if (g2RenderDeferredAt === null) g2RenderDeferredAt = now
-    if (now - g2RenderDeferredAt < 2000) {
-      g2RenderPending = true
-      g2RenderPendingForce = g2RenderPendingForce || force
-      console.log(`[refreshG2] deferred: scroll anim active (force=${force})`)
-      return
-    }
-    // 安全弁: 2000ms 超過 — 延期解除して実行する
-    console.log('[refreshG2] safety valve: deferred >2000ms, executing')
-    g2RenderDeferredAt = null
-  }
-  // ロック中なら pending に積む (latest-wins: 実行完了後に最新状態で 1 回だけ再描画)
-  if (g2SendLock) {
-    g2RenderPending = true
-    g2RenderPendingForce = g2RenderPendingForce || force
-    console.log(`[refreshG2] queued (force=${force})`)
-    return
-  }
-  await executeFullRender(force)
+  // 待機枠に積むだけ (latest-wins)。送信するかどうか/いつかはポンプが決める。
+  g2RenderPending = true
+  g2RenderPendingForce = g2RenderPendingForce || force
+  await pumpG2Sends()
 }
 
 /**
- * full render 実行ループ。pending がある間は完了後にもう 1 回実行する。
- * ロックの取得/解放とエラーハンドリングを 1 箇所に集約する。
+ * full render を 1 回だけ実行する。ポンプからのみ呼ぶ
+ * (g2SendLock は呼び出し側が握っている前提)。
  */
 async function executeFullRender(force: boolean): Promise<void> {
+  g2RefreshLastAt = performance.now()
+  // ここで例外を外に出さない (ポンプのループを止めないため)。
+  try {
+    // header / content / footer を同期的に一括ビルド (同一 phase スナップショット)
+    const header = buildG2Header()
+    const content = buildG2Content()
+    const footer = buildG2Footer()
+    // dedup 基準を更新: scroll tick とポーリング由来の再描画がこの 3 つと突き合わせる
+    g2HeaderLastSent = header
+    g2ContentLastSent = content
+    g2FooterLastSent = footer
+    console.log(`[refreshG2] firing (phase=${phase}, force=${force})`)
+    await updateHeader(header)
+    await updateContent(content)
+    await updateFooter(footer)
+  } catch (err) {
+    invalidateG2Dedup()
+    log(`G2 refresh error: ${err}`)
+  }
+}
+
+/**
+ * ポンプの待機枠に載らない特殊な送信 (ページ再構築 / プラグイン遷移前の告知) を、
+ * 同じ送信路のロックを取ってから実行する。これで「ポンプ外の送信」も in-flight 1 本の
+ * 制約に収まり、ポンプの送信と混ざらない。
+ * ロック中は解放されるまで待つ (ドロップではなくキューイング)。
+ */
+async function runExclusiveG2Send(body: () => Promise<void>): Promise<void> {
+  // ロック取得を待つ: 他の送信が完了するまでスピンしない Promise で待機
+  while (g2SendLock) {
+    await new Promise((r) => setTimeout(r, 16))
+  }
   g2SendLock = true
   try {
-    // ── render loop: pending がある限り最新状態で再描画 ──
-    let currentForce = force
-    do {
-      // pending フラグをクリア (この render 中に新しい要求が来たら再度立つ)
-      g2RenderPending = false
-      g2RenderPendingForce = false
-      g2RefreshLastAt = performance.now()
-      // header / content / footer を同期的に一括ビルド (同一 phase スナップショット)
-      const header = buildG2Header()
-      const content = buildG2Content()
-      const footer = buildG2Footer()
-      // scroll dedup: full render が送った content と同一なら scroll tick は送信をスキップする
-      g2ContentLastSent = content
-      try {
-        console.log(`[refreshG2] firing (phase=${phase}, force=${currentForce})`)
-        await updateHeader(header)
-        await updateContent(content)
-        await updateFooter(footer)
-      } catch (err) {
-        log(`G2 refresh error: ${err}`)
-      }
-      // pending が溜まっていたら次のイテレーションへ
-      currentForce = g2RenderPendingForce
-    } while (g2RenderPending)
+    await body()
   } finally {
     g2SendLock = false
+    // 溜まっていた待機枠 (full render / content-only) を流す
+    void pumpG2Sends()
   }
 }
 
 /**
  * showScreen (rebuildPageContainer) をロック経由で呼ぶ。
  * boot / foreground 再入場 / 言語切替などページ全体再構築時に使う。
- * ロック中ならページ再構築が終わるまで待つ (ドロップではなくキューイング)。
  */
 async function sendShowScreen(header: string, content: string, footer: string): Promise<void> {
-  // ロック取得を待つ: 他の SDK 送信が完了するまでスピンしない Promise で待機
-  while (g2SendLock) {
-    await new Promise((r) => setTimeout(r, 16))
-  }
-  g2SendLock = true
-  try {
-    await showScreen(header, content, footer)
-  } finally {
-    g2SendLock = false
-    // showScreen 完了後に pending full render があれば実行する
-    if (g2RenderPending) {
-      const force = g2RenderPendingForce
-      g2RenderPending = false
-      g2RenderPendingForce = false
-      void executeFullRender(force)
+  await runExclusiveG2Send(async () => {
+    // ページ全体を送り直すので、待機中の content-only は用済み。dedup 基準も更新する。
+    g2ContentQueued = null
+    g2HeaderLastSent = header
+    g2ContentLastSent = content
+    g2FooterLastSent = footer
+    try {
+      await showScreen(header, content, footer)
+    } catch (err) {
+      invalidateG2Dedup()
+      throw err
     }
-  }
+  })
+}
+
+/**
+ * 現在の状態を送ったとき、前回送った内容から 1 つでも変わるか。
+ *
+ * ポーリングは成功のたびに全面更新を要求してくるが、内容が同じなら 3 フレームを
+ * ブリッジへ流し込んでも表示は 1px も変わらない。無操作でも 1.5 秒ごとに供給が
+ * 続くため、これがキューへの定常的な負荷源になっていた。変化の無いポーリング
+ * 由来の要求はここで捨てる。ユーザ操作起因の描画はこのチェックを通さず即時に描く。
+ */
+function g2WouldChange(): boolean {
+  return buildG2Header() !== g2HeaderLastSent
+    || buildG2Content() !== g2ContentLastSent
+    || buildG2Footer() !== g2FooterLastSent
 }
 
 // ─── Sessions ──────────────────────────────────────────────────────────
@@ -1524,9 +1628,14 @@ async function refreshClaudeData(): Promise<void> {
     } else {
       setOutputDisplay(`(no chat yet for "${targetSession}")`, 'muted')
     }
-    if (phase === 'idle' || phase === 'cc-message' || phase === 'cc-response') void refreshG2(true)
-    // chat を実際に取得して描画している = ユーザは見ている前提なので既読化
-    if (phase === 'idle' || phase === 'cc-message' || phase === 'cc-response') markAsRead(targetSession)
+    if (phase === 'idle' || phase === 'cc-message' || phase === 'cc-response') {
+      // ポーリング由来の再描画は「表示が変わる時だけ」。変わらないのに 1.5 秒ごとに
+      // 全面送信 (3 フレーム) を掛け続けると、レンズ側の消化が追いつかない環境では
+      // それだけで滞留が育つ (g2WouldChange 参照)。
+      if (g2WouldChange()) void refreshG2(true)
+      // chat を実際に取得して描画している = ユーザは見ている前提なので既読化
+      markAsRead(targetSession)
+    }
   } catch (e) {
     // AbortError はセッション切替による意図的キャンセルなので無視する
     if ((e as DOMException).name === 'AbortError') return
@@ -1649,6 +1758,11 @@ function stopAllBackgroundWork(): void {
   toastHideTimer = null
   // 実行中の取得も打ち切る (完了時に描画へ回るため)
   abortInFlightRefresh()
+  // レンズ送信の待機枠も捨てる。残しておくと in-flight が捌けた瞬間に headlenss の
+  // フレームがプラグインのページに 1 枚だけ被さる。
+  g2RenderPending = false
+  g2RenderPendingForce = false
+  g2ContentQueued = null
   // 取り込み後、SDK がブリッジ単例を再利用する実装でも headlenss のハンドラが誤発火しないよう無効化する
   setEventHandlers({
     onScrollUp: () => {},
@@ -2368,8 +2482,17 @@ function openG2Plugin(plugin: G2PluginInfo): void {
   log(`plugin を開きます: ${plugin.name} -> ${url}`)
   void (async () => {
     try {
-      await updateHeader(plugin.name)
-      await updateContent(`${t('pluginConnecting')}\n${url}`)
+      // 送信路のロックを取ってから出す。ポンプが送っている最中に割り込むと
+      // 「接続中」の後ろに headlenss のフレームが上書きされる。
+      await runExclusiveG2Send(async () => {
+        // これ以降レンズは headlenss の画面ではないので、待機枠と dedup 基準を捨てる
+        g2RenderPending = false
+        g2RenderPendingForce = false
+        g2ContentQueued = null
+        invalidateG2Dedup()
+        await updateHeader(plugin.name)
+        await updateContent(`${t('pluginConnecting')}\n${url}`)
+      })
       await new Promise((r) => setTimeout(r, PLUGIN_NAVIGATE_DELAY_MS))
     } catch (err) {
       log(`plugin を開く前の描画エラー: ${err}`)
