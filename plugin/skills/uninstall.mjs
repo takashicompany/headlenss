@@ -6,27 +6,17 @@
 // 削除対象はリポジトリの現在のファイル一覧ではなく ~/.claude/skills/ 側の走査で決める。
 // (スキルを削除・改名しても、旧バージョンでインストールしたものが取り残されないため。)
 
-import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, readdirSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 
+// マーカーの中身まで見る判定 (install.mjs と共通)。
+import { isHeadlenssSkill } from './marker.mjs';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const sourceRoot = __dirname;
 const skillsDir = resolve(homedir(), '.claude', 'skills');
-
-const MARKER_NAME = '.headlenss-skill.json';
-
-// マーカーの中身まで見る (たまたま同名のファイルがあるだけのものを消さない)。
-function isHeadlenssSkill(destDir) {
-  const marker = join(destDir, MARKER_NAME);
-  if (!existsSync(marker)) return false;
-  try {
-    return JSON.parse(readFileSync(marker, 'utf8')).installedBy === 'headlenss';
-  } catch {
-    return false;
-  }
-}
 
 // 「同名の自作スキルを残した」旨を伝えるためだけに使う (削除判定には使わない)。
 function repoSkillNames() {

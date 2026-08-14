@@ -99,8 +99,10 @@ export type RespondInput = (
 }
 
 /**
- * 応答 POST が「対象の用件が既に入れ替わっている」で弾かれた (409) ことを表す。
- * 呼び出し側は構築中の回答を捨てて取り直す判断に使う。
+ * 応答 POST が「対象の用件が既に入れ替わっている」で弾かれた (409 code=pending_mismatch)
+ * ことを表す。呼び出し側は構築中の回答を捨てて取り直す判断に使う。
+ * 同じ 409 でも二重送信 (already_processing) 等はこれに含めない
+ * (入れ替わっていないのに「入れ替わった」と案内してしまうため)。
  */
 export class PendingConflictError extends Error {
   constructor(message: string) {
@@ -222,9 +224,13 @@ export class HeadlenssClient {
     })
     if (!res.ok) {
       const body = await res.text().catch(() => '')
-      // 409 = 応答先の用件が入れ替わっている (pendingId 不一致 / 既に解決済み)。
-      // 呼び出し側が「回答を捨てて取り直す」判断をできるよう型で区別する。
-      if (res.status === 409) {
+      // 409 のうち「応答先の用件が入れ替わっている」(code=pending_mismatch) だけを
+      // 型で区別する。呼び出し側が「回答を捨てて取り直す」判断に使うため。
+      // 他の 409 (already_processing / codex_still_waiting / not_awaitable) は
+      // 用件が入れ替わったわけではないので通常のエラーとして扱う。
+      let code: string | undefined
+      try { code = (JSON.parse(body) as { code?: string }).code } catch { /* 非 JSON 応答 */ }
+      if (res.status === 409 && code === 'pending_mismatch') {
         throw new PendingConflictError(`respondClaude HTTP 409: ${body.slice(0, 200)}`)
       }
       throw new Error(`respondClaude HTTP ${res.status}: ${body.slice(0, 200)}`)

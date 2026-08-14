@@ -316,6 +316,14 @@ let respondQIdx = 0                              // 複数質問時、現在表�
 // なぜ: 画面を開いている間もポーリングは走り続けるので、用件が入れ替わった (別の承認/質問に
 // なった) ことに気付かないと、古い画面で作った回答を新しい用件へ送ってしまう。
 let respondPendingId: string | null = null
+// 応答 POST の実行中フラグ。
+// なぜ: 送信は数百ms〜秒単位かかる (サーバが tmux にキーを注入して確認するまで) ので、
+// その間の再タップで同じ用件へ 2 通目を送ってしまう。送信中は応答画面の入力を捨てる。
+let respondInFlight = false
+/** 応答 POST 中の応答画面 (cc-message / cc-response) の入力か。true なら無視する。 */
+function respondInputBlocked(): boolean {
+  return respondInFlight && (phase === 'cc-message' || phase === 'cc-response')
+}
 // AskUserQuestion 回答ビルド用: 各質問について構築中の回答を保持
 type RespondAnswer =
   | { kind: 'predefined'; option?: string; options?: string[] }   // single or multi
@@ -726,7 +734,11 @@ function ccMessageLines(): string[] {
 
   const out: string[] = []
   for (const para of paras) {
-    for (const line of wrapText(para, CHAT_WRAP_PX)) out.push(line)
+    // 段落自体が改行を含むことがある (質問文やツール入力の整形結果)。wrapText は
+    // 改行を知らないので、先に行へ割ってから折り返す (formatChatLines / recordingLines と同じ)。
+    for (const src of para.split('\n')) {
+      for (const line of wrapText(src, CHAT_WRAP_PX)) out.push(line)
+    }
   }
   ccMsgLinesCache = out
   ccMsgLinesCacheKey = key
@@ -1269,8 +1281,9 @@ const G2_RENDER_DEFER_MAX_MS = 2000
 // なぜ: openG2Plugin は「接続中」を出してから遷移するが、その間もポーリング
 // (reloadClaudeSessions / reloadSessions / refreshClaudeData) は完了ごとに
 // refreshG2(true) を要求してくるので、放っておくと接続中表示が一覧で上書きされる。
-// 遷移をキャンセルした時 (ダブルタップ) だけ解除する。取り込み (performTakeover) や
-// トップレベル遷移まで進んだ場合は、以降 headlenss の画面を出す理由が無いので立てたまま。
+// 解除するのは cancelPluginNavigation だけ (ダブルタップでの中止 / 取り込み失敗時の復帰)。
+// 取り込み (performTakeover) やトップレベル遷移まで進んだ場合は、以降 headlenss の画面を
+// 出す理由が無いので立てたままにする。
 let pluginNavBlocksG2Render = false
 
 /** 最後に実際にレンズへ送信した時刻 (performance.now)。低頻度の強制再同期の基準。 */
@@ -1535,6 +1548,9 @@ sessionPillsEl.addEventListener('click', (e) => {
     chatLinesCacheKey = ''
     claudeChatStatus = undefined
     claudeChatLoading = true
+    // 前セッションの用件と作りかけの回答を捨てる (応答画面を開いていたら idle に戻る)。
+    // recomputePhase は cc-* を「操作中」として抜けないので、先に phase を落としておく。
+    resetRespondStateForSessionChange()
     renderSessionPills()
     recomputePhase()
     tmuxOutput = ''
@@ -1564,6 +1580,8 @@ async function reloadSessions(verbose = false): Promise<void> {
       abortInFlightRefresh()
       settings.sessionName = lastSessions[0].name
       void persistSettings()
+      // 見ていたセッションが無くなって別セッションへ移った。前の用件は捨てる
+      resetRespondStateForSessionChange()
     }
     // rootlist のカーソル位置がオーバーランしないよう名前解決でクランプ
     resolveRootCursorIndex()
@@ -1678,7 +1696,11 @@ async function refreshClaudeData(): Promise<void> {
       chatLinesCache = formatChatLines(chat, CHAT_WRAP_PX, currentAgentSource)
       chatLinesCacheKey = nextCacheKey
     }
+    // 表示行数を測る前に、末尾の待機行を決める材料 (status と pending) を両方入れ替える。
+    // 片方だけ新しい中間状態で測ると、待機行の有無が実際とは違う判定になり、
+    // pending の出現/消滅のたびに読んでいる位置が 1 行ずれる。
     claudeChatStatus = chatResponse.status
+    claudePending = pending
     // chat: scrollback 中なら増えたぶんだけオフセットを繰り上げて読んでいる位置を保つ
     if (scrollOffset > 0) {
       const delta = chatLinesForDisplay().length - prevDisplayLen
@@ -1686,7 +1708,6 @@ async function refreshClaudeData(): Promise<void> {
     }
     claudeChat = chat
     claudeChatLoading = false
-    claudePending = pending
     // 応答画面を開いている間に、対象の用件そのものが入れ替わっていないかを突き合わせる
     reconcileRespondPending()
     if (chat.length > 0) {
@@ -1760,6 +1781,8 @@ async function killSession(name: string): Promise<void> {
         settings.sessionName = remaining[0].name
         await persistSettings()
       }
+      // 見ていたセッションが消えた = 用件も消えた。作りかけの回答も捨てる
+      resetRespondStateForSessionChange()
     }
     await reloadSessions()
     recomputePhase()
@@ -2496,6 +2519,8 @@ async function abortRecording(): Promise<void> {
 
 async function toggleRecording(): Promise<void> {
   if (phase === 'finalizing' || phase === 'sending') return
+  // 応答 POST 中のタップは無視 (同じ用件へ 2 通目を送らせない)
+  if (respondInputBlocked()) return
   if (phase === 'recording') {
     await stopRecordingToPending()
   } else if (phase === 'pending') {
@@ -2554,6 +2579,9 @@ const PLUGIN_NAVIGATE_DELAY_MS = 400
 let navigatingToPlugin = false
 // 取り込み用 fetch の中断口 (Connecting 中のダブルタップ中止で使う)
 let pluginNavAbort: AbortController | null = null
+// boot で登録した G2 入力ハンドラの再登録口。取り込み直前に no-op へ差し替えるので、
+// 取り込みに失敗して headlenss に戻る時はこれで操作を復活させる。
+let reinstallG2EventHandlers: (() => void) | null = null
 
 /**
  * セッション配下の G2 プラグインへ WebView ごと遷移する。
@@ -2568,7 +2596,8 @@ function openG2Plugin(plugin: G2PluginInfo): void {
   navigatingToPlugin = true
   // 「接続中」を出した後、遷移が完了するまでポーリング由来の再描画で上書きされないよう
   // レンズ描画を止める。取り込み経路 (performTakeover) / トップレベル遷移 (location.assign)
-  // のどちらに進んでも解除しない (キャンセル時のみ解除する)。
+  // のどちらに進んでも解除しない。解除は cancelPluginNavigation 経由だけ
+  // (ダブルタップでの中止 / 取り込みに失敗して headlenss に戻る時)。
   pluginNavBlocksG2Render = true
   pluginNavAbort = new AbortController()
   log(`plugin を開きます: ${plugin.name} -> ${url}`)
@@ -2602,8 +2631,19 @@ function openG2Plugin(plugin: G2PluginInfo): void {
       // 裏で回り続け、プラグインの描画と奪い合う。
       stopAllBackgroundWork()
       log('plugin を取り込みます (ページ置き換え)')
-      performTakeover(html, url, log)
-      return
+      try {
+        performTakeover(html, url, log)
+        return
+      } catch (err) {
+        // 取り込みに失敗するとレンズは「接続中」のまま、背景処理も入力ハンドラも
+        // 止めた後なので、何も起きない画面で固まる。描画停止を解いて headlenss の
+        // 画面へ戻し、操作とポーリングも復活させる。
+        log(`plugin の取り込みに失敗しました: ${err}`)
+        reinstallG2EventHandlers?.()
+        cancelPluginNavigation()
+        startOutputPolling()
+        return
+      }
     }
 
     // 取り込めない場合 (CORS 拒否 / 非 HTML / 応答なし / 既にシム注入済み) は
@@ -2626,10 +2666,21 @@ function openG2Plugin(plugin: G2PluginInfo): void {
  * (遷移が成功した場合はページごと破棄されるのでこの処理は動かない)
  */
 function cancelPluginNavigation(): void {
-  if (!navigatingToPlugin) return
-  navigatingToPlugin = false
-  // 遷移しないのでレンズは headlenss のもの。描画停止を解除する (この後の refreshG2 用)
+  // 描画停止の解除だけは early-return より前に必ず行う。
+  // なぜ: 解除を navigatingToPlugin に依存させると、遷移フラグが先に降りている状態
+  // (取り込み失敗の後始末など) から呼ばれた時に解除されず、レンズが「接続中」のまま
+  // 二度と描き替わらなくなる。
+  const wasBlocked = pluginNavBlocksG2Render
   pluginNavBlocksG2Render = false
+  if (!navigatingToPlugin) {
+    // 遷移中でなければ中止すべきものは無い。描画だけ止まっていたなら描き直す。
+    if (wasBlocked) {
+      markPageAlreadyBuilt()
+      void refreshG2(true)
+    }
+    return
+  }
+  navigatingToPlugin = false
   log('plugin を開くのを中止しました')
   // 取り込み用 fetch と、保留中のトップレベル遷移の両方を止める
   pluginNavAbort?.abort()
@@ -2670,8 +2721,8 @@ function openSelectedFromRoot(): void {
   claudeChatStatus = undefined
   claudeChatLoading = true
   currentAgentSource = sel.source
-  claudePending = null
-  respondPendingId = null
+  // 前セッションの用件と作りかけの回答を捨てる (応答画面から直接来た場合も含む)
+  resetRespondStateForSessionChange()
   resetScroll()
   phase = 'idle'
   paintStatus()
@@ -2779,6 +2830,28 @@ function cancelCcRespond(): void {
 }
 
 /**
+ * セッションが切り替わった時の応答系の後始末。
+ * なぜ: 用件 (pending) はセッションごとのものなので、切替後もそのまま持っていると
+ * 前のセッションの用件に対する作りかけの回答が、次に来た用件の画面に混ざる。
+ * 応答画面を開いていた場合は idle に戻す (呼び出し側で描画を更新すること)。
+ */
+function resetRespondStateForSessionChange(): void {
+  const wasResponding = phase === 'cc-message' || phase === 'cc-response'
+  claudePending = null
+  respondPendingId = null
+  respondCursor = 0
+  respondQIdx = 0
+  respondAnswers = {}
+  recordingPurpose = 'tmux'
+  ccMsgScrollOffset = 0
+  if (!wasResponding) return
+  phase = 'idle'
+  paintStatus()
+  updateRecordButton()
+  void refreshG2(true)
+}
+
+/**
  * ポーリング結果と応答画面の突き合わせ。cc-message / cc-response を開いている間に
  * 対象の pending が消えた / 別物に入れ替わった場合の始末をする。
  * なぜ: 気付かずに操作を続けると、古い用件のつもりで作った回答が別の用件に送られる。
@@ -2818,6 +2891,8 @@ async function sendPendingResponseAndFinish(): Promise<void> {
   // 応答は「この用件に対する回答」であることを id で明示する。サーバ側で現在の
   // pending と食い違っていたら 409 が返るので、取り違えた回答が通ることはない。
   const pendingId = claudePending.id
+  if (respondInFlight) return   // 同じ用件への 2 通目 (再タップ) は出さない
+  respondInFlight = true
   try {
     if (claudePending.kind === 'permission') {
       const decision = respondCursor === 0 ? 'allow' : 'deny'
@@ -2854,17 +2929,25 @@ async function sendPendingResponseAndFinish(): Promise<void> {
       log(`respond error: ${(e as Error).message}`)
     }
   } finally {
-    claudePending = null
-    respondCursor = 0
-    respondQIdx = 0
-    respondAnswers = {}
-    respondPendingId = null
-    recordingPurpose = 'tmux'
-    ccMsgScrollOffset = 0
-    phase = 'idle'
-    paintStatus()
-    updateRecordButton()
-    void refreshG2(true)
+    respondInFlight = false
+    // POST の間に画面が別の用件へ移っていた (ポーリングで入れ替わり検知 / セッション切替 /
+    // ダブルタップでキャンセル) 場合、新しい回答フローの状態を壊さないよう何もしない。
+    // 後始末をするのは「今も自分が答えた用件を対象にしている」時だけ。
+    if (respondPendingId === pendingId) {
+      // 楽観的に用件を消す。取り違え防止のため、消すのも自分が答えた用件の時だけ。
+      if (claudePending?.id === pendingId) claudePending = null
+      respondCursor = 0
+      respondQIdx = 0
+      respondAnswers = {}
+      respondPendingId = null
+      recordingPurpose = 'tmux'
+      ccMsgScrollOffset = 0
+      phase = 'idle'
+      paintStatus()
+      updateRecordButton()
+      void refreshG2(true)
+    }
+    // 状態の再同期はどちらの場合も行う (新しい用件の有無をサーバに聞き直す)
     void refreshClaudeData()
   }
 }
@@ -3257,7 +3340,8 @@ async function changeLanguage(lang: Language): Promise<void> {
   }
   await persistSettings()
   // G2 レンズも「言語切替」を 1 つの画面遷移と扱って rebuildPageContainer で再描画。
-  if (bridge) {
+  // プラグイン遷移中は描かない (refreshG2 と同じ理由: 「接続中」を上書きしてしまう)。
+  if (bridge && !pluginNavBlocksG2Render) {
     try {
       await sendShowScreen(buildG2Header(), buildG2Content(), buildG2Footer())
     } catch (err) {
@@ -3295,13 +3379,16 @@ async function boot(): Promise<void> {
     initRenderer(bridge)
     // renderer 内から出る例外的な送信 (復帰後ガード再描画) も、この 1 本の直列路を通す
     setRendererExclusiveSender(runExclusiveG2Send)
-    setEventHandlers({
+    // 取り込み (performTakeover) の直前に no-op へ差し替えるので、取り込みに失敗して
+    // headlenss に戻る時に同じ内容を再登録できるよう、登録処理を関数で持っておく。
+    const installHandlers = (): void => setEventHandlers({
       // rootlist: 上下=カーソル / click=open / dbl=OS終了
       // pending:  上=送信 / 下=テキスト削除 / dbl=破棄して idle へ
       // idle:     上=過去ログ / 下=新しい方へ / dbl=root へ戻る
       // cc-message:  上下=本文スクロール / click=選択肢画面へ / dbl=キャンセルして idle へ
       // cc-response: 上下=選択肢移動 / dbl=cc-message へ戻る
       onScrollUp: () => {
+        if (respondInputBlocked()) return  // 応答 POST 中は応答画面の入力を無視
         if (phase === 'rootlist') moveRootCursor(-1)
         else if (phase === 'pending') void confirmAndSend()
         else if (phase === 'idle') scrollBack()
@@ -3310,6 +3397,7 @@ async function boot(): Promise<void> {
         else if (phase === 'cc-response') moveRespondCursor(-1)
       },
       onScrollDown: () => {
+        if (respondInputBlocked()) return  // 応答 POST 中は応答画面の入力を無視
         if (phase === 'rootlist') moveRootCursor(1)
         else if (phase === 'pending') removeLastSentence() // 末尾1文だけ削除。空になれば idle
         else if (phase === 'idle') scrollForward()
@@ -3322,7 +3410,8 @@ async function boot(): Promise<void> {
       onDoubleClick: () => {
         // プラグインへの遷移待ちで固まっている場合は、まずそれを中止する。
         // (接続先が落ちていると Connecting 表示のまま戻れなくなるため)
-        if (navigatingToPlugin) { cancelPluginNavigation(); return }
+        // 描画停止だけが残っている状態 (取り込み直前で失敗した等) も同じ口で解く。
+        if (navigatingToPlugin || pluginNavBlocksG2Render) { cancelPluginNavigation(); return }
         if (phase === 'idle') backToRoot()
         else if (phase === 'recording') void abortRecording()  // 録音中止 (新しい文は追加しない)
         else if (phase === 'pending') discardPending()         // pending 全破棄 → idle
@@ -3347,6 +3436,12 @@ async function boot(): Promise<void> {
       },
       // G2 アプリ画面に戻ってきたとき: ページを再生成して最新の tmux 出力を再描画
       onForegroundEnter: () => {
+        if (pluginNavBlocksG2Render) {
+          // プラグイン遷移中 (location.assign 待ち等)。ここで描くと「接続中」が
+          // headlenss の画面で上書きされ、遷移先が出るまでの間だけ一覧に戻って見える。
+          log('foreground enter — plugin 遷移中なので再描画しません')
+          return
+        }
         log('foreground enter — re-rendering lens')
         resetPageState()
         void (async () => {
@@ -3372,6 +3467,8 @@ async function boot(): Promise<void> {
       },
       onLog: (msg) => log(msg),
     })
+    reinstallG2EventHandlers = installHandlers
+    installHandlers()
     try {
       await sendShowScreen(buildG2Header(), buildG2Content(), buildG2Footer())
       bridge.onEvenHubEvent(onEvenHubEvent)

@@ -67,6 +67,10 @@ button {
   max-width: 720px;
   margin: 0 auto;
   padding: 1.5rem 1rem;
+  /* standalone 起動 (viewport-fit=cover) では画面がステータスバー / ホームインジケータの
+     下まで伸びるので、その分の余白を足す。通常ブラウザでは inset が 0 なので変化なし。 */
+  padding-top: calc(1.5rem + env(safe-area-inset-top));
+  padding-bottom: calc(1.5rem + env(safe-area-inset-bottom));
   min-height: 100%;
 }
 
@@ -287,6 +291,10 @@ button {
   align-items: center;
   gap: 1rem;
   padding: 0.5rem 1rem;
+  /* .page-session は padding 0 なのでヘッダ行が画面最上端に来る。standalone では
+     そこがステータスバーの下になるため、安全域の分だけ上に余白を足す
+     (通常ブラウザでは inset が 0 = 従来どおり)。 */
+  padding-top: calc(0.5rem + env(safe-area-inset-top));
   background: var(--panel);
   border-bottom: 1px solid var(--border);
 }
@@ -1039,6 +1047,9 @@ button {
   display: flex;
   gap: 0.5rem;
   padding: 0.6rem 0.75rem;
+  /* viewport-fit=cover では画面下端 (ホームインジケータ) まで領域が伸びるので、
+     入力欄が隠れないよう下端の安全域を足す。通常ブラウザでは inset が 0。 */
+  padding-bottom: calc(0.6rem + env(safe-area-inset-bottom));
   background: var(--panel);
   border-top: 1px solid var(--border);
 }
@@ -1109,6 +1120,9 @@ button {
   flex: 1;
   background: #0e0e10;
   padding: 0.5rem;
+  /* viewport-fit=cover で画面下端まで伸びるため、最下行がホームインジケータに
+     重ならないよう安全域を足す。通常ブラウザでは inset が 0。 */
+  padding-bottom: calc(0.5rem + env(safe-area-inset-bottom));
   overflow: hidden;
   /* .xterm-viewport (overflow-y: scroll) に iOS のネイティブ慣性スクロールを任せる。
      縦パンだけブラウザに渡し、横スワイプ「戻る」ジェスチャは抑止。 */

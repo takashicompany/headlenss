@@ -144,6 +144,36 @@ export function clearPending(tmuxName: string): void {
 }
 
 /**
+ * id が一致する時だけ pending を消す。
+ * 応答処理には await (tmux へのキー注入等) が挟まるので、その間に用件が別物へ
+ * 入れ替わっていることがある。無条件に clearPending すると、後から出てきた
+ * 新しい用件を「答え終わった古い用件のつもり」で消してしまう。
+ * @returns 実際に消したら true
+ */
+export function clearPendingIfId(tmuxName: string, pendingId: string): boolean {
+  const s = sessions.get(tmuxName);
+  if (!s || s.pending?.id !== pendingId) return false;
+  clearPending(tmuxName);
+  return true;
+}
+
+// 応答処理中の pending id。同じ用件への 2 件目の応答 (再タップ / 複数クライアント) を
+// 弾くために持つ。pending id は UUID なので tmux セッションを跨いでも衝突しない。
+const respondingPendingIds = new Set<string>();
+
+/** 応答処理の開始を宣言する (原子的 claim)。既に同じ用件を処理中なら false。 */
+export function claimPendingForRespond(pendingId: string): boolean {
+  if (respondingPendingIds.has(pendingId)) return false;
+  respondingPendingIds.add(pendingId);
+  return true;
+}
+
+/** claimPendingForRespond の解放。応答処理の finally で必ず呼ぶ。 */
+export function releasePendingForRespond(pendingId: string): void {
+  respondingPendingIds.delete(pendingId);
+}
+
+/**
  * Register a long-poll resolver that will be called when G2 responds (or session ends).
  * Returns a Promise that resolves to the hook decision.
  */

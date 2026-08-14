@@ -23,7 +23,7 @@ import {
   pruneSessionStatusObservations,
   resolveTrackedSessionStatus,
 } from '../session-status.ts';
-import type { AskQuestion, ChatItem, HookDecision, RespondInput, SessionStatus } from './types.ts';
+import type { AskQuestion, ChatItem, HookDecision, Pending, RespondInput, SessionStatus } from './types.ts';
 
 const exec = promisify(execFile);
 
@@ -83,7 +83,8 @@ async function clearStaleCodexPermissionIfTmuxNoLongerAsking(tmuxName: string): 
   try {
     const pane = await captureOutput(tmuxName, 80);
     const stillAsking = isCodexPermissionPrompt(pane);
-    if (!stillAsking) store.clearPending(tmuxName);
+    // capture の間に別の用件へ入れ替わっていることがあるので、見に行った当人だけを消す
+    if (!stillAsking) store.clearPendingIfId(tmuxName, pending.id);
   } catch {
     // If tmux capture fails, leave the pending alone; normal cleanup paths can still clear it.
   }
@@ -460,7 +461,9 @@ function startTuiAnswerWatcher(tmuxName: string, toolUseId: string, transcriptPa
                   (block as { tool_use_id?: string }).tool_use_id === toolUseId
                 ) {
                   console.log(`[watcher] TUI answered (tool_use_id=${toolUseId}), clearing pending for ${tmuxName}`);
-                  store.clearPending(tmuxName);
+                  // 監視していた用件が今も現役の時だけ消す (次の用件を巻き込まない)
+                  const cur = store.getPending(tmuxName);
+                  if (cur?.toolUseId === toolUseId) store.clearPendingIfId(tmuxName, cur.id);
                   cancelled = true;
                   return;
                 }
@@ -521,7 +524,9 @@ claudeRouter.post('/hooks/permission-request', async (c) => {
   });
 
   const decision = await store.awaitPendingResolution(pending.id, PENDING_TIMEOUT_MS);
-  store.clearPending(tmuxName);
+  // 待っている間に別の用件が作られていることがある (タイムアウト時など)。
+  // 自分が作った用件だけを消す。
+  store.clearPendingIfId(tmuxName, pending.id);
 
   if (decision.event === 'PermissionRequest') {
     return c.json({
@@ -894,8 +899,30 @@ claudeRouter.post('/claude/sessions/:tmuxName/respond', async (c) => {
   // pendingId を送ってこない旧クライアントは従来どおり受理する (後方互換)。
   if (body.pendingId && body.pendingId !== pending.id) {
     console.log(`[respond] pending mismatch: body=${body.pendingId} current=${pending.id}`);
-    return c.json({ error: 'pending mismatch', currentPendingId: pending.id }, 409);
+    return c.json({ error: 'pending mismatch', code: 'pending_mismatch', currentPendingId: pending.id }, 409);
   }
+  // 応答処理の開始をここで原子的に宣言する (最初の await より前)。
+  // なぜ: 応答処理には tmux へのキー注入など時間の掛かる await が挟まるので、
+  // 同じ用件へ 2 件目 (グラスの再タップ / 別クライアント) が入ると同じキーを二度送り、
+  // 片方の後始末が他方の状態を消してしまう。
+  if (!store.claimPendingForRespond(pending.id)) {
+    console.log(`[respond] already processing: pending=${pending.id}`);
+    return c.json({ error: 'already processing this pending', code: 'already_processing', currentPendingId: pending.id }, 409);
+  }
+  try {
+    return await processRespond(c, tmuxName, pending, body);
+  } finally {
+    store.releasePendingForRespond(pending.id);
+  }
+});
+
+/** respond の本処理。claim 済みの pending に対してのみ呼ばれる。 */
+async function processRespond(
+  c: Context,
+  tmuxName: string,
+  pending: Pending,
+  body: RespondInput,
+): Promise<Response> {
   console.log(`[respond] tmux=${tmuxName} kind=${body.kind} hookEvent=${pending.hookEvent}`);
 
   let decision: HookDecision;
@@ -945,8 +972,10 @@ claudeRouter.post('/claude/sessions/:tmuxName/respond', async (c) => {
         return `${head}${a.question}\n${line}`.trim();
       });
       store.appendChat(tmuxName, 'user', summaryLines.join('\n\n'), { origin: 'ui' });
-      // pending を即 clear(楽観的)、watcher も止める
-      store.clearPending(tmuxName);
+      // pending を即 clear(楽観的)、watcher も止める。
+      // キー注入の間に用件が入れ替わっていることがあるので、消すのは自分が答えた
+      // 用件が今も現役の時だけ (新しい用件を巻き込んで消さない)。
+      store.clearPendingIfId(tmuxName, pending.id);
       tuiWatchers.get(tmuxName)?.cancel();
       return c.json({ ok: true });
     } else {
@@ -958,7 +987,7 @@ claudeRouter.post('/claude/sessions/:tmuxName/respond', async (c) => {
         try {
           const before = await captureOutput(tmuxName, 60);
           if (!isCodexPermissionPrompt(before)) {
-            store.clearPending(tmuxName);
+            store.clearPendingIfId(tmuxName, pending.id);
             return c.json({ ok: true, stale: true });
           }
           if (body.decision === 'allow') {
@@ -971,9 +1000,11 @@ claudeRouter.post('/claude/sessions/:tmuxName/respond', async (c) => {
           await wait(350);
           const after = await captureOutput(tmuxName, 40);
           if (isCodexPermissionPrompt(after)) {
-            return c.json({ error: 'Codex still appears to be waiting for approval in tmux. Open tmux view and approve there.' }, 409);
+            // 用件は入れ替わっていない (tmux がまだ同じ承認を出している) ので
+            // pending_mismatch とは別の code にする。クライアントは通常のエラー扱い。
+            return c.json({ error: 'Codex still appears to be waiting for approval in tmux. Open tmux view and approve there.', code: 'codex_still_waiting' }, 409);
           }
-          store.clearPending(tmuxName);
+          store.clearPendingIfId(tmuxName, pending.id);
           return c.json({ ok: true });
         } catch (e) {
           return c.json({ error: 'failed to send keys to tmux: ' + (e as Error).message }, 500);
@@ -1003,6 +1034,7 @@ claudeRouter.post('/claude/sessions/:tmuxName/respond', async (c) => {
   }
 
   const ok = store.resolvePending(pending.id, decision);
-  if (!ok) return c.json({ error: 'pending not awaitable (already resolved or timed out)' }, 409);
+  // 用件の入れ替わりではなく「その用件の待ち受けが既に終わっている」ので別 code。
+  if (!ok) return c.json({ error: 'pending not awaitable (already resolved or timed out)', code: 'not_awaitable' }, 409);
   return c.json({ ok: true });
-});
+}
