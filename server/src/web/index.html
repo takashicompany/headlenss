@@ -9,6 +9,12 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
     <!-- iOS「ホーム画面に追加」用 (無いとページのスクリーンショットがアイコンになる) -->
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <!-- standalone 宣言。これが無いとホーム画面アイコンはただのブックマーク扱いになり、
+         既定ブラウザで開いてしまう (PWA として単独ウィンドウで開かせるための宣言) -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="HeadLenss" />
     <title>HeadLenss</title>
   </head>
   <body>
