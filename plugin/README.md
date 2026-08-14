@@ -32,6 +32,31 @@ Claude Code がイベントを発火するたびに、headlenss サーバーの 
 
 現状はサーバーURLが `http://localhost:3000` でハードコード。今後 `userConfig` で変更可能にする予定。
 
+## Claude Code skills
+
+`plugin/skills/` に同梱している Claude Code スキル (headlenss 自体の操作手順書) を、
+`~/.claude/skills/<name>/` に**コピー**でインストールする:
+
+```bash
+node /path/to/headlenss/plugin/skills/install.mjs
+# または server/ で: npm run skills:install
+```
+
+- シンボリックリンクではなくコピーなので、リポジトリを移動・削除しても壊れない。
+  更新は `git pull` 後にもう一度実行するだけ (冪等。中身が同じなら何もしない)。
+- 同名スキルが既にあり、それが headlenss 由来でない場合は `<dir>.bak.<timestamp>` に退避してから上書きする。
+- スキル本文のサーバ URL は `HEADLENSS_SERVER_URL=http://<host>:3000` を付けて実行すると差し替わる。
+
+外すとき:
+
+```bash
+node /path/to/headlenss/plugin/skills/uninstall.mjs
+# または server/ で: npm run skills:uninstall
+```
+
+インストール時に各ディレクトリへ `.headlenss-skill.json` (マーカー) を置いており、
+uninstall はそれがあるディレクトリだけを消す (同名の自作スキルは残す)。
+
 ## Codex hooks
 
 This plugin also includes Codex lifecycle hooks under `plugin/codex-hooks/` and `plugin/.codex-plugin/plugin.json`.

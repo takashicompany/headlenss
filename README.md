@@ -51,7 +51,7 @@ Browser (smartphone / PC, web UI)
 headlenss/
 ├── server/   # Server running on the PC (tmux management API + Web UI + ASR)
 ├── even/     # Even G2 app (TS web app running inside the smartphone WebView)
-└── plugin/   # Claude Code plugin (forwards lifecycle hooks to the server)
+└── plugin/   # Claude Code / Codex hooks (forwarded to the server) + bundled Claude Code skills
 ```
 
 ## What It Can Do
@@ -148,7 +148,23 @@ npm run hooks:install   # writes both Claude Code and Codex hooks into ~/.claude
 > This writes hooks directly into `~/.claude/settings.json` (Claude) and `~/.codex/hooks.json` (Codex).
 > **Do NOT also install the marketplace plugin (`/plugin install headlenss@headlenss`)** — running both double-fires the hooks. Pick one. See [plugin/README.md](./plugin/README.md) for details.
 
-### 4. (Optional) Install the G2 app on your smartphone
+### 4. (Optional) Install the bundled Claude Code skills
+
+Teaches Claude Code how to drive HeadLenss itself:
+
+- `headlenss-new-session` — create a new tmux session (an agent workspace) through the API.
+- `headlenss-g2-plugin` — surface a G2 plugin you are developing in the session list and open it from the glasses.
+- `headlenss-dev-server` — run a dev server on the HeadLenss machine and expose it over the tailnet without stealing HeadLenss's ports.
+
+```bash
+cd server
+npm run skills:install   # copies plugin/skills/* into ~/.claude/skills/
+```
+
+- Copies (not symlinks), so the skills keep working even if you move the repo. Re-run it after `git pull` to update; remove with `npm run skills:uninstall`.
+- If your server is not `http://127.0.0.1:3000`: `HEADLENSS_SERVER_URL=http://<host>:3000 npm run skills:install`.
+
+### 5. (Optional) Install the G2 app on your smartphone
 
 Only if you use the physical G2.
 
@@ -169,7 +185,7 @@ On first launch, enter the following in the WebView settings:
 
 You also need to add your PC hostname and the Speechmatics endpoints to the `network` permission `whitelist` in `even/app.json` (see [even/README.md](./even/README.md)).
 
-### 5. Use it
+### 6. Use it
 
 - **From the Web UI**: open `http://<PC hostname>:3000/`, create a tmux session, and operate it.
 - **From G2**: tap to start / stop recording → swipe up to send to tmux / swipe down to discard. While idle the tail of the tmux screen is mirrored on the lens.
