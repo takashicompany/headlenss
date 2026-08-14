@@ -44,8 +44,11 @@ const STRINGS = {
   recStartedHint:      { en: 'Recording — please speak',        ja: '録音開始 — お話しください' },
   chatNoMsg:           { en: '(no messages yet)',               ja: '(まだ発言なし)' },
   chatLoading:         { en: 'Loading...',                      ja: '読み込み中...' },
-  noticeQuestion:      { en: '? Question waiting (tap to answer)',    ja: '? 質問待ち (clickで回答)' },
-  noticePermission:    { en: '⏸ Permission waiting (tap to respond)', ja: '⏸ 承認待ち (clickで応答)' },
+  // Agent の動作状態を chat 末尾に出す待機行。サーバも同義の英語行を合成してくるが、
+  // そちらは synthetic として捨て、表示はこのテーブルで行う (言語に追従させるため)。
+  chatStatusThinking:  { en: '(thinking…)',                     ja: '(考え中…)' },
+  chatStatusWaitPerm:  { en: '(awaiting permission…)',          ja: '(承認待ち…)' },
+  chatStatusWaitQ:     { en: '(awaiting question…)',            ja: '(質問待ち…)' },
   rootListEmpty:       { en: '(no agent session)\n\nStart agent or Codex inside tmux',
                          ja: '(エージェントが動いている tmux が無い)\n\ntmux 内でエージェントを起動してください' },
 
@@ -176,8 +179,11 @@ const STRINGS = {
   g2FootSending:    { en: 'Sending to tmux…',                              ja: 'tmuxに送信中…' },
   g2FootSetup:      { en: 'Set up on phone',                               ja: 'スマホで設定' },
   g2FootIdle:       { en: 'Tap:Rec　↑↓:Scroll　2Tap:Back',         ja: 'タップ:録音　↑↓:履歴　2タップ:戻る' },
-  g2FootIdlePending:{ en: 'Tap:Answer　↑↓:Scroll　2Tap:Back',      ja: 'タップ:応答　↑↓:履歴　2タップ:戻る' },
-  g2FootCcResponse: { en: '↑↓:Pick　Tap:OK　2Tap:Cancel',          ja: '↑↓:選択　タップ:確定　2タップ:取消' },
+  g2FootIdlePending:{ en: 'Tap:Answer　↑↓:Scroll　2Tap:Back',      ja: 'タップ:回答　↑↓:履歴　2タップ:戻る' },
+  // cc-message: メッセージ全文の閲覧画面 (タップで選択肢画面へ)
+  g2FootCcMessage:  { en: 'Tap:Choices　↑↓:Scroll　2Tap:Cancel',    ja: 'タップ:選択肢へ　↑↓:読む　2タップ:取消' },
+  // cc-response: 選択肢画面。2Tap はキャンセルではなく cc-message へ戻る
+  g2FootCcResponse: { en: '↑↓:Pick　Tap:OK　2Tap:Back',             ja: '↑↓:選択　タップ:確定　2タップ:戻る' },
   g2FootCcRespMulti:{ en: '↑↓:Pick　Tap:Toggle & Submit',          ja: '↑↓:選択　タップ:切替　Submitで確定' },
   g2FootCcRespRec:  { en: 'Tap:Done　2Tap:Cancel',                  ja: 'タップ:録音終了　2タップ:取消' },
   g2NoOutput:       { en: '(no output yet)',                    ja: '(まだ出力なし)' },

@@ -159,9 +159,13 @@ const logEl = document.getElementById('log') as HTMLPreElement
 //                                     ↑doubleClick (戻る)
 //   idle ──click──> recording ──click──> pending ──↑scroll──> sending ──> idle
 //                                              └──↓scroll──> idle (破棄)
+//   idle (pending有) ──click──> cc-message ──click──> cc-response ──> (応答送信) idle
+//                                        ↑doubleClick (戻る)┘
+//                          idle <──doubleClick (応答キャンセル)
 type Phase =
   | 'boot' | 'unconfigured' | 'rootlist' | 'idle'
   | 'recording' | 'finalizing' | 'pending' | 'sending'
+  | 'cc-message'   // Claude Code の承認/質問の本文を全文読む画面 (cc-response の手前)
   | 'cc-response'  // Claude Code の承認/質問待ちに応答する画面
   | 'error'
 
@@ -189,7 +193,10 @@ const CHAT_WRAP_PX = MAIN_INNER_WIDTH - 2
 const CHAT_WRAP_WIDTH = 56             // (cc-response の粗いスライス用) 全角28文字相当のカラム数
 const CC_POLL_INTERVAL_MS = 1500       // Agent sessions / chat / pending のポーリング間隔
 const ROOT_LIST_VISIBLE = 7            // G2 root 画面に同時表示するセッション数 (8 行送ると容量超えでスクロールバーが出るため 7 に絞る)
-const CC_LIST_VISIBLE = 7              // cc-response 画面に同時表示する行数 (rootlist と揃える)
+const CC_LIST_VISIBLE = 7              // cc-response / cc-message 画面に同時表示する行数 (rootlist と揃える)
+// cc-message で本文として折り返す最大文字数。巨大な toolInput をそのまま px 計測すると
+// 描画が固まるので、閲覧用途として十分な長さで頭打ちにする。
+const CC_MSG_MAX_CHARS = 2000
 
 type HistoryEntry = {
   id: number
@@ -239,6 +246,12 @@ let scrollAnimTimer: ReturnType<typeof setTimeout> | null = null
 let rootCursorKey: string | null = null
 let rootListStart = 0 // rootlist 表示窓の先頭 index。カーソル追従方式で cursor が窓外に出た時だけスライドする
 let ccListStart = 0   // cc-response 画面の表示窓の先頭行 index (rootlist と同じカーソル追従方式)
+// cc-message (メッセージ全文閲覧) 画面の表示窓の先頭行 index。0 = 本文の先頭。
+let ccMsgScrollOffset = 0
+// cc-message の本文を折り返した結果。ポーリングのたびに全文を px 計測し直すと重いので、
+// 元テキスト (pending / 質問 index を含む) が変わった時だけ計算する。
+let ccMsgLinesCache: string[] = []
+let ccMsgLinesCacheKey = ''
 
 // 「最後に開いてから何か動いた」を未読として rootlist に印を出す仕組み。
 // セッション名 → 最後に既読化した unix ms。idle 中はポーリングごとに現在
@@ -280,6 +293,8 @@ let chatLinesCache: string[] = []
 // 無操作中は内容が変わらないので、指紋一致で丸ごと省ける。
 let chatLinesCacheKey = ''
 let currentAgentSource: AgentSource | undefined = undefined
+// サーバから来た Agent の動作状態 (idle / busy / waiting-*)。chat 末尾の待機行に使う。
+let claudeChatStatus: string | undefined = undefined
 let claudePending: Pending | null = null         // 現在選択中セッションの承認/質問待ち
 let claudeChatLoading = false                    // セッション切替直後のロード中フラグ
 let claudePollTimer: ReturnType<typeof setInterval> | null = null
@@ -324,6 +339,7 @@ function statusForCurrentPhase(): { dot: string; text: string } {
       return { dot: 'idle', text: t('g2Booting') }
     case 'rootlist':
       return { dot: 'ready', text: `${t('g2Sessions')} (${claudeSessions.length})` }
+    case 'cc-message':
     case 'cc-response':
       return { dot: 'busy', text: t('g2ClaudeAck') }
     case 'recording':
@@ -366,12 +382,13 @@ function isReady(): boolean {
 
 function recomputePhase(): void {
   // pendingは「ユーザの判断待ち」なので自動で抜けない
-  // cc-response も応答操作中なので自動で抜けない
+  // cc-message / cc-response も閲覧/応答操作中なので自動で抜けない
   if (
     phase === 'recording' ||
     phase === 'finalizing' ||
     phase === 'pending' ||
     phase === 'sending' ||
+    phase === 'cc-message' ||
     phase === 'cc-response'
   ) return
   if (!isReady()) {
@@ -481,19 +498,21 @@ function buildG2Content(): string {
 
   // idle時は Claude Code の chat (user発言とClaude返事) を画面いっぱい使って表示。
   if (phase === 'idle') {
-    const formatted = chatLinesCache
+    // 回答待ちの告知はヘッダ/フッタ側で出す (本文に差し込むとスクロールしても
+    // 1 行目に張り付き、その 1 行ぶん chat が読めなくなるため)。
+    const formatted = chatLinesForDisplay()
     if (formatted.length > 0) {
-      // pending があるなら 1 行目に notice
-      const notice = claudePending
-        ? (claudePending.kind === 'question' ? t('noticeQuestion') : t('noticePermission'))
-        : null
-      const window = chatWindow(formatted, chatDisplayLines() - (notice ? 1 : 0))
-      const body = notice ? [notice, ...window].join('\n') : window.join('\n')
+      const body = chatWindow(formatted, chatDisplayLines()).join('\n')
       // 末尾スペーサ: ON なら最終行のさらに下に空行を 1 行足す。最終行が下端 border に
       // かかって切れる時、この空行を犠牲にして実テキストを安全域へ逃がす。
       return settings.chatBottomSpacer ? body + '\n' : body
     }
     return `[${settings.sessionName || 'no session'}]\n${claudeChatLoading ? t('chatLoading') : t('chatNoMsg')}`
+  }
+
+  // Claude Code 承認/質問 待ちのメッセージ全文閲覧画面 (応答画面の手前)
+  if (phase === 'cc-message') {
+    return buildCcMessageView()
   }
 
   // Claude Code 承認/質問 待ちへの応答画面
@@ -637,6 +656,87 @@ function buildRootListView(): string {
     lines.push(appendRootPreview(prefix, s.lastChat))
   }
   return lines.join('\n')
+}
+
+/**
+ * cc-message 画面に出す本文を、レンズ幅で折り返した行配列にして返す。
+ * 内容が変わっていなければ前回の結果を返す (ポーリングのたびに全文を px 計測し直すと
+ * 本文が長いほど重くなるため。recordingLines と同じキャッシュ方式)。
+ */
+function ccMessageLines(): string[] {
+  if (!claudePending) {
+    ccMsgLinesCache = []
+    ccMsgLinesCacheKey = ''
+    return ccMsgLinesCache
+  }
+  // 段落 (折り返し前) の配列。空文字は空行として扱う。
+  // 質問番号 / multi バッジ / ツール名といったメタ情報はヘッダ (buildG2Header) が
+  // 受け持つので、ここは本題だけを載せる (7 行しかない窓を無駄遣いしない)。
+  const paras: string[] = []
+  if (claudePending.kind === 'permission') {
+    // 選択肢画面と違いここは切り詰めない (全文を読ませるのがこの画面の役目)。
+    // 巨大な toolInput で描画が固まらないよう文字数だけ上限を掛ける。
+    const summary = summarizeToolInput(claudePending.toolInput).slice(0, CC_MSG_MAX_CHARS)
+    if (summary) paras.push(summary)
+  } else {
+    const q = claudePending.questions?.[respondQIdx]
+    if (!q) return []
+    // header は AskUserQuestion が付ける短い見出し (無い場合もある)
+    if (q.header) {
+      paras.push(q.header)
+      paras.push('')
+    }
+    paras.push(q.question.slice(0, CC_MSG_MAX_CHARS))
+  }
+
+  // 指紋: 同じ pending / 同じ質問 / 同じ本文なら折り返しをまるごと省く
+  const key = `${claudePending.id}#${respondQIdx}#${paras.join('\n')}`
+  if (key === ccMsgLinesCacheKey) return ccMsgLinesCache
+
+  const out: string[] = []
+  for (const para of paras) {
+    for (const line of wrapText(para, CHAT_WRAP_PX)) out.push(line)
+  }
+  ccMsgLinesCache = out
+  ccMsgLinesCacheKey = key
+  return out
+}
+
+/** cc-message のスクロール上限 (窓の先頭行 index の最大値) */
+function maxCcMsgScrollOffset(): number {
+  return Math.max(0, ccMessageLines().length - CC_LIST_VISIBLE)
+}
+
+/** cc-message: 前 (メッセージ先頭) 方向へ戻る */
+function ccMsgScrollBack(): void {
+  if (ccMsgScrollOffset === 0) return
+  ccMsgScrollOffset = Math.max(0, ccMsgScrollOffset - scrollLinesPerGesture())
+  void refreshG2(true)
+}
+
+/** cc-message: 次 (メッセージ末尾) 方向へ進む */
+function ccMsgScrollForward(): void {
+  const max = maxCcMsgScrollOffset()
+  const next = Math.min(max, ccMsgScrollOffset + scrollLinesPerGesture())
+  if (next === ccMsgScrollOffset) return
+  ccMsgScrollOffset = next
+  void refreshG2(true)
+}
+
+/**
+ * Claude Code 承認/質問の本文を全文読むための画面。
+ * 選択肢は出さず、CC_LIST_VISIBLE 行の窓を ccMsgScrollOffset でスクロールさせる。
+ */
+function buildCcMessageView(): string {
+  if (!claudePending) return '(no pending)'
+  const all = ccMessageLines()
+  // 本題が空 (toolInput 無しの承認など) でも、用件自体はヘッダに出ている
+  if (all.length === 0) {
+    return claudePending.kind === 'permission' ? '(no tool input)' : '(question is empty)'
+  }
+  // 本文が短くなった場合に窓が範囲外へ出ないようクランプする
+  ccMsgScrollOffset = Math.max(0, Math.min(ccMsgScrollOffset, Math.max(0, all.length - CC_LIST_VISIBLE)))
+  return all.slice(ccMsgScrollOffset, ccMsgScrollOffset + CC_LIST_VISIBLE).join('\n')
 }
 
 /** Claude Code 承認/質問への応答画面 */
@@ -884,8 +984,28 @@ function lensWindow(text: string, n: number): string {
   return lines.slice(start, end).join('\n')
 }
 
+/**
+ * 現在の status に対応する chat 末尾の待機行。idle / 不明なら null。
+ * サーバも同義の英語行を chat に合成してくるが、そちらは synthetic として捨て、
+ * 表示はここで作る (言語設定に追従させるため)。ドットのアニメーションは再現しない。
+ */
+function chatStatusLine(): string | null {
+  switch (claudeChatStatus) {
+    case 'busy':               return t('chatStatusThinking')
+    case 'waiting-permission': return t('chatStatusWaitPerm')
+    case 'waiting-question':   return t('chatStatusWaitQ')
+    default:                   return null
+  }
+}
+
+/** 表示用の chat 行配列 = 整形済みキャッシュ + (あれば) 末尾の待機行 */
+function chatLinesForDisplay(): string[] {
+  const status = chatStatusLine()
+  return status ? [...chatLinesCache, status] : chatLinesCache
+}
+
 function maxChatScrollOffset(): number {
-  return Math.max(0, chatLinesCache.length - chatDisplayLines())
+  return Math.max(0, chatLinesForDisplay().length - chatDisplayLines())
 }
 
 function isScrolled(): boolean {
@@ -990,6 +1110,13 @@ function buildG2Footer(): string {
       if (rows === 0) return t('g2NoSessionsBrief')
       return `${t('g2FootRoot')} (${resolveRootCursorIndex() + 1}/${rows})`
     }
+    case 'cc-message': {
+      // 収まりきらない本文はスクロールで読む。今どこまで読んだかを rootlist と同じ書式で出す
+      const total = ccMessageLines().length
+      if (total <= CC_LIST_VISIBLE) return t('g2FootCcMessage')
+      const shownEnd = Math.min(total, ccMsgScrollOffset + CC_LIST_VISIBLE)
+      return `${t('g2FootCcMessage')} (${shownEnd}/${total})`
+    }
     case 'cc-response':
       // multi-select 中の Submit 行を強調するため、multi-select 質問のときは別文言
       if (currentRespondQuestionIsMulti()) return t('g2FootCcRespMulti')
@@ -1031,9 +1158,32 @@ function buildG2Header(): string {
       return n > 1 ? `${t('g2HeadPending')} (${n})` : t('g2HeadPending')
     }
     case 'sending':      return `${t('g2HeadSending')} → ${settings.sessionName || ''}`.slice(0, 56)
-    case 'cc-response':  return t('g2HeadCcResponse')
+    // メッセージ閲覧と選択肢は同じ用件の 2 画面なのでヘッダは共通。
+    // 本文の窓 (7 行) を本題だけに使いたいので、ツール名・質問番号・multi バッジは
+    // スクロールしない ここ で出す。
+    case 'cc-message':
+    case 'cc-response': {
+      if (!claudePending) return t('g2HeadCcResponse')
+      if (claudePending.kind === 'permission') {
+        return t('approveTool').replace('{name}', claudePending.toolName).slice(0, 56)
+      }
+      const questions = claudePending.questions ?? []
+      const q = questions[respondQIdx]
+      // 単一質問でも (1/1) を出す (2 画面で番号の見え方を揃える)
+      const num = questions.length > 0 ? ` (${respondQIdx + 1}/${questions.length})` : ''
+      const badge = q?.multiSelect ? t('multiBadge') : ''
+      return `${t('g2HeadCcResponse')}${num}${badge}`.slice(0, 56)
+    }
     case 'error':        return t('g2HeadError')
-    case 'idle':         return settings.sessionName || t('appName')
+    case 'idle': {
+      // 回答待ちがあるなら、スクロールしても消えないヘッダで知らせる
+      if (claudePending) {
+        const isQ = claudePending.kind === 'question'
+        const head = `${isQ ? '?' : '⏸'} ${isQ ? t('claudeStatusWaitQ') : t('claudeStatusWaitPerm')}`
+        return `${head}　${settings.sessionName || ''}`.slice(0, 56)
+      }
+      return settings.sessionName || t('appName')
+    }
     default:             return t('appName')
   }
 }
@@ -1204,6 +1354,7 @@ sessionPillsEl.addEventListener('click', (e) => {
     claudeChat = []
     chatLinesCache = []
     chatLinesCacheKey = ''
+    claudeChatStatus = undefined
     claudeChatLoading = true
     renderSessionPills()
     recomputePhase()
@@ -1331,8 +1482,13 @@ async function refreshClaudeData(): Promise<void> {
     ])
     // ── セッション切替ガード: fetch 中にユーザがセッションを変えた場合は結果を破棄 ──
     if (settings.sessionName !== targetSession) return
-    const chat = chatResponse.chat
+    // サーバが状態表示用に合成した行 (synthetic) は捨てる。表示は status から
+    // ローカライズして作り直す。ドット数が 500ms ごとに変わるので、素通しすると
+    // 指紋が毎回変わって全文の再整形が走り続ける、という問題も同時に消える。
+    const chat = chatResponse.chat.filter((c) => !c.synthetic)
     currentAgentSource = chatResponse.source ?? claudeSessions.find((s) => s.tmuxSessionName === targetSession)?.source
+    // 差し替え前の表示行数 (待機行込み)。scrollback 中の繰り上げ量の計算に使う。
+    const prevDisplayLen = chatLinesForDisplay().length
     // 取得内容が前回と同一なら整形をまるごと省く。無操作でもポーリングは 1.5 秒毎に
     // 走るので、ここを毎回計算すると会話が長いほどメインスレッドが埋まる。
     // source も鍵に含める (タグ表記が変わると整形結果も変わるため)。
@@ -1340,19 +1496,14 @@ async function refreshClaudeData(): Promise<void> {
     if (nextCacheKey !== chatLinesCacheKey) {
       // 整形は取得時に1回だけ行い、描画/スクロールで使い回す (スクロール毎の全文再整形を回避)。
       // source を明示的に渡してタグずれを防ぐ。
-      const newChatLines = formatChatLines(chat, CHAT_WRAP_PX, currentAgentSource)
-      // chat: scrollback 中なら新着分だけオフセット繰り上げ
-      if (scrollOffset > 0) {
-        const oldLen = chatLinesCache.length
-        const newLen = newChatLines.length
-        const delta = newLen - oldLen
-        if (delta > 0) {
-          const max = Math.max(0, newLen - chatDisplayLines())
-          scrollOffset = Math.min(max, scrollOffset + delta)
-        }
-      }
-      chatLinesCache = newChatLines
+      chatLinesCache = formatChatLines(chat, CHAT_WRAP_PX, currentAgentSource)
       chatLinesCacheKey = nextCacheKey
+    }
+    claudeChatStatus = chatResponse.status
+    // chat: scrollback 中なら増えたぶんだけオフセットを繰り上げて読んでいる位置を保つ
+    if (scrollOffset > 0) {
+      const delta = chatLinesForDisplay().length - prevDisplayLen
+      if (delta > 0) scrollOffset = Math.min(maxChatScrollOffset(), scrollOffset + delta)
     }
     claudeChat = chat
     claudeChatLoading = false
@@ -1373,9 +1524,9 @@ async function refreshClaudeData(): Promise<void> {
     } else {
       setOutputDisplay(`(no chat yet for "${targetSession}")`, 'muted')
     }
-    if (phase === 'idle' || phase === 'cc-response') void refreshG2(true)
+    if (phase === 'idle' || phase === 'cc-message' || phase === 'cc-response') void refreshG2(true)
     // chat を実際に取得して描画している = ユーザは見ている前提なので既読化
-    if (phase === 'idle' || phase === 'cc-response') markAsRead(targetSession)
+    if (phase === 'idle' || phase === 'cc-message' || phase === 'cc-response') markAsRead(targetSession)
   } catch (e) {
     // AbortError はセッション切替による意図的キャンセルなので無視する
     if ((e as DOMException).name === 'AbortError') return
@@ -1395,7 +1546,7 @@ function startOutputPolling(): void {
     if (phase === 'recording' || phase === 'finalizing' || phase === 'pending' || phase === 'sending') return
     if (phase === 'rootlist') {
       void reloadClaudeSessions()
-    } else if (phase === 'idle' || phase === 'cc-response') {
+    } else if (phase === 'idle' || phase === 'cc-message' || phase === 'cc-response') {
       void reloadClaudeSessions()
       void refreshClaudeData()
     }
@@ -2154,19 +2305,27 @@ async function toggleRecording(): Promise<void> {
   } else if (phase === 'rootlist') {
     activateSelectedFromRoot()
   } else if (phase === 'idle') {
-    // pending があるなら音声入力ではなく応答画面に遷移
+    // pending があるなら音声入力ではなく、まずメッセージ全文の閲覧画面に遷移
     if (claudePending) {
       respondCursor = 0
       respondQIdx = 0
       respondAnswers = {}
       recordingPurpose = 'tmux'
-      phase = 'cc-response'
+      ccMsgScrollOffset = 0
+      phase = 'cc-message'
       paintStatus()
       void refreshG2(true)
       updateRecordButton()
     } else {
       await startRecording()
     }
+  } else if (phase === 'cc-message') {
+    // 本文を読み終えた → 選択肢画面へ
+    respondCursor = 0
+    phase = 'cc-response'
+    paintStatus()
+    void refreshG2(true)
+    updateRecordButton()
   } else if (phase === 'cc-response') {
     await handleCcResponseClick()
   } else {
@@ -2291,6 +2450,7 @@ function openSelectedFromRoot(): void {
   claudeChat = []
   chatLinesCache = []
   chatLinesCacheKey = ''
+  claudeChatStatus = undefined
   claudeChatLoading = true
   currentAgentSource = sel.source
   claudePending = null
@@ -2368,12 +2528,35 @@ function advanceToNextQuestionOrSubmit(): void {
   if (!claudePending) return
   const total = claudePending.questions?.length ?? 0
   if (respondQIdx + 1 < total) {
+    // 次の質問はまず本文を読ませたいので、選択肢画面ではなく cc-message に戻る
     respondQIdx++
     respondCursor = 0
-    void refreshG2(true)
+    backToCcMessage()
   } else {
     void sendPendingResponseAndFinish()
   }
+}
+
+/** cc-response → メッセージ閲覧画面 (cc-message) へ戻る。読み位置は先頭に戻す */
+function backToCcMessage(): void {
+  ccMsgScrollOffset = 0
+  phase = 'cc-message'
+  paintStatus()
+  void refreshG2(true)
+  updateRecordButton()
+}
+
+/** 応答をやめて idle に戻る (構築中の回答も破棄) */
+function cancelCcRespond(): void {
+  phase = 'idle'
+  respondCursor = 0
+  respondQIdx = 0
+  respondAnswers = {}
+  recordingPurpose = 'tmux'
+  ccMsgScrollOffset = 0
+  paintStatus()
+  void refreshG2(true)
+  updateRecordButton()
 }
 
 async function sendPendingResponseAndFinish(): Promise<void> {
@@ -2415,6 +2598,7 @@ async function sendPendingResponseAndFinish(): Promise<void> {
     respondQIdx = 0
     respondAnswers = {}
     recordingPurpose = 'tmux'
+    ccMsgScrollOffset = 0
     phase = 'idle'
     paintStatus()
     updateRecordButton()
@@ -2851,12 +3035,14 @@ async function boot(): Promise<void> {
       // rootlist: 上下=カーソル / click=open / dbl=OS終了
       // pending:  上=送信 / 下=テキスト削除 / dbl=破棄して idle へ
       // idle:     上=過去ログ / 下=新しい方へ / dbl=root へ戻る
-      // cc-response: 上下=選択肢移動 / dbl=キャンセルして idle へ
+      // cc-message:  上下=本文スクロール / click=選択肢画面へ / dbl=キャンセルして idle へ
+      // cc-response: 上下=選択肢移動 / dbl=cc-message へ戻る
       onScrollUp: () => {
         if (phase === 'rootlist') moveRootCursor(-1)
         else if (phase === 'pending') void confirmAndSend()
         else if (phase === 'idle') scrollBack()
         else if (phase === 'recording') recordingScrollBack()
+        else if (phase === 'cc-message') ccMsgScrollBack()
         else if (phase === 'cc-response') moveRespondCursor(-1)
       },
       onScrollDown: () => {
@@ -2864,6 +3050,7 @@ async function boot(): Promise<void> {
         else if (phase === 'pending') removeLastSentence() // 末尾1文だけ削除。空になれば idle
         else if (phase === 'idle') scrollForward()
         else if (phase === 'recording') recordingScrollForward()
+        else if (phase === 'cc-message') ccMsgScrollForward()
         else if (phase === 'cc-response') moveRespondCursor(1)
       },
       onClick: () => { void toggleRecording() },
@@ -2875,17 +3062,9 @@ async function boot(): Promise<void> {
         if (phase === 'idle') backToRoot()
         else if (phase === 'recording') void abortRecording()  // 録音中止 (新しい文は追加しない)
         else if (phase === 'pending') discardPending()         // pending 全破棄 → idle
-        else if (phase === 'cc-response') {
-          // 応答キャンセル → idle に戻る (構築中の回答も破棄)
-          phase = 'idle'
-          respondCursor = 0
-          respondQIdx = 0
-          respondAnswers = {}
-          recordingPurpose = 'tmux'
-          paintStatus()
-          void refreshG2(true)
-          updateRecordButton()
-        } else if (
+        else if (phase === 'cc-response') backToCcMessage()  // 選択肢画面 → 本文閲覧画面へ戻る
+        else if (phase === 'cc-message') cancelCcRespond()   // 応答キャンセル → idle へ
+        else if (
           phase === 'rootlist' ||
           phase === 'unconfigured' ||
           phase === 'boot' ||

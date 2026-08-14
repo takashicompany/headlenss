@@ -50,11 +50,15 @@ export type ChatItem = {
   role: ChatRole
   text: string
   ts: number
+  /** サーバが状態表示用に合成した行 (永続ログではない)。表示は status から作り直すので捨てる。 */
+  synthetic?: boolean
 }
 
 export type ClaudeChatResponse = {
   chat: ChatItem[]
   source?: AgentSource
+  /** Agent の動作状態。未知の値が増えても壊れないよう string も許容する。 */
+  status?: ClaudeSessionStatus | string
 }
 
 export type AskQuestionOption = { label: string; description?: string }
@@ -184,7 +188,7 @@ export class HeadlenssClient {
     if (res.status === 404) return { chat: [] }
     if (!res.ok) throw new Error(`getClaudeChat HTTP ${res.status}`)
     const data = (await res.json()) as ClaudeChatResponse
-    return { chat: data.chat ?? [], source: data.source }
+    return { chat: data.chat ?? [], source: data.source, status: data.status }
   }
 
   async getClaudePending(name: string, signal?: AbortSignal): Promise<Pending | null> {
