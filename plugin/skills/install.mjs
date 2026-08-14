@@ -24,8 +24,9 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 
 // 「そのディレクトリは headlenss が入れたものか」の判定は uninstall.mjs と共通。
-// マーカーの存在だけでは自分のものと見なさない (破損・他ツール製のものはユーザーの
-// 資産として扱い、退避してから置き換える)。
+// マーカーの存在だけでは自分のものと見なさない (破損・他ツール製のもの、および
+// マーカーのスキル名とディレクトリ名が食い違うもの = 別名でコピー / 改名された
+// カスタマイズ版はユーザーの資産として扱い、退避してから置き換える)。
 import { MARKER_NAME, isHeadlenssSkill } from './marker.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));

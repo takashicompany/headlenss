@@ -32,6 +32,7 @@ import { fetchTargetHtml, isDocumentReplaced, isProxyInjected, performTakeover }
 import {
   HeadlenssClient,
   PendingConflictError,
+  RespondInterruptedError,
   type AgentSource,
   type ChatItem,
   type ClaudeSessionInfo,
@@ -342,7 +343,7 @@ type RespondAnswer =
  * 不変条件 (assertRespondFlowInvariant で実行時にも守る):
  *   - phase が cc-message / cc-response なら respondFlow は必ず非 null
  *   - respondFlow が非 null なら、phase は cc-message / cc-response、または
- *     Type something の録音中 (recording=true) か POST 中 (inFlight=true)
+ *     Type something の録音中 (recording=true) か POST 中 (inFlightSince≠null)
  */
 type RespondFlow = {
   /** どの用件に答えているか。ポーリング結果との突き合わせに使う。 */
@@ -358,15 +359,47 @@ type RespondFlow = {
   /** Type something の音声入力中 (録音 / 確定待ち) か。録音の用途フラグを兼ねる。 */
   recording: boolean
   /**
-   * 応答 POST の実行中か。
+   * 応答 POST を開始した時刻 (performance.now)。null = 送信中でない。
    * 送信は数百ms〜秒単位かかる (サーバが tmux にキーを注入して確認するまで) ので、
    * その間の入力を全部捨てないと同じ用件へ 2 通目を送ってしまう。
+   *
+   * 真偽値ではなく時刻を持つのは、fetch が決着しないまま返ってこない場合の脱出口の
+   * ため。WebView では通信が切れても reject も resolve もしないことがあり、その間
+   * 入力を捨て続けると画面が二度と操作できなくなる (RESPOND_INFLIGHT_GUARD_MS 参照)。
    */
-  inFlight: boolean
+  inFlightSince: number | null
   /** 直近の送信失敗の表示文言 (null = 無し)。次の操作か時間経過で消える。 */
   error: string | null
 }
 let respondFlow: RespondFlow | null = null
+
+/**
+ * 応答 POST の入力ガードを壁時計で解除するまでの時間 (ms)。
+ * client 側の fetch タイムアウト (15 秒) より長く取り、「タイムアウトで決着する」
+ * 正常系ではこちらが先に動かないようにする。
+ */
+const RESPOND_INFLIGHT_GUARD_MS = 20000
+
+/** 応答 POST 中か (フロー未生成なら false)。 */
+function flowIsInFlight(flow: RespondFlow | null): boolean {
+  return flow != null && flow.inFlightSince !== null
+}
+
+/**
+ * 決着しない送信の入力ガードを解除する。
+ * 送信自体は諦めない (返ってきたら finally が後始末する) が、届いたかどうかは
+ * 分からないので、その旨を出して操作だけ返す。
+ * 既に決着済み (inFlightSince が null) なら何もしない = 何度呼んでも安全。
+ */
+function releaseStuckInFlightGuard(flow: RespondFlow): void {
+  if (flow.inFlightSince === null) return
+  flow.inFlightSince = null
+  log(`応答の送信が ${RESPOND_INFLIGHT_GUARD_MS}ms 決着しないため入力ガードを解除しました (送信結果は不明)`)
+  if (respondFlow === flow) {
+    showRespondError(t('respondUnknownResult'))
+    void refreshG2(true)
+  }
+}
 
 /** 現在表示中の質問 index。フローが無い間 (描画の隙間) は 0 として扱う。 */
 function flowQIdx(): number { return respondFlow?.qIdx ?? 0 }
@@ -379,7 +412,12 @@ function flowAnswers(): Record<number, RespondAnswer> { return respondFlow?.answ
 
 /** 応答 POST 中の G2 入力か。true ならその入力は無視する (全ジェスチャー共通)。 */
 function respondInputBlocked(): boolean {
-  return respondFlow?.inFlight === true
+  const flow = respondFlow
+  if (!flow || flow.inFlightSince === null) return false
+  if (performance.now() - flow.inFlightSince < RESPOND_INFLIGHT_GUARD_MS) return true
+  // タイマー経路より先にユーザが触った場合の保険。ここでも解除して操作を通す。
+  releaseStuckInFlightGuard(flow)
+  return false
 }
 /**
  * 用件への応答フロー (本文閲覧 → 選択肢 → Type something の録音 → POST) の最中か。
@@ -1169,8 +1207,6 @@ function maxChatScrollOffset(): number {
 
 /** 末尾突き合わせで使う行数。これだけ一致すれば同じ位置と見なす。 */
 const TAIL_MATCH_PROBE = 8
-/** 末尾のズレを探す範囲。これを超える変化は「別物」として補正しない。 */
-const TAIL_MATCH_MAX_SHIFT = 64
 
 /**
  * 旧表示行列と新表示行列を末尾で突き合わせ、「末尾に何行足されたか」を返す。
@@ -1181,10 +1217,14 @@ const TAIL_MATCH_MAX_SHIFT = 64
  * 末尾が動いた時だけ。tail 窓の先頭から古い行が落ちても末尾は動かないので、
  * 基準は 1 行も動かしてはいけない。総行数の差 (旧コード) だと、先頭の脱落を
  * 末尾の減少と取り違えて、読んでいる位置が脱落したぶんだけ末尾方向へ滑る。
+ *
+ * 探索範囲に上限は設けない (行数で自然に有界)。以前は 64 行で打ち切っていたが、
+ * 長い返答が一度に届くと「一致は必ず存在するのに見つからない」= 総取っ替え扱いに
+ * なり、読んでいた位置が据え置き + クランプで飛んでいた。
  */
 function tailAppendedLines(prev: string[], next: string[]): number | null {
   if (prev.length === 0) return next.length
-  const limit = Math.min(TAIL_MATCH_MAX_SHIFT, Math.max(prev.length, next.length))
+  const limit = Math.max(prev.length, next.length)
   // ズレの小さい順に試す (最小の説明を採る)。d>0 = 末尾に追記、d<0 = 末尾から減少。
   for (let mag = 0; mag <= limit; mag++) {
     for (const d of mag === 0 ? [0] : [mag, -mag]) {
@@ -1542,7 +1582,9 @@ async function pumpG2Sends(): Promise<void> {
       g2ContentQueued = null
       try {
         await updateContent(content)
-        g2LastSentAt = performance.now()
+        // ここでは g2LastSentAt を進めない。強制再同期は「header/footer も含めて
+        // 一度描き直す」ための時計で、content だけを送り続けるスクロール中に進めると
+        // 期限が永久に来ず、取りこぼした header/footer が直らないため。
       } catch (err) {
         // ブリッジ側のタイムアウト/失敗。送れていない内容を送信済みにしない
         if (g2ContentLastSent === content) g2ContentLastSent = null
@@ -1598,17 +1640,21 @@ async function executeFullRender(force: boolean, frame: G2Frame | null = null): 
     // header / content / footer を同期的に一括ビルド (同一 phase スナップショット)。
     // 呼び出し側が既に組んだスナップショットがあればそれを使う (二重ビルドの解消)。
     const { header, content, footer } = frame ?? buildG2Frame()
-    // dedup 基準を更新: scroll tick とポーリング由来の再描画がこの 3 つと突き合わせる
-    g2HeaderLastSent = header
-    g2ContentLastSent = content
-    g2FooterLastSent = footer
     console.log(`[refreshG2] firing (phase=${phase}, force=${force})`)
+    // dedup 基準は「送れたもの」だけを 1 つずつ記録する: scroll tick とポーリング由来の
+    // 再描画がこの 3 つと突き合わせる。3 つまとめて先に立てると、途中の await が失敗した
+    // 時に「送っていない内容を送信済み」と記録したフレームが残る (catch の一括取り消しは
+    // 逆に、送れていた分まで捨てて無駄な再送を生む)。
     await updateHeader(header)
+    g2HeaderLastSent = header
     await updateContent(content)
+    g2ContentLastSent = content
     await updateFooter(footer)
-    g2LastSentAt = performance.now()  // 強制再同期の起点 (実際に送れた時だけ更新する)
+    g2FooterLastSent = footer
+    g2LastSentAt = performance.now()  // 強制再同期の起点 (full render が通った時だけ更新する)
   } catch (err) {
-    invalidateG2Dedup()
+    // ここで dedup 基準を一括で捨てる必要は無い: 失敗した時点より後の 3 つは
+    // 更新していないので、次の要求で自然に送り直される。
     log(`G2 refresh error: ${err}`)
   }
 }
@@ -2571,6 +2617,30 @@ async function startRecording(): Promise<void> {
 
 /** 録音停止 → ASR 確定 → pending 状態へ。送信はしない (ユーザの↑/↓判断待ち) */
 async function stopRecordingToPending(): Promise<void> {
+  // ── 最初の await より前に「この録音が何のためのものか」を確保する ──
+  // 停止処理には G2 マイク停止と ASR の最終結果待ちという 2 つの await が挟まり、
+  // その間にセッション切替 (足場ごとの差し替え) が起こりうる。後から「今の状態」を
+  // 見て分岐すると、応答用に喋った内容が行き先を失った拍子に tmux 送信の待ち行列へ
+  // 紛れ込む。用途・対象フロー・セッション名 (世代) をここで固定する。
+  const startedSession = settings.sessionName
+  const recordingFlow = respondFlow?.recording ? respondFlow : null
+  const startedRt = rtSession
+  /**
+   * 録音を止め始めた時と同じセッション (世代) のままか。
+   * 違っていたら、この録音の結果は行き先ごと消えているので破棄する。
+   * 新しい状態 (切替後のセッションの phase / pending / 録音) には一切触らない。
+   */
+  const abandonIfSessionSwitched = (where: string): boolean => {
+    if (settings.sessionName === startedSession) return false
+    log(`録音停止 (${where}): セッションが切り替わったので結果を破棄します`)
+    // 自分が始めた ASR 接続だけを片付ける (切替後に始まった新しい録音は触らない)
+    if (startedRt && rtSession === startedRt) {
+      try { rtSession.abort() } catch { /* ignore */ }
+      rtSession = null
+    }
+    return true
+  }
+
   stopRecordingTimer()
   phase = 'finalizing'
   paintStatus()
@@ -2583,12 +2653,7 @@ async function stopRecordingToPending(): Promise<void> {
   } catch (err) {
     log(`Stop error: ${err}`)
   }
-
-  // 録音を始めた時点の用途を控える。確定するまでの間 (ASR の最終結果待ち) に
-  // セッション切替などでフローが畳まれることがあるので、「今の状態」ではなく
-  // 「始めた時の用途」で分岐する。今の状態で見ると、応答用に喋った内容が行き先を
-  // 失った拍子に tmux 送信の待ち行列へ紛れ込む。
-  const recordingFlow = respondFlow?.recording ? respondFlow : null
+  if (abandonIfSessionSwitched('マイク停止後')) return
 
   /** 録音終了時の戻り先を決める共通ハンドラ。
    *  録音が cc-response の Type something 用なら応答画面へ、そうでなければ tmux 用 pending へ。 */
@@ -2657,6 +2722,7 @@ async function stopRecordingToPending(): Promise<void> {
   } catch (e) {
     const errorMsg = (e as Error).message
     log(`RT stop error: ${errorMsg}`)
+    if (abandonIfSessionSwitched('ASR 失敗後')) return
     addHistoryEntry({
       text: liveTranscript || '(ASR failed)',
       session: settings.sessionName,
@@ -2664,15 +2730,17 @@ async function stopRecordingToPending(): Promise<void> {
       durationMs: performance.now() - t0,
       errorMsg,
     })
-    rtSession = null
     durationEl.textContent = '0.0s'
     liveTranscript = ''
     finishWithText('')
     return
   } finally {
-    rtSession = null
+    // 片付けるのは自分が止めた接続だけ。世代が変わった後に始まった新しい録音の
+    // 接続まで手放すと、その録音が確定できなくなる。
+    if (rtSession === rt) rtSession = null
   }
 
+  if (abandonIfSessionSwitched('ASR 確定後')) return
   durationEl.textContent = '0.0s'
   liveTranscript = ''
   finishWithText(text)
@@ -3055,6 +3123,17 @@ async function handleCcResponseClick(): Promise<void> {
   if (phase !== 'cc-response' || !claudePending) return
   const flow = respondFlow
   if (!flow) { assertRespondFlowInvariant('handleCcResponseClick'); return }
+  // 直前の送信が失敗している間のタップは、カーソルがどの行にあっても「再送」とする。
+  // なぜ: 失敗した時のカーソルは最後に選んだ行 (Type something や Chat about this) に
+  // 残っている。そのままタップを行の意味で解釈すると、再試行のつもりの操作が新しい
+  // 録音を始めたり回答を作り直したりして、組み上がった回答を送る手段が画面から消える。
+  // 再送しない操作 (カーソル移動 / 本文へ戻る) をすればエラー表示は解除され、
+  // 以降のタップは通常どおり行の意味で扱われる。
+  if (flow.error) {
+    clearRespondError()
+    await sendPendingResponseAndFinish()
+    return
+  }
   clearRespondError()
   if (claudePending.kind === 'permission') {
     await sendPendingResponseAndFinish()
@@ -3160,7 +3239,7 @@ function enterRespondFlow(pending: Pending): void {
     msgScrollOffset: 0,
     answers: {},
     recording: false,
-    inFlight: false,
+    inFlightSince: null,
     error: null,
   }
   phase = 'cc-message'
@@ -3180,7 +3259,7 @@ function rebindRespondFlow(pending: Pending): void {
     msgScrollOffset: 0,
     answers: {},
     recording: false,
-    inFlight: false,
+    inFlightSince: null,
     error: null,
   }
   phase = 'cc-message'
@@ -3276,7 +3355,7 @@ function assertRespondFlowInvariant(where: string): void {
     void refreshG2(true)
     return
   }
-  if (!inRespondPhase && respondFlow && !respondFlow.inFlight && !respondFlow.recording) {
+  if (!inRespondPhase && respondFlow && !flowIsInFlight(respondFlow) && !respondFlow.recording) {
     log(`[bug] 応答画面を離れているのに respondFlow が残っている (${where}) — 破棄します`)
     respondFlow = null
   }
@@ -3299,14 +3378,14 @@ function resetRespondStateForSessionChange(): void {
  * なぜ: 気付かずに操作を続けると、古い用件のつもりで作った回答が別の用件に送られる。
  *   - 消えた (別経路で承認済み等) → 構築中の回答を捨てて idle へ戻す
  *   - id が変わった → 回答を捨て、新しい用件の本文 (cc-message) の先頭から読み直させる
- * 送信中 (inFlight) は触らない: 決着の後始末は送信側が自分で行う。
+ * 送信中 (inFlightSince≠null) は触らない: 決着の後始末は送信側が自分で行う。
  */
 function reconcileRespondPending(): void {
   // ポーリングのたびに phase と respondFlow の整合も確かめる (片方だけ残る状態の検出口)
   assertRespondFlowInvariant('poll')
   const flow = respondFlow
   if (!flow) return
-  if (flow.inFlight) return
+  if (flowIsInFlight(flow)) return
   if (!claudePending) {
     log('応答対象の pending が消えたので idle に戻ります')
     resetRespondFlow('pending-gone')
@@ -3325,11 +3404,15 @@ async function sendPendingResponseAndFinish(): Promise<void> {
   // 応答は「この用件に対する回答」であることを id で明示する。サーバ側で現在の
   // pending と食い違っていたら 409 が返るので、取り違えた回答が通ることはない。
   const pendingId = claudePending.id
-  if (flow.inFlight) return   // 同じ用件への 2 通目 (再タップ) は出さない
-  flow.inFlight = true
+  if (flowIsInFlight(flow)) return   // 同じ用件への 2 通目 (再タップ) は出さない
+  flow.inFlightSince = performance.now()
   flow.error = null
+  // fetch が決着しないままになった場合の脱出口。時間切れで入力ガードだけ先に解く。
+  // タイマーはこの送信専用に持つ (グローバルに 1 本だと、遅れて決着した古い送信の
+  // 後始末が、次の送信の脱出口を消してしまう)。
+  const guardTimer = setTimeout(() => releaseStuckInFlightGuard(flow), RESPOND_INFLIGHT_GUARD_MS)
   // 失敗したら回答を残して画面に留まる (作り直させない)。捨てるのは決着した時だけ。
-  let outcome: 'sent' | 'stale' | 'failed' = 'failed'
+  let outcome: 'sent' | 'stale' | 'failed' | 'interrupted' = 'failed'
   let failureMessage = ''
   try {
     if (claudePending.kind === 'permission') {
@@ -3366,6 +3449,13 @@ async function sendPendingResponseAndFinish(): Promise<void> {
       // 作った回答はもう行き先が無いので捨て、次のポーリングで新しい用件を取り直す。
       log('respond conflict: 応答先の用件が入れ替わっていたため回答を破棄します')
       outcome = 'stale'
+    } else if (e instanceof RespondInterruptedError) {
+      // キーを途中まで撃った後で打ち切られた。一部だけ TUI に届いている可能性があるので、
+      // 「送っていない」とも「送った」とも言えない。回答は残すが自動では送り直さない
+      // (二重に撃つと選択が壊れる)。送り直すかはユーザのタップに委ねる。
+      failureMessage = (e as Error).message
+      log(`respond interrupted: ${failureMessage} (一部送信済みの可能性あり)`)
+      outcome = 'interrupted'
     } else {
       // タイムアウト / 500 / 別理由の 409。回答は残して画面に留まり、再試行させる。
       failureMessage = (e as Error).message
@@ -3373,14 +3463,15 @@ async function sendPendingResponseAndFinish(): Promise<void> {
       outcome = 'failed'
     }
   } finally {
-    flow.inFlight = false
+    flow.inFlightSince = null
+    clearTimeout(guardTimer)
     // POST の間に画面が別の用件へ移っていた (ポーリングで入れ替わり検知 / セッション切替 /
     // ダブルタップでキャンセル) 場合、新しい回答フローの状態を壊さないよう何もしない。
     // 後始末をするのは「今も自分が答えた用件を対象にしている」時だけ。
     if (respondFlow === flow && flow.pendingId === pendingId) {
-      if (outcome === 'failed') {
-        // 回答も cc-response 画面もそのまま残す。フッターに再試行の案内を出すだけ。
-        showRespondError(t('respondFailedRetry'))
+      if (outcome === 'failed' || outcome === 'interrupted') {
+        // 回答も cc-response 画面もそのまま残す。フッターに案内を出すだけ。
+        showRespondError(outcome === 'interrupted' ? t('respondInterrupted') : t('respondFailedRetry'))
         void refreshG2(true)
       } else {
         completeRespondFlow(pendingId)

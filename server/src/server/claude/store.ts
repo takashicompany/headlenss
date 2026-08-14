@@ -165,12 +165,30 @@ export function clearPendingIfId(tmuxName: string, pendingId: string): boolean {
 // 排他すると、注入の途中で用件が入れ替わった直後に別 id の応答が並走でき、
 // 2 本ぶんの矢印と Enter が同じ TUI に混ざって選択が壊れる。同じ tmux への
 // 応答処理は常に 1 本だけ通す。
-const respondingTmuxNames = new Set<string>();
+// 値は取得時刻 (epoch ms)。時刻を持つのは下の「取り残されたロックの回収」のため。
+const respondingTmuxNames = new Map<string, number>();
+
+/**
+ * ロックを握ったまま決着しない処理を諦める時間。
+ *
+ * なぜ必要か: 応答処理は tmux への execFile を挟む。execFile 側にも timeout を
+ * 付けてあるが、それでも何かの拍子に finally まで戻らなければロックが残り、その
+ * tmux への応答も chat 送信も以後ずっと 409 になる (画面から回復できない)。
+ * 次に誰かがロックを取りに来た時、これを超えて握られているロックは強制的に
+ * 解放してログに残す (定期タイマーは持たない = 誰も使っていない間は何もしない)。
+ */
+const RESPOND_LOCK_MAX_HOLD_MS = 60_000;
 
 /** 応答処理の開始を宣言する (原子的な try-lock)。既にその tmux を処理中なら false。 */
 export function acquireRespondLock(tmuxName: string): boolean {
-  if (respondingTmuxNames.has(tmuxName)) return false;
-  respondingTmuxNames.add(tmuxName);
+  const heldSince = respondingTmuxNames.get(tmuxName);
+  if (heldSince !== undefined) {
+    const heldMs = Date.now() - heldSince;
+    if (heldMs < RESPOND_LOCK_MAX_HOLD_MS) return false;
+    // 取り残されたロック: 持ち主はもう戻ってこないものとして回収する。
+    console.warn(`[respond] reaped stale lock tmux=${tmuxName} heldMs=${heldMs}`);
+  }
+  respondingTmuxNames.set(tmuxName, Date.now());
   return true;
 }
 
@@ -182,6 +200,12 @@ export function releaseRespondLock(tmuxName: string): void {
 /** テスト/診断用: その tmux が応答処理中か。 */
 export function isRespondLocked(tmuxName: string): boolean {
   return respondingTmuxNames.has(tmuxName);
+}
+
+/** テスト用: ロックの取得時刻を巻き戻す (取り残されたロックの回収を再現する)。 */
+export function backdateRespondLockForTest(tmuxName: string, ageMs: number): void {
+  if (!respondingTmuxNames.has(tmuxName)) return;
+  respondingTmuxNames.set(tmuxName, Date.now() - ageMs);
 }
 
 /**

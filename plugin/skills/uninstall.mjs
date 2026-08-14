@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // install.mjs で ~/.claude/skills/ に入れた HeadLenss スキルを取り除く。
-// .headlenss-skill.json (インストーラが置くマーカー) があるディレクトリだけを消す。
-// 同名の自作スキルは消さずに警告して残す。
+// .headlenss-skill.json (インストーラが置くマーカー) の中身が headlenss 製で、かつ
+// 記録されたスキル名がディレクトリ名と一致するものだけを消す。
+// 同名の自作スキルや、別名にコピー / 改名したカスタマイズ版は消さずに理由を出して残す。
 //
 // 削除対象はリポジトリの現在のファイル一覧ではなく ~/.claude/skills/ 側の走査で決める。
 // (スキルを削除・改名しても、旧バージョンでインストールしたものが取り残されないため。)
@@ -12,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 
 // マーカーの中身まで見る判定 (install.mjs と共通)。
-import { isHeadlenssSkill } from './marker.mjs';
+import { isHeadlenssSkill, markerSkillName } from './marker.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const sourceRoot = __dirname;
@@ -42,8 +43,13 @@ function uninstall() {
     const destDir = join(skillsDir, entry.name);
 
     if (!isHeadlenssSkill(destDir)) {
-      // マーカーが無い (= HeadLenss が入れたものではない) ディレクトリには触れない。
-      if (fromRepo.has(entry.name)) {
+      // HeadLenss が入れたと確認できないディレクトリには触れない。
+      const claimed = markerSkillName(destDir);
+      if (claimed !== null) {
+        // マーカーはあるが、記録されたスキル名とディレクトリ名が違う。
+        // インストール済みスキルを別名でコピー / 改名したもの (= ユーザーの資産) と見なす。
+        console.log(`Skipped ${destDir} (copied or renamed from HeadLenss skill "${claimed}"; treated as your own and left untouched)`);
+      } else if (fromRepo.has(entry.name)) {
         console.log(`Skipped ${destDir} (not installed by HeadLenss; left untouched)`);
       }
       continue;

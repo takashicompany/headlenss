@@ -131,6 +131,22 @@ export class PendingConflictError extends Error {
   }
 }
 
+/**
+ * 応答 POST が「キーを途中まで TUI に撃った後で用件が入れ替わった」で打ち切られた
+ * (409 code=injection_interrupted) ことを表す。
+ *
+ * pending_mismatch (1 つも撃っていない = 完全に無かったこと) と区別するのは、
+ * こちらは「一部だけ届いている可能性がある」ため。同じ回答を自動で送り直すと
+ * TUI に二重にキーが入って選択が壊れるので、呼び出し側は回答を残したまま
+ * その旨を表示するだけにして、送り直すかどうかはユーザに委ねる。
+ */
+export class RespondInterruptedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RespondInterruptedError'
+  }
+}
+
 export class HeadlenssClient {
   constructor(private base: string) {}
 
@@ -265,6 +281,10 @@ export class HeadlenssClient {
       try { code = (JSON.parse(body) as { code?: string }).code } catch { /* 非 JSON 応答 */ }
       if (res.status === 409 && code === 'pending_mismatch') {
         throw new PendingConflictError(`respondClaude HTTP 409: ${body.slice(0, 200)}`)
+      }
+      // 途中まで撃った後の打ち切り。無かったことにはできないので別の型で返す。
+      if (res.status === 409 && code === 'injection_interrupted') {
+        throw new RespondInterruptedError(`respondClaude HTTP 409: ${body.slice(0, 200)}`)
       }
       throw new Error(`respondClaude HTTP ${res.status}: ${body.slice(0, 200)}`)
     }

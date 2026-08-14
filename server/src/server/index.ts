@@ -391,11 +391,37 @@ app.get('/api/sessions/:name/output', async (c) => {
   }
 });
 
+/**
+ * チャット送信が応答のキー注入と混ざらないよう、tmux 単位の mutex を待つ。
+ *
+ * 応答処理 (/api/claude/.../respond) は「Down x N → Enter」を数百 ms かけて撃つ。
+ * その最中にチャット本文を send-keys すると、質問 TUI の選択肢の上に文字が流れ込み、
+ * 選択も本文も壊れる。応答処理と同じロックを取ることで、どちらか一方だけが tmux を
+ * 触っている状態にする。人が入力してから押すまでの間に応答が始まっていることは
+ * まれなので、まずは短く待ち、それでも空かなければ 409 で返す (握り潰さない)。
+ */
+const INPUT_LOCK_WAIT_MS = 1_000;
+const INPUT_LOCK_POLL_MS = 50;
+async function acquireTmuxLockWithWait(name: string): Promise<boolean> {
+  const deadline = Date.now() + INPUT_LOCK_WAIT_MS;
+  for (;;) {
+    if (claudeStore.acquireRespondLock(name)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, INPUT_LOCK_POLL_MS));
+  }
+}
+
 app.post('/api/sessions/:name/input', async (c) => {
   const name = c.req.param('name');
   const body = (await c.req.json().catch(() => ({}))) as { text?: unknown; submit?: unknown };
   if (typeof body.text !== 'string') {
     return c.json({ error: 'body must be { "text": string, "submit"?: boolean }' }, 400);
+  }
+  if (!(await acquireTmuxLockWithWait(name))) {
+    return c.json(
+      { error: 'another response is being sent to this session', code: 'already_processing' },
+      409,
+    );
   }
   try {
     const tracked = claudeStore.getSession(name);
@@ -434,6 +460,8 @@ app.post('/api/sessions/:name/input', async (c) => {
     const status =
       msg.includes("can't find session") || msg.includes('no server running') ? 404 : 400;
     return c.json({ error: msg }, status);
+  } finally {
+    claudeStore.releaseRespondLock(name);
   }
 });
 

@@ -64,6 +64,11 @@ const STRINGS = {
   voiceInputBadge:     { en: '(voice input)',                   ja: '(音声入力)' },
   // 応答の送信に失敗した時にフッターへ出す一時的な案内。回答は残したままなので再試行できる
   respondFailedRetry:  { en: 'Send failed — tap to retry',      ja: '送信に失敗 (タップで再試行)' },
+  // キーを途中まで TUI に撃った後で用件が入れ替わり、打ち切られた場合。
+  // 一部だけ届いている可能性があるので、送り直す前に端末側を確認してほしい
+  respondInterrupted:  { en: 'Interrupted — may be partly sent', ja: '中断 (一部送信済みの可能性)' },
+  // 送信が既定時間内に決着せず、入力ガードだけ先に解除した場合。届いたかは不明
+  respondUnknownResult:{ en: 'Send result unknown — tap to retry', ja: '送信結果不明 (タップで再試行)' },
 
   // ─── New Agent session detection ────────────────────────────
   newClaudeDetecting:  { en: '(detecting…)',                    ja: '(検出中…)' },
