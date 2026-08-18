@@ -139,8 +139,8 @@ const STRINGS = {
   },
   scrollAnimTick: { en: 'Scroll anim speed (ms/line)',          ja: 'スクロール速度 (ms/行)' },
   scrollAnimTickDesc: {
-    en: 'Delay per line of the scroll animation (ms, 0-200). Smaller is faster. Set 0 to disable the animation: jump straight to the target in a single update.',
-    ja: 'スクロールアニメの1行あたりの待ち時間 (ms, 0〜200)。小さいほど速い。0 にするとアニメ無しで、目的位置へ一括スクロール（1回の更新でまとめて移動）。',
+    en: 'Delay per line of the scroll animation (ms, 0-1000, step 10). Smaller is faster. Scroll frames are sent without waiting for the lens to acknowledge them, so a smaller value really does scroll faster. Set 0 to disable the animation: jump straight to the target in a single update.',
+    ja: 'スクロールアニメの1行あたりの待ち時間 (ms, 0〜1000, 10刻み)。小さいほど速い。スクロール中のコマはレンズ側の完了を待たずに送るので、小さくすればそのぶん速く動く。0 にするとアニメ無しで、目的位置へ一括スクロール（1回の更新でまとめて移動）。',
   },
   unset:          { en: '(unset)',                              ja: '未設定' },
   toastUrlCopied: { en: 'URL copied. Open it in your browser.', ja: 'URL をコピーしました。ブラウザで開いてください。' },

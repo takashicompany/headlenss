@@ -279,10 +279,10 @@
           <label class="row">
             <span data-i18n="scrollAnimTick">スクロール速度 (ms/行)</span>
             <div class="slider-line">
-              <input id="scrollAnimTick" type="range" min="0" max="200" step="5" />
+              <input id="scrollAnimTick" type="range" min="0" max="1000" step="10" />
               <span id="scrollAnimTickVal" class="slider-val">10</span>
             </div>
-            <small class="setting-desc" data-i18n="scrollAnimTickDesc">スクロールアニメの1行あたりの待ち時間 (ms, 0〜200)。小さいほど速い。0 にするとアニメ無しで、目的位置へ一括スクロール（1回の更新でまとめて移動）。</small>
+            <small class="setting-desc" data-i18n="scrollAnimTickDesc">スクロールアニメの1行あたりの待ち時間 (ms, 0〜1000, 10刻み)。小さいほど速い。スクロール中のコマはレンズ側の完了を待たずに送るので、小さくすればそのぶん速く動く。0 にするとアニメ無しで、目的位置へ一括スクロール（1回の更新でまとめて移動）。</small>
           </label>
           <label class="row">
             <span data-i18n="chatLines">レンズ表示行数</span>

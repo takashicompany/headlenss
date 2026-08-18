@@ -1310,7 +1310,14 @@ function startScrollAnimation(): void {
       if (next !== scrollOffset) { scrollOffset = next; changed = true }
       scrollAnimPending++
     }
-    if (changed) sendContentDirect(buildG2Content())
+    if (changed) {
+      const content = buildG2Content()
+      // pending を使い切った = これが着地点のコマ。直列路 (待機枠) に載せて
+      // 「最後のコマは必ず届く」保証を維持する。途中のコマは投げっぱなしにして、
+      // レンズの完了待ちで間引かれないようにする (sendScrollFrameLoose 参照)。
+      if (scrollAnimPending === 0) sendContentDirect(content)
+      else sendScrollFrameLoose(content)
+    }
     if (scrollAnimPending !== 0) {
       scrollAnimTimer = setTimeout(() => { void tick() }, scrollAnimTickMs())
     } else {
@@ -1435,7 +1442,10 @@ function buildG2Header(): string {
 }
 
 // ─── G2 レンダリング直列化 (送信背圧) ──────────────────────────────────
-// レンズへの送信は例外なくこの 1 本の直列路 (pumpG2Sends) を通す。
+// レンズへの送信は、スクロールアニメの中間コマ 1 つを除いて、この 1 本の直列路
+// (pumpG2Sends) を通す。唯一の例外は sendScrollFrameLoose (指を動かしている間だけ
+// 発生する有限個のコマ) で、そちらは直列路の会計 (g2SendLock / 待機枠) に一切
+// 参加せず、専用のカウンタ g2LooseScrollInFlight で別勘定にしてある。
 //
 // なぜ背圧が要るか:
 //   SDK ブリッジは呼ばれたぶんだけフレームを内部キューに積むが、実際に消化できる
@@ -1460,7 +1470,7 @@ function buildG2Header(): string {
 //   送信が終わるたびポンプが待機枠から次の 1 件を取り出す。アプリ内の待機も
 //   高々 1 件なので、どれだけ速く要求が来ても構造的に滞留が起きない。
 //   full render は content も送り直すので、実行時に content-only の待機枠は捨てる。
-//   スクロールの中間コマは落ちるが、最後のコマは必ず待機枠に残る = 着地点は必ず届く。
+//   スクロールアニメの着地点 (最後のコマ) もこの待機枠を通るので、必ず届く。
 /** レンズ 1 画面ぶんのスナップショット (同じ状態から組んだ 3 コンテナの内容)。 */
 type G2Frame = { header: string; content: string; footer: string }
 
@@ -1542,9 +1552,11 @@ function isFullRenderDeferred(now: number): boolean {
 }
 
 /**
- * scroll 中のレンズ本文更新 (content コンテナのみ)。
- * 送信中なら待機枠に置くだけで、待機枠は常に最新で上書きされる (途中のコマは捨てる)。
+ * レンズ本文の更新 (content コンテナのみ) を直列路へ載せる。
+ * 使うのはスクロールアニメの着地点 (最後のコマ) と速度 0 の一括ジャンプ。
+ * 送信中なら待機枠に置くだけで、待機枠は常に最新で上書きされる (古い要求は捨てる)。
  * 送信そのものはポンプが直列に行うので、ここから SDK へ直接投げることはない。
+ * スクロールの中間コマはこちらではなく sendScrollFrameLoose を通る。
  */
 function sendContentDirect(content: string): void {
   if (content === g2ContentLastSent) return
@@ -1554,6 +1566,64 @@ function sendContentDirect(content: string): void {
   // 待機中の full render のスナップショットはここで古くなる。捨てて実行時に組み直させる。
   g2RenderPendingFrame = null
   void pumpG2Sends()
+}
+
+/** 投げっぱなしで送ったスクロールコマのうち、まだ完了していない本数 (直列路の会計とは別勘定)。 */
+let g2LooseScrollInFlight = 0
+/**
+ * 投げっぱなしを許す上限 = ジェスチャー 1 回ぶんのコマ数。
+ *
+ * 1 ジェスチャーが出す中間コマは高々 scrollLinesPerGesture - 1 本 (最後の 1 本は
+ * 直列路) なので、単発のジェスチャーでこの上限に当たることはない。当たるのは
+ * 「レンズが遅くて前のジェスチャーぶんがまだ捌けていないのに次を連打した」時だけで、
+ * その時は中間コマを捨てて滞留をジェスチャー 1 回ぶんに頭打ちにする
+ * (捨てても着地点は直列路で必ず届くので、表示が迷子になることはない)。
+ * これが「投げっぱなしでも溜まり続けない」ことの担保。
+ */
+function looseScrollMaxInFlight(): number {
+  return scrollLinesPerGesture()
+}
+
+/**
+ * スクロールアニメの中間コマを、待機枠 (背圧) を通さずレンズへ直接投げる。
+ *
+ * なぜ直列路を通さないか:
+ *   直列路は latest-wins なので、レンズ 1 回の送信にかかる時間より tick が短いと
+ *   中間コマが丸ごと捨てられる。7 行スクロールが 2〜3 コマに落ちて「飛んだ」ように
+ *   見えるカクつきの正体はこれ。even-jp / greensky はスクロールを含む全送信を
+ *   投げっぱなし (ロック・間引きなし) で実機運用していて滑らかなので、滑らかさの
+ *   条件は「中間コマを捨てないこと」だと判断し、スクロールアニメの tick 由来の
+ *   content 送信だけを同じ扱いにする。
+ *
+ * なぜ全経路を投げっぱなしに戻さないか:
+ *   ポーリング由来の full render まで投げっぱなしにすると、無操作でも 1.5 秒ごとに
+ *   供給が続くので未処理が単調に増え、長時間使うほど表示が遅れる (背圧を入れた元の
+ *   理由)。ここで投げるのは「指を動かしている間だけ」「1 ジェスチャーあたり高々
+ *   scrollLinesPerGesture コマ」なので、溜まる量の上限がジェスチャー 1 回ぶんに閉じる。
+ *   指を止めれば供給も止まり、レンズが追いつけば必ず空になる = 蓄積し続けない。
+ *
+ * 順序: ブリッジは呼ばれた順に処理するので、投げっぱなしのコマと直列路の送信が
+ * 混ざっても「呼び出し順 = 反映順」は保たれる。
+ */
+function sendScrollFrameLoose(content: string): void {
+  if (content === g2ContentLastSent) return
+  // 安全弁: レンズが遅すぎて投げっぱなし分が捌けていない。中間コマなので捨ててよい
+  // (g2ContentLastSent を進めないので、同じ内容が後で必要になれば送り直される)。
+  if (g2LooseScrollInFlight >= looseScrollMaxInFlight()) return
+  g2ContentLastSent = content
+  // スクロールは refreshG2 を通さずに scrollOffset を動かすので、待機中の full render の
+  // スナップショットはここで古くなる (sendContentDirect と同じ理由)。
+  g2RenderPendingFrame = null
+  g2LooseScrollInFlight++
+  void updateContent(content).then(
+    () => { g2LooseScrollInFlight-- },
+    (err) => {
+      g2LooseScrollInFlight--
+      // 送れていない内容を送信済みにしない (次の要求で送り直させる)
+      if (g2ContentLastSent === content) g2ContentLastSent = null
+      log(`G2 scroll frame error: ${err}`)
+    },
+  )
 }
 
 /**

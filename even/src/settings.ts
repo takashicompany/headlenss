@@ -31,6 +31,10 @@ export type Settings = {
   scrollCooldownMs: number
   /** スクロールアニメーションの 1 行あたりの間隔 (ms)。小さいほど速い。 */
   scrollAnimTickMs: number
+
+  /** この設定を保存した時刻 (epoch ms)。bridge 側と localStorage 側のどちらが
+   *  新しいかを判定するためだけに使う。旧データには無いので optional。 */
+  savedAt?: number
 }
 
 /** 各数値設定の許容範囲。範囲外の入力はここに clamp する。 */
@@ -43,8 +47,12 @@ export const CHAT_DISPLAY_LINES_MAX = 7
 export const SCROLL_LINES_MIN = 1
 export const SCROLL_COOLDOWN_MIN = 0
 export const SCROLL_COOLDOWN_MAX = 2000
+// スクロールアニメの 1 行あたり待ち時間。0 = アニメ無し (一括ジャンプ)。
+// 下限が 0 で既定が 10ms なのは even-jp / greensky と揃えるため: スクロール中の
+// コマはレンズの完了を待たずに投げる (main.ts の sendScrollFrameLoose 参照) ので、
+// tick をレンズ 1 回の送信時間より短くしても中間コマが消えることはない。
 export const SCROLL_ANIM_TICK_MIN = 0
-export const SCROLL_ANIM_TICK_MAX = 200
+export const SCROLL_ANIM_TICK_MAX = 1000
 
 export const DEFAULT_SETTINGS: Settings = {
   serverBaseUrl: '',
@@ -114,30 +122,99 @@ function parse(json: string | null | undefined): Settings | null {
         raw.scrollAnimTickMs === undefined
           ? DEFAULT_SETTINGS.scrollAnimTickMs
           : clampInt(raw.scrollAnimTickMs, SCROLL_ANIM_TICK_MIN, SCROLL_ANIM_TICK_MAX, DEFAULT_SETTINGS.scrollAnimTickMs),
+      // 新旧比較の基準。壊れた値/旧データは「時刻不明」として undefined にする
+      // (undefined は比較時に最古扱いになる = 時刻を持つ側が勝つ)。
+      savedAt: typeof raw.savedAt === 'number' && Number.isFinite(raw.savedAt) ? raw.savedAt : undefined,
     }
   } catch {
     return null
   }
 }
 
+/**
+ * 設定を読み出す。
+ *
+ * なぜ両方読むか: 以前は bridge 側を無条件に優先していたため、bridge への書き込みが
+ * 失敗している / 古い値が残っている環境では、リロード (プラグイン往復の bfcache 復帰に
+ * よる location.reload、通常の再起動) のたびにユーザーの変更が黙って旧値へ巻き戻った。
+ * 保存時刻 (savedAt) を持たせ、新しい方を採用することでこの巻き戻りを断つ。
+ *
+ * 採用規則:
+ *   - 片方にしか値が無ければそれ。
+ *   - 両方に savedAt があれば新しい方。
+ *   - 片方だけ savedAt を持つ (= 一方が旧データ) なら、持っている方が新しい。
+ *   - どちらも savedAt を持たない (両方とも旧データ) なら従来どおり bridge 優先。
+ * 下 3 つは「savedAt 無し = -Infinity」「同点は bridge 勝ち」で 1 つの比較に畳める。
+ */
 export async function loadSettings(bridge: EvenAppBridge | null): Promise<Settings> {
+  let fromBridge: Settings | null = null
   if (bridge) {
     try {
-      const v = await bridge.getLocalStorage(STORAGE_KEY)
-      const parsed = parse(v)
-      if (parsed) return parsed
+      fromBridge = parse(await bridge.getLocalStorage(STORAGE_KEY))
     } catch {
-      // bridge側に値が無いだけのこともある。下に落とす
+      // bridge 側に値が無い / 読めないだけのこともある。localStorage 側に任せる
+      fromBridge = null
     }
   }
-  return parse(localStorage.getItem(STORAGE_KEY)) ?? { ...DEFAULT_SETTINGS }
+  let fromLocal: Settings | null = null
+  try {
+    fromLocal = parse(localStorage.getItem(STORAGE_KEY))
+  } catch {
+    fromLocal = null
+  }
+
+  let source: 'bridge' | 'localStorage' | 'default'
+  let picked: Settings
+  if (fromBridge && fromLocal) {
+    const bAt = fromBridge.savedAt ?? -Infinity
+    const lAt = fromLocal.savedAt ?? -Infinity
+    // 同点 (両方 savedAt 無しを含む) は bridge 優先 = 従来挙動
+    if (lAt > bAt) { picked = fromLocal; source = 'localStorage' }
+    else { picked = fromBridge; source = 'bridge' }
+  } else if (fromBridge) {
+    picked = fromBridge
+    source = 'bridge'
+  } else if (fromLocal) {
+    picked = fromLocal
+    source = 'localStorage'
+  } else {
+    picked = { ...DEFAULT_SETTINGS }
+    source = 'default'
+  }
+
+  // 実機での切り分け用に 1 行だけ残す (どちら側の値が使われたかが分からないと
+  // 巻き戻りの再発を追えないため)。devMode に依存させない。
+  console.log(
+    `[settings] loaded from=${source} savedAt=${picked.savedAt ?? 'none'}` +
+    ` (bridge=${fromBridge ? fromBridge.savedAt ?? 'none' : 'absent'},` +
+    ` local=${fromLocal ? fromLocal.savedAt ?? 'none' : 'absent'})`,
+  )
+  return picked
 }
 
-export async function saveSettings(bridge: EvenAppBridge | null, s: Settings): Promise<void> {
+/**
+ * 設定を保存する。s.savedAt を保存時刻で更新してから両方へ書く。
+ * @returns bridge へ書けたか。bridge が無い場合は「書く先が無いだけ」なので true。
+ *          失敗時は devMode に関係なくコンソールへ警告を出す (黙って落とすと、
+ *          次回起動で古い bridge 値に巻き戻る原因が表に出ないため)。
+ */
+export async function saveSettings(bridge: EvenAppBridge | null, s: Settings): Promise<boolean> {
+  // 呼び出し側が持っている生存オブジェクトにも刻んでおく (次回の保存/比較で整合させる)
+  s.savedAt = Date.now()
   const json = JSON.stringify(s)
   try { localStorage.setItem(STORAGE_KEY, json) } catch { /* quota */ }
-  if (bridge) {
-    try { await bridge.setLocalStorage(STORAGE_KEY, json) } catch { /* ignore */ }
+  if (!bridge) return true
+  try {
+    // SDK は例外ではなく false で失敗を返すことがあるので、戻り値も必ず見る
+    const ok = await bridge.setLocalStorage(STORAGE_KEY, json)
+    if (ok === false) {
+      console.warn('[settings] bridge への保存が拒否されました (localStorage 側のみ保存)')
+      return false
+    }
+    return true
+  } catch (err) {
+    console.warn(`[settings] bridge への保存に失敗しました (localStorage 側のみ保存): ${err}`)
+    return false
   }
 }
 
