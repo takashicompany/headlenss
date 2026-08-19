@@ -16,6 +16,8 @@
     "typecheck": "tsc --noEmit",
     "hooks:install": "node ../plugin/cc-hooks/install.mjs && node ../plugin/codex-hooks/install.mjs",
     "hooks:uninstall": "node ../plugin/cc-hooks/uninstall.mjs && node ../plugin/codex-hooks/uninstall.mjs",
+    "skills:install": "node ../plugin/skills/install.mjs",
+    "skills:uninstall": "node ../plugin/skills/uninstall.mjs",
     "service:install": "node scripts/install-systemd.mjs",
     "service:status": "systemctl --user status headlenss",
     "service:logs": "journalctl --user -u headlenss -f"

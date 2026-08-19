@@ -51,7 +51,7 @@ PC
 headlenss/
 ├── server/   # PCで動くサーバー (tmux管理API + Web UI + ASR)
 ├── even/     # Even G2用アプリ (スマホWebView上で動くTS Webアプリ)
-└── plugin/   # Claude Code プラグイン (lifecycle hooks → server)
+└── plugin/   # Claude Code / Codex のフック (lifecycle hooks → server) + 同梱スキル
 ```
 
 ## できること
@@ -127,7 +127,23 @@ npm run hooks:install   # Claude Code と Codex 両方のフックを ~/.claude�
 > Claude 側は `~/.claude/settings.json` に、Codex 側は `~/.codex/hooks.json` に直接書き込む方式。
 > **マーケットプレイス版 (`/plugin install headlenss@headlenss`) と併用すると hook が二重発火する**ので、どちらか一方にすること。詳細は [plugin/README.md](./plugin/README.md) を参照。
 
-### 4. (任意) G2アプリをスマホに入れる
+### 4. (任意) 同梱の Claude Code スキルを入れる
+
+Claude Code に headlenss 自体の操作方法を教えるスキル。
+
+- `headlenss-new-session` — API で新しい tmux セッション(エージェント作業場)を作る。
+- `headlenss-g2-plugin` — 開発中の G2 プラグインをセッション一覧に出し、グラスから開く。
+- `headlenss-dev-server` — headlenss のポートを奪わずに dev server を立てて tailnet に公開する。
+
+```bash
+cd server
+npm run skills:install   # plugin/skills/* を ~/.claude/skills/ にコピーする
+```
+
+- シンボリックリンクではなくコピーなので、リポジトリを移動・削除しても動く。`git pull` 後に再実行すれば更新される。外すときは `npm run skills:uninstall`。
+- サーバが `http://127.0.0.1:3000` 以外なら `HEADLENSS_SERVER_URL=http://<host>:3000 npm run skills:install`。差し替わるのは `headlenss-new-session` スキルのみ (他のスキルは headlenss が動くマシン上で使う前提のため、ループバック表記のまま残る)。
+
+### 5. (任意) G2アプリをスマホに入れる
 
 実機 G2 を使う場合のみ。
 
@@ -149,7 +165,7 @@ npm run qr         # QRコードを表示
 `even/app.json` の `network` permission whitelist に、PCのホスト名と
 Speechmatics のエンドポイントを書く必要がある (詳細: [even/README.md](./even/README.md))。
 
-### 5. 使う
+### 6. 使う
 
 - **Web UI から**: ブラウザで `http://<PCのホスト名>:3000/` を開き、tmuxセッションを作って操作。
 - **G2 から**: クリックで録音開始/停止 → 上スワイプで tmux 送信 / 下スワイプで破棄。

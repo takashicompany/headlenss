@@ -299,20 +299,30 @@ export async function renameSession(name: string, nextName: string): Promise<voi
   await exec('tmux', ['rename-session', '-t', name, nextName]);
 }
 
+/**
+ * tmux コマンド 1 本あたりの上限時間。
+ *
+ * なぜ必要か: 応答のキー注入は「Down x N → Enter」のように前後関係のある一連の
+ * 操作で、その間 tmux 単位のロックを握っている。tmux サーバが応答しないまま
+ * execFile が返らないと、ロックごと決着しなくなりその tmux への送信が全て詰まる。
+ * 必ず有限時間で失敗させる (live-owner.ts の tmux 呼び出しと同じ流儀)。
+ */
+const TMUX_EXEC_TIMEOUT_MS = 5_000;
+
 export async function sendKeys(name: string, text: string, submit = false): Promise<void> {
   const target = await agentTarget(name);
   if (text.length > 0) {
-    await exec('tmux', ['send-keys', '-t', target, '-l', text]);
+    await exec('tmux', ['send-keys', '-t', target, '-l', text], { timeout: TMUX_EXEC_TIMEOUT_MS });
   }
   if (submit) {
-    await exec('tmux', ['send-keys', '-t', target, 'C-m']);
+    await exec('tmux', ['send-keys', '-t', target, 'C-m'], { timeout: TMUX_EXEC_TIMEOUT_MS });
   }
 }
 
 export async function sendKey(name: string, key: string): Promise<void> {
   if (!/^[A-Za-z0-9_+-]+$/.test(key)) throw new Error('invalid key');
   const target = await agentTarget(name);
-  await exec('tmux', ['send-keys', '-t', target, key]);
+  await exec('tmux', ['send-keys', '-t', target, key], { timeout: TMUX_EXEC_TIMEOUT_MS });
 }
 
 /**
@@ -329,6 +339,6 @@ export async function captureOutput(name: string, lines = 24): Promise<string> {
     '-p',
     '-J',
     '-S', `-${safeLines}`,
-  ]);
+  ], { timeout: TMUX_EXEC_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 });
   return stdout;
 }

@@ -50,6 +50,20 @@ export function setRendererLog(fn: (msg: string) => void): void {
 }
 
 /**
+ * 「ブリッジ送信路のロックを取ってから実行する」実装の差し込み口。
+ *
+ * なぜ: 復帰後ガード再描画は元々ここから直接 (fire-and-forget で) 送っていたが、
+ * main.ts 側は全送信を 1 本の直列路に通して in-flight を高々 1 本に保っている。
+ * その外から割り込むと背圧の前提が崩れ、他の送信と混ざる。既定は素通しなので、
+ * main.ts が接続していない場合 (テスト等) でも従来どおり動く。
+ */
+type ExclusiveSender = (body: () => Promise<void>) => Promise<void>
+let exclusiveSend: ExclusiveSender = async (body) => { await body() }
+export function setRendererExclusiveSender(fn: ExclusiveSender): void {
+  exclusiveSend = fn
+}
+
+/**
  * プラグインから復帰した直後の boot で呼ぶ。
  * ホスト側セッションには既にプラグインのコンテナが存在し、
  * createStartUpPageContainer はセッションにつき 1 回きりなので、
@@ -68,10 +82,15 @@ function scheduleReturnRedraw(config: {
   window.setTimeout(() => {
     if (!bridge) return
     if (drawSeq !== seqAt) return  // 間に他の描画があった = 取りこぼしていない
-    drawSeq++
-    logFn(`復帰後ガード再描画: ${RETURN_REDRAW_RETRY_MS}ms 無描画のため rebuild を再送`)
-    void withBridgeTimeout('rebuildPageContainer(guard)', bridge.rebuildPageContainer(new RebuildPageContainer(config)))
-      .catch((err) => logFn(`ガード再描画 失敗: ${err}`))
+    // 送信路のロックを取ってから送る。ロック待ちの間に他の描画が入ることがあるので、
+    // 取得後にもう一度 drawSeq を見て「その後に描画があったらキャンセル」を保つ。
+    void exclusiveSend(async () => {
+      if (!bridge) return
+      if (drawSeq !== seqAt) return
+      drawSeq++
+      logFn(`復帰後ガード再描画: ${RETURN_REDRAW_RETRY_MS}ms 無描画のため rebuild を再送`)
+      await withBridgeTimeout('rebuildPageContainer(guard)', bridge.rebuildPageContainer(new RebuildPageContainer(config)))
+    }).catch((err) => logFn(`ガード再描画 失敗: ${err}`))
   }, RETURN_REDRAW_RETRY_MS)
 }
 
@@ -102,6 +121,15 @@ async function withBridgeTimeout<T>(op: string, p: Promise<T>): Promise<T> {
 
 export function initRenderer(appBridge: EvenAppBridge): void {
   bridge = appBridge
+}
+
+/**
+ * ホスト側にこのページのコンテナが既にあるとみなしているか。
+ * false の間は差分更新 (textContainerUpgrade) を送っても何も出ないので、
+ * 呼び出し側は showScreen (ページ再構築) から描き直す必要がある。
+ */
+export function isPageBuilt(): boolean {
+  return startupRendered
 }
 
 /** Foreground 再入場後など、レンズページを再生成したいときに呼ぶ */

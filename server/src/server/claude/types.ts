@@ -94,6 +94,12 @@ export type RespondInput = (
   // chat 履歴に残す回答整形文をどの言語で作るか (Web UI で選択中の言語)。
   // 未指定なら 'en'。
   lang?: 'en' | 'ja';
+  /**
+   * どの pending への回答かをクライアントが明示するための id。
+   * 画面を開いている間に用件が入れ替わることがあるので、現在の pending と
+   * 一致しない応答は 409 で弾く。未指定 (旧クライアント) は従来どおり受理する。
+   */
+  pendingId?: string;
 };
 
 export type HookDecision =

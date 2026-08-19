@@ -528,7 +528,9 @@ export function ChatView({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           // lang: chat 履歴に残る回答整形文をブラウザ選択言語でサーバに作らせる
-          body: JSON.stringify({ ...body, lang: language }),
+          // pendingId: 画面を開いている間に用件が入れ替わっていたらサーバに弾かせる
+          // (古い画面で作った回答が別の用件に適用されるのを防ぐ)
+          body: JSON.stringify({ ...body, lang: language, pendingId: pendingInter.id }),
         },
       );
       if (!res.ok) {

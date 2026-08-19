@@ -44,16 +44,31 @@ const STRINGS = {
   recStartedHint:      { en: 'Recording — please speak',        ja: '録音開始 — お話しください' },
   chatNoMsg:           { en: '(no messages yet)',               ja: '(まだ発言なし)' },
   chatLoading:         { en: 'Loading...',                      ja: '読み込み中...' },
-  noticeQuestion:      { en: '? Question waiting (tap to answer)',    ja: '? 質問待ち (clickで回答)' },
-  noticePermission:    { en: '⏸ Permission waiting (tap to respond)', ja: '⏸ 承認待ち (clickで応答)' },
+  // Agent の動作状態を chat 末尾に出す待機行。サーバも同義の英語行を合成してくるが、
+  // そちらは synthetic として捨て、表示はこのテーブルで行う (言語に追従させるため)。
+  chatStatusThinking:  { en: '(thinking…)',                     ja: '(考え中…)' },
+  chatStatusWaitPerm:  { en: '(awaiting permission…)',          ja: '(承認待ち…)' },
+  chatStatusWaitQ:     { en: '(awaiting question…)',            ja: '(質問待ち…)' },
   rootListEmpty:       { en: '(no agent session)\n\nStart agent or Codex inside tmux',
                          ja: '(エージェントが動いている tmux が無い)\n\ntmux 内でエージェントを起動してください' },
 
   // ─── G2 cc-response (approve / answer) ───────────────────────
   approveTool:         { en: '⏸ Approve {name}',                ja: '⏸ {name} の承認' },
   multiBadge:          { en: ' [multi]',                        ja: ' [複数]' },
+  // cc-message で本文を上限文字数で切り詰めた時に末尾へ出す省略表示
+  ccMsgTruncated:      { en: '… (showing {shown} of {total} chars)',
+                         ja: '… (全{total}文字中{shown}文字まで表示)' },
   submitOption:        { en: '> Submit',                        ja: '> Submit (確定)' },
+  // 複数選択で 1 つも選ばれていない時、Submit 行に添える注意書き (押しても確定しない)
+  submitNeedsPick:     { en: '(pick at least one)',             ja: '(1つ以上選択)' },
   voiceInputBadge:     { en: '(voice input)',                   ja: '(音声入力)' },
+  // 応答の送信に失敗した時にフッターへ出す一時的な案内。回答は残したままなので再試行できる
+  respondFailedRetry:  { en: 'Send failed — tap to retry',      ja: '送信に失敗 (タップで再試行)' },
+  // キーを途中まで TUI に撃った後で用件が入れ替わり、打ち切られた場合。
+  // 一部だけ届いている可能性があるので、送り直す前に端末側を確認してほしい
+  respondInterrupted:  { en: 'Interrupted — may be partly sent', ja: '中断 (一部送信済みの可能性)' },
+  // 送信が既定時間内に決着せず、入力ガードだけ先に解除した場合。届いたかは不明
+  respondUnknownResult:{ en: 'Send result unknown — tap to retry', ja: '送信結果不明 (タップで再試行)' },
 
   // ─── New Agent session detection ────────────────────────────
   newClaudeDetecting:  { en: '(detecting…)',                    ja: '(検出中…)' },
@@ -124,8 +139,8 @@ const STRINGS = {
   },
   scrollAnimTick: { en: 'Scroll anim speed (ms/line)',          ja: 'スクロール速度 (ms/行)' },
   scrollAnimTickDesc: {
-    en: 'Delay per line of the scroll animation (ms, 0-200). Smaller is faster. Set 0 to disable the animation: jump straight to the target in a single update.',
-    ja: 'スクロールアニメの1行あたりの待ち時間 (ms, 0〜200)。小さいほど速い。0 にするとアニメ無しで、目的位置へ一括スクロール（1回の更新でまとめて移動）。',
+    en: 'Delay per line of the scroll animation (ms, 0-1000, step 10). Smaller is faster. Scroll frames are sent without waiting for the lens to acknowledge them, so a smaller value really does scroll faster. Set 0 to disable the animation: jump straight to the target in a single update.',
+    ja: 'スクロールアニメの1行あたりの待ち時間 (ms, 0〜1000, 10刻み)。小さいほど速い。スクロール中のコマはレンズ側の完了を待たずに送るので、小さくすればそのぶん速く動く。0 にするとアニメ無しで、目的位置へ一括スクロール（1回の更新でまとめて移動）。',
   },
   unset:          { en: '(unset)',                              ja: '未設定' },
   toastUrlCopied: { en: 'URL copied. Open it in your browser.', ja: 'URL をコピーしました。ブラウザで開いてください。' },
@@ -176,8 +191,11 @@ const STRINGS = {
   g2FootSending:    { en: 'Sending to tmux…',                              ja: 'tmuxに送信中…' },
   g2FootSetup:      { en: 'Set up on phone',                               ja: 'スマホで設定' },
   g2FootIdle:       { en: 'Tap:Rec　↑↓:Scroll　2Tap:Back',         ja: 'タップ:録音　↑↓:履歴　2タップ:戻る' },
-  g2FootIdlePending:{ en: 'Tap:Answer　↑↓:Scroll　2Tap:Back',      ja: 'タップ:応答　↑↓:履歴　2タップ:戻る' },
-  g2FootCcResponse: { en: '↑↓:Pick　Tap:OK　2Tap:Cancel',          ja: '↑↓:選択　タップ:確定　2タップ:取消' },
+  g2FootIdlePending:{ en: 'Tap:Answer　↑↓:Scroll　2Tap:Back',      ja: 'タップ:回答　↑↓:履歴　2タップ:戻る' },
+  // cc-message: メッセージ全文の閲覧画面 (タップで選択肢画面へ)
+  g2FootCcMessage:  { en: 'Tap:Choices　↑↓:Scroll　2Tap:Cancel',    ja: 'タップ:選択肢へ　↑↓:読む　2タップ:取消' },
+  // cc-response: 選択肢画面。2Tap はキャンセルではなく cc-message へ戻る
+  g2FootCcResponse: { en: '↑↓:Pick　Tap:OK　2Tap:Back',             ja: '↑↓:選択　タップ:確定　2タップ:戻る' },
   g2FootCcRespMulti:{ en: '↑↓:Pick　Tap:Toggle & Submit',          ja: '↑↓:選択　タップ:切替　Submitで確定' },
   g2FootCcRespRec:  { en: 'Tap:Done　2Tap:Cancel',                  ja: 'タップ:録音終了　2タップ:取消' },
   g2NoOutput:       { en: '(no output yet)',                    ja: '(まだ出力なし)' },

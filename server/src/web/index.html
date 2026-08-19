@@ -2,9 +2,22 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit=cover: standalone (ホーム画面から起動) で画面全体を使う宣言。
+         これが無いと black-translucent なステータスバーの下に自分で余白を作れない。
+         代わりに安全域は CSS 側で env(safe-area-inset-*) を足して確保する。 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#0e0e10" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- Safari は SVG favicon 非対応なので PNG/ico を併記。ico は生成物 (favicon-32.png 由来) -->
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <!-- iOS「ホーム画面に追加」用 (無いとページのスクリーンショットがアイコンになる) -->
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <!-- standalone 宣言。これが無いとホーム画面アイコンはただのブックマーク扱いになり、
+         既定ブラウザで開いてしまう (PWA として単独ウィンドウで開かせるための宣言) -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="HeadLenss" />
     <title>HeadLenss</title>
   </head>
   <body>
