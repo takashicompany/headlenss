@@ -9,6 +9,7 @@ import type { EvenAppBridge } from '@evenrealities/even_hub_sdk'
 const DISPLAY_WIDTH = 576
 const DISPLAY_HEIGHT = 288
 const HEADER_HEIGHT = 32                                // ヘッダ (現在の phase タイトル)
+const HEADER_PADDING = 4                                // ヘッダの内側余白 (headerContainer と共有)
 const FOOTER_HEIGHT = 40                                // フッタ (操作ガイド)
 // 左眼で main container の上端 border (1px) が裁ち落とされる現象への対策で、
 // main を MAIN_TOP_INSET px だけ下にずらす。height はその分減らし、footer の位置は変えない。
@@ -26,6 +27,9 @@ const MAIN_BORDER = 1
 export const MAIN_INNER_WIDTH = DISPLAY_WIDTH - 2 * (MAIN_PADDING + MAIN_BORDER)
 /** main コンテナの実テキスト描画高さ (px)。 */
 export const MAIN_INNER_HEIGHT = CONTENT_HEIGHT - 2 * (MAIN_PADDING + MAIN_BORDER)
+/** header (containerID:4) の実テキスト描画幅 (px)。padding を四辺から引いた内側。
+ *  これより広いヘッダはレンズ側で裁ち落とされる (末尾から見えなくなる)。 */
+export const HEADER_INNER_WIDTH = DISPLAY_WIDTH - 2 * HEADER_PADDING
 /** LVGL の行の高さ (px, 固定)。@evenrealities/pretext の計測値準拠。 */
 export const LENS_LINE_HEIGHT = 27
 
@@ -208,7 +212,7 @@ function headerContainer(text: string): TextContainerProperty {
     width: DISPLAY_WIDTH,
     height: HEADER_HEIGHT,
     isEventCapture: 0,
-    paddingLength: 4,
+    paddingLength: HEADER_PADDING,
   })
 }
 

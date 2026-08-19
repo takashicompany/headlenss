@@ -10,6 +10,7 @@ import {
 } from './audio'
 import { onEvenHubEvent, setEventHandlers, setScrollCooldownMs } from './events'
 import {
+  HEADER_INNER_WIDTH,
   initRenderer,
   isPageBuilt,
   MAIN_INNER_WIDTH,
@@ -599,7 +600,8 @@ function syncRootCursor(): void {
  * (レンズの 1 行は狭く、記号は 1 枠しか置けない)
  */
 function claudeStatusMark(s: ClaudeSessionInfo): string {
-  if (s.screenBlocked === true) return '⚠'
+  // 全角「！」。⚠ はレンズのフォントに無く、行に置いても空白にしか見えない。
+  if (s.screenBlocked === true) return '！'
   switch (s.status) {
     case 'waiting-permission': return '⏸'
     case 'waiting-question': return '?'
@@ -1438,6 +1440,11 @@ function buildG2Footer(): string {
   }
 }
 
+// 画面ブロック警告の点滅位相。true = 警告を出すコマ、false = セッション名だけのコマ。
+// 専用タイマーは持たず、1.5 秒ポーリング由来の再描画 (refreshClaudeData) のたびに
+// 反転させることで約 1.5 秒周期の点滅にする。
+let blockedBlinkOn = true
+
 /** 今開いているセッションが画面ブロック中か (一覧の最新の取得結果から見る) */
 function currentSessionBlocked(): boolean {
   const name = settings.sessionName
@@ -1486,7 +1493,18 @@ function buildG2Header(): string {
       // 画面が塞がっているなら、スクロールしても消えないヘッダで知らせる
       // (フッタは操作の案内なので変えない)
       if (currentSessionBlocked()) {
-        return `${t('g2HeadBlocked')}　${settings.sessionName || ''}`.slice(0, 56)
+        // 並びは「セッション名　！ 警告」。警告は必ず出したいので、ヘッダの実描画幅に
+        // 収まらないぶんはセッション名側を切り詰める。文字数ではなく px で測るのは、
+        // レンズが裁ち落とすのが px 幅だから (全角名だと文字数では収まって見えても
+        // 警告が画面外へ押し出される)。
+        // 切り詰めは点滅の両フェーズに同じだけ掛ける。非表示コマだけ名前が伸びると
+        // 名前そのものがちらついて読みにくいため。
+        const warn = t('g2HeadBlocked')
+        const sep = '　'
+        const avail = HEADER_INNER_WIDTH - getTextWidth(sep + warn)
+        const name = truncateToPx(settings.sessionName || '', avail).s
+        // 56 は他のヘッダと揃えた最後の歯止め (px で切った後は通常ここに掛からない)
+        return (blockedBlinkOn ? `${name}${sep}${warn}` : name).slice(0, 56)
       }
       return settings.sessionName || t('appName')
     }
@@ -2092,6 +2110,12 @@ async function refreshClaudeData(): Promise<void> {
       // ポーリング由来の再描画は「表示が変わる時だけ」。変わらないのに 1.5 秒ごとに
       // 全面送信 (3 フレーム) を掛け続けると、レンズ側の消化が追いつかない環境では
       // それだけで滞留が育つ (g2FrameWouldChange 参照)。
+      // 画面ブロック中の警告は、この再描画に便乗して表示/非表示を入れ替える (点滅)。
+      // 副作用として、ブロック中はヘッダが毎回変わる = g2FrameWouldChange が常に
+      // 「変化あり」になり、1.5 秒ごとに full render が送られる。ブロック中の
+      // セッションを開いている間だけの話なので許容する。
+      // ブロックが解けたら位相を「表示」に戻し、次にブロックされたとき必ず警告から始める。
+      blockedBlinkOn = currentSessionBlocked() ? !blockedBlinkOn : true
       // ただし送信が途絶えて久しい場合は、取りこぼし対策として dedup を捨てて 1 回通す。
       if (isForcedResyncDue()) {
         console.log('[refreshG2] forced resync: no send for a while')
