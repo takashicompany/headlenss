@@ -35,6 +35,11 @@ export type ClaudeSessionInfo = {
    * サーバは true のときだけ付けてくる (false は送らない)。
    */
   screenBlocked?: boolean
+  /**
+   * 送ったのに ACK (エージェントの UserPromptSubmit フック) が返ってこなかった
+   * 直近の送信。サーバは未確認の間だけ付けてくる (確認できたら消える)。
+   */
+  deliveryWarning?: DeliveryWarning
   /** このセッションの作業フォルダ配下で動いている G2 プラグインの dev server。 */
   g2Plugins?: G2PluginInfo[]
 }
@@ -48,6 +53,16 @@ export type G2PluginInfo = {
   name: string
   /** 宣言ファイルに書かれた URL。そのまま遷移先になる (組み立て直さない) */
   url: string
+}
+
+/**
+ * 送達未確認の知らせ。tmux へのキー注入は成功しても、pane が塞がっていれば
+ * 会話には入らない。エージェントがプロンプトを受理した証拠 (フック) が期限内に
+ * 来なかった送信を、サーバがこの形で教えてくる。
+ */
+export type DeliveryWarning = {
+  /** 未確認のまま残っている送信を投げた時刻 (epoch ms)。 */
+  sentAt: number
 }
 
 export type ChatRole = 'user' | 'assistant'
@@ -65,6 +80,8 @@ export type ClaudeChatResponse = {
   source?: AgentSource
   /** Agent の動作状態。未知の値が増えても壊れないよう string も許容する。 */
   status?: ClaudeSessionStatus | string
+  /** 送ったのに届いた確証が得られていない送信 (未確認の間だけ付く)。 */
+  deliveryWarning?: DeliveryWarning
 }
 
 export type AskQuestionOption = { label: string; description?: string }
@@ -247,7 +264,12 @@ export class HeadlenssClient {
     if (res.status === 404) return { chat: [] }
     if (!res.ok) throw new Error(`getClaudeChat HTTP ${res.status}`)
     const data = (await res.json()) as ClaudeChatResponse
-    return { chat: data.chat ?? [], source: data.source, status: data.status }
+    return {
+      chat: data.chat ?? [],
+      source: data.source,
+      status: data.status,
+      deliveryWarning: data.deliveryWarning,
+    }
   }
 
   async getClaudePending(name: string, signal?: AbortSignal): Promise<Pending | null> {

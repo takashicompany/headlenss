@@ -20,7 +20,7 @@ import { detectLiveOwners, invalidateLiveOwnerCache } from './claude/live-owner.
 import * as claudeStore from './claude/store.ts';
 import { sanitizeChatText } from './claude/transcript.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot, stopPeriodicSnapshot } from './persist.ts';
-import { recordUiSubmission } from './uiSubmissions.ts';
+import { createDelivery, getDeliveryWarning, markDeliveryFailed, markDeliveryInjected, pruneDeliveries } from './uiSubmissions.ts';
 import {
   deleteSessionStatusObservation,
   pickEffectiveSource,
@@ -190,6 +190,8 @@ app.get('/api/sessions', async (c) => {
   // 死んだ / 改名された tmux セッションの status 変化時刻は捨てる。
   pruneSessionStatusObservations(liveNames);
   pruneScreenBlockObservations(liveNames);
+  // 死んだ / 改名されたセッションの送達追跡も捨てる (無制限成長させない)。
+  pruneDeliveries(liveNames);
   const enriched = sessions.map((s) => {
     const tracked = claudeStore.getSession(s.name);
     // agent (実効ソース) も status も /api/claude/sessions と同じ共有関数で決める。
@@ -231,6 +233,9 @@ app.get('/api/sessions', async (c) => {
       codexNeedsHookAttention: (agent === 'codex' && codexMap.get(s.name)?.needsHookAttention) ?? false,
       lastChat: storeMatches ? buildLastChat(s.name) : undefined,
       screenBlocked: screenBlocked ? (true as const) : undefined,
+      // 送ったのに ACK (UserPromptSubmit) が返ってこなかった直近の送信。
+      // 確認できた時点で消える。付くのは未確認のときだけ。
+      deliveryWarning: getDeliveryWarning(s.name),
     };
   });
   for (const retained of listRetainedSessions(liveNames)) {
@@ -245,6 +250,7 @@ app.get('/api/sessions', async (c) => {
       lastChat: undefined,
       // 解放済み (tmux が無い) セッションは画面そのものが無いので常に付けない。
       screenBlocked: undefined,
+      deliveryWarning: undefined,
     });
   }
   return c.json({ sessions: enriched });
@@ -438,6 +444,8 @@ app.post('/api/sessions/:name/input', async (c) => {
       409,
     );
   }
+  // 送達 (ack) の追跡 id。注入前に作るので、finally/catch でも見えるところに置く。
+  let deliveryId: string | null = null;
   try {
     const tracked = claudeStore.getSession(name);
     const pane = body.submit === true ? await captureOutput(name, 120).catch(() => '') : '';
@@ -456,9 +464,10 @@ app.post('/api/sessions/:name/input', async (c) => {
         (await detectCodexSessions()).some((session) => session.tmuxSessionName === name)
       );
     }
-    // UI 送信を記録: 後続の user-prompt-submit hook で origin 判定に使う
+    // 送達を記録: 後続の user-prompt-submit hook で origin 判定と ACK 突き合わせに使う。
+    // 注入「前」に作るのは、注入が終わる前にフックが届くことがあるため。
     if (body.submit === true && body.text.trim()) {
-      recordUiSubmission(name, body.text);
+      deliveryId = createDelivery(name, body.text);
     }
     if (body.submit === true && isCodex) {
       const visiblePaneTail = pane.slice(-3000);
@@ -466,11 +475,24 @@ app.post('/api/sessions/:name/input', async (c) => {
       await sendKeys(name, body.text, false);
       await new Promise((resolve) => setTimeout(resolve, 120));
       await sendKey(name, shouldQueueInCodex ? 'Tab' : 'Enter');
-      return c.json({ ok: true, queued: shouldQueueInCodex });
+      // Tab キューに積んだ場合は、現ターンが終わる (Stop) まで受理されないので
+      // 期限の考え方が変わる。その区別を送達側に渡す。
+      if (deliveryId) markDeliveryInjected(name, deliveryId, { queued: shouldQueueInCodex });
+      return c.json({ ok: true, queued: shouldQueueInCodex, ...(deliveryId ? { deliveryId } : {}) });
     }
     await sendKeys(name, body.text, body.submit === true);
-    return c.json({ ok: true });
+    if (deliveryId) {
+      // Claude Code も処理中 (esc to interrupt 表示中) に Enter を撃つと、その本文は
+      // 入力キューに積まれ、今のターンが終わるまで受理されない。Codex の Tab キューと
+      // 同じ扱いにしないと、長いターンの最中に送っただけで「届いていない」と誤報する。
+      // (注入の仕方は一切変えていない。期限の数え方だけを変える。)
+      const queued = /esc to interrupt/i.test(pane.slice(-3000));
+      markDeliveryInjected(name, deliveryId, { queued });
+    }
+    return c.json({ ok: true, ...(deliveryId ? { deliveryId } : {}) });
   } catch (e) {
+    // 注入そのものが失敗した = 確実に届いていない。待たずに未達として確定させる。
+    if (deliveryId) markDeliveryFailed(name, deliveryId);
     const msg = (e as Error).message;
     const status =
       msg.includes("can't find session") || msg.includes('no server running') ? 404 : 400;

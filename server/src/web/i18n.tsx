@@ -64,6 +64,12 @@ const STRINGS = {
   screenBlockedBody:      { en: 'A dialog or wizard is taking over the agent\u2019s tmux screen, so messages sent from here will not reach the conversation. Check the tmux screen directly and finish what is on it.',
                             ja: 'エージェントの tmux 画面をウィザードやダイアログが占有しています。ここから送ったメッセージは会話に届きません。tmux の画面を直接確認して、表示されている操作を終わらせてください。' },
 
+  // ── 送達確認 (ack) が返ってこなかった送信 ──
+  // 送った本文をエージェントが受理すると UserPromptSubmit フックが飛ぶ。
+  // それが来ないまま期限を過ぎた = 会話に入っていない可能性が高い。
+  deliveryUnconfirmed:    { en: 'It looks like your message did not arrive. Check the tmux screen.',
+                            ja: '届いていないようです。tmux の画面を確認してください。' },
+
   // ── ChatView: question / pending ──
   confirmCancelTitle:     { en: 'Confirm question cancellation', ja: '質問のキャンセル確認' },
   confirmAnswersTitle:    { en: 'Review your answers', ja: '回答内容の確認' },

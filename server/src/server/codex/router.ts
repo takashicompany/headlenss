@@ -5,7 +5,7 @@ import type { Context } from 'hono';
 import { resolveTmuxSessionName } from '../claude/tmux-resolver.ts';
 import * as store from '../claude/store.ts';
 import { extractLastCodexAssistantText } from './transcript.ts';
-import { matchUiSubmission } from '../uiSubmissions.ts';
+import { confirmDelivery, startQueuedDeliveryTimer } from '../uiSubmissions.ts';
 
 const exec = promisify(execFile);
 
@@ -45,6 +45,8 @@ type CodexHookPayload = {
   tool_input?: unknown;
   permission_mode?: string;
   source?: string;
+  /** Codex が付けてくるターン識別子。同一イベントの二重フックの冪等化に使う。 */
+  turn_id?: string;
 };
 
 async function getTmuxName(c: Context): Promise<string> {
@@ -103,7 +105,14 @@ codexRouter.post('/hooks/codex/user-prompt-submit', async (c) => {
   const text = (body.prompt ?? '').trim();
   console.log('[codex-hook] user-prompt tmux=' + tmuxName + ' len=' + text.length);
   if (text) {
-    const origin = matchUiSubmission(tmuxName, text) ? 'ui' as const : 'external' as const;
+    // Codex がプロンプトを受理した証拠 = 送達の ACK。Tab キューに積んだ送信も、
+    // キューが掃けてここに来た時点で確認済みになる。
+    const { origin } = confirmDelivery({
+      tmuxName,
+      text,
+      sessionId: body.session_id,
+      turnId: body.turn_id,
+    });
     store.appendChat(tmuxName, 'user', text, { origin });
   }
   store.setStatus(tmuxName, 'busy');
@@ -120,6 +129,9 @@ codexRouter.post('/hooks/codex/stop', async (c) => {
   // await を挟むので、その間に新しい用件が立っていることがある。無条件に消すと、
   // 後から出てきた用件を「終わった古い用件のつもり」で消してしまう。
   const pendingIdAtEntry = store.getPending(tmuxName)?.id;
+  // Tab キューに積んだ送信は「今のターンが終わってから」受理される。
+  // このターンが終わった今が、その送信の ACK を待ち始めるべき時点。
+  startQueuedDeliveryTimer(tmuxName);
   const transcriptPath = body.transcript_path ?? '';
   if (transcriptPath) {
     const text = await extractLastCodexAssistantText(transcriptPath);

@@ -1020,6 +1020,15 @@ button {
   background: rgba(255, 255, 255, 0.02);
 }
 
+/* 送達未確認の注意 (入力欄の直上)。エラーではないので赤ではなく警告色で出す。 */
+.chat-delivery-warning {
+  background: rgba(245, 166, 35, 0.12);
+  color: #f5a623;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.85rem;
+  border-top: 1px solid rgba(245, 166, 35, 0.42);
+}
+
 .chat-error {
   background: #3a1a1a;
   color: #ff8888;

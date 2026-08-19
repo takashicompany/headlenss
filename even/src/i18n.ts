@@ -49,6 +49,10 @@ const STRINGS = {
   chatStatusThinking:  { en: '(thinking…)',                     ja: '(考え中…)' },
   chatStatusWaitPerm:  { en: '(awaiting permission…)',          ja: '(承認待ち…)' },
   chatStatusWaitQ:     { en: '(awaiting question…)',            ja: '(質問待ち…)' },
+  // 送ったのにエージェントが受理した証拠 (フック) が期限内に来なかった時の注意。
+  // tmux の画面が塞がっていると、キーは撃てても会話には入らない。
+  chatDeliveryUnconfirmed: { en: '⚠ It looks like your message did not arrive. Check the tmux screen.',
+                             ja: '⚠ 届いていないようです。tmux の画面を確認してください。' },
   rootListEmpty:       { en: '(no agent session)\n\nStart agent or Codex inside tmux',
                          ja: '(エージェントが動いている tmux が無い)\n\ntmux 内でエージェントを起動してください' },
 

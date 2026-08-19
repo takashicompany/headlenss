@@ -14,7 +14,7 @@ import { captureOutput, sendKey, sendKeys } from '../tmux.ts';
 import { extractChatFromTranscript, extractLastAssistantText, sanitizeChatText } from './transcript.ts';
 import { extractCodexChatFromTranscript } from '../codex/transcript.ts';
 import { detectAgentPaneTexts, detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
-import { matchUiSubmission } from '../uiSubmissions.ts';
+import { confirmDelivery, getDeliveryWarning, startQueuedDeliveryTimer, type DeliveryWarning } from '../uiSubmissions.ts';
 import { detectG2Plugins, tmuxSessionPaths, type G2Plugin } from '../g2-plugins.ts';
 import {
   deleteSessionStatusObservation,
@@ -129,6 +129,9 @@ type HookPayload = {
   tool_name?: string;
   tool_input?: { questions?: AskQuestion[]; [k: string]: unknown };
   source?: string;
+  /** 同一イベントの二重フック (global 設定 + project 設定の両方に入っている等) を
+   *  見分けるためのターン識別子。提供されないエージェントもあるので任意。 */
+  turn_id?: string;
   // Stop / SubagentStop で送られる「今のターンの最終アシスタント本文」。
   // transcript は非同期書き込みでフック発火時にまだ今ターン分を含まないため、
   // 公式ドキュメントはこちらを使うよう指示している。
@@ -209,7 +212,14 @@ claudeRouter.post('/hooks/user-prompt-submit', async (c) => {
   const text = (body.prompt ?? '').trim();
   console.log(`[hook] user-prompt tmux=${tmuxName} len=${text.length}`);
   if (text) {
-    const origin = matchUiSubmission(tmuxName, text) ? 'ui' as const : 'external' as const;
+    // このフックが「エージェントが本文を受理した」唯一の証拠 = 送達の ACK。
+    // origin (UI 由来か外部入力か) の判定も同じ突き合わせで返ってくる。
+    const { origin } = confirmDelivery({
+      tmuxName,
+      text,
+      sessionId: body.session_id,
+      turnId: body.turn_id,
+    });
     store.appendChat(tmuxName, 'user', text, { origin });
   }
   return c.json({});
@@ -246,6 +256,10 @@ claudeRouter.post('/hooks/stop', async (c) => {
       source: 'claude',
     });
   }
+  // Claude が処理中の間に送った本文は入力キューに積まれ、今のターンが終わってから
+  // 受理される。このターンが終わった今が、その送信の ACK を待ち始めるべき時点。
+  // (Codex の Tab キューと同じ扱い。codex/router.ts の stop フックと対になる。)
+  startQueuedDeliveryTimer(tmuxName);
   // 今ターンの本文は payload の last_assistant_message を最優先で使う。
   // transcript は非同期書き込みなので、フック発火時点ではまだ今ターン分が
   // 書かれておらず、読みに行くと「1ターン前の返答」を拾ってしまう。
@@ -711,6 +725,9 @@ claudeRouter.get('/claude/sessions', async (c) => {
     /** 対話ウィザード等が pane を占有していて、通常の入力欄が画面に見えていない。
      *  status は据え置きなので、既存クライアントはこのフィールドを無視できる。 */
     screenBlocked?: true;
+    /** 送ったのに ACK (UserPromptSubmit) が返ってこなかった直近の送信。
+     *  確認できた時点で消える (未確認のときだけ付く)。 */
+    deliveryWarning?: DeliveryWarning;
     /** セッションの作業フォルダ配下で動いている G2 プラグインの dev server */
     g2Plugins?: G2Plugin[];
   }> = [];
@@ -788,6 +805,7 @@ claudeRouter.get('/claude/sessions', async (c) => {
         source: 'claude',
         lastChat,
         screenBlocked: screenBlocked ? true : undefined,
+        deliveryWarning: getDeliveryWarning(name),
       });
     } else {
       const sx = storeMatched ? st : undefined;
@@ -804,6 +822,7 @@ claudeRouter.get('/claude/sessions', async (c) => {
         codexHookHealth: cwd ? getCodexHookHealth(cwd) : undefined,
         codexNeedsHookAttention: xd?.needsHookAttention,
         lastChat,
+        deliveryWarning: getDeliveryWarning(name),
       });
     }
   }
@@ -1010,10 +1029,13 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
     status,
     paneText: paneTexts.get(tmuxName),
   });
+  // 送達警告: 送ったのに ACK が来ていない直近の送信 (確認できたら消える)。
+  const deliveryWarning = getDeliveryWarning(tmuxName);
   return c.json({
     chat: merged,
     status,
     ...(screenBlocked ? { screenBlocked: true as const } : {}),
+    ...(deliveryWarning ? { deliveryWarning } : {}),
     // stale (別 agent の残骸) の pending は表示しない (store は書き換えない=表示抑止のみ)。
     pending: storeIsStale ? null : (session?.pending ?? null),
     source: effSource,

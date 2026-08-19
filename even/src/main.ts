@@ -36,6 +36,7 @@ import {
   type AgentSource,
   type ChatItem,
   type ClaudeSessionInfo,
+  type DeliveryWarning,
   type G2PluginInfo,
   type Pending,
   type Session,
@@ -315,6 +316,9 @@ let chatLinesCacheKey = ''
 let currentAgentSource: AgentSource | undefined = undefined
 // サーバから来た Agent の動作状態 (idle / busy / waiting-*)。chat 末尾の待機行に使う。
 let claudeChatStatus: string | undefined = undefined
+// 送ったのに届いた確証が得られていない直近の送信 (サーバが未確認の間だけ載せてくる)。
+// 確認できたらサーバ側で消えるので、こちらは受け取った値をそのまま持つだけでよい。
+let claudeDeliveryWarning: DeliveryWarning | null = null
 let claudePending: Pending | null = null         // 現在選択中セッションの承認/質問待ち
 let claudeChatLoading = false                    // セッション切替直後のロード中フラグ
 // refreshClaudeData の非同期レース防止: 実行中の fetch を abort し、完了時にセッション名を検証する
@@ -1184,29 +1188,58 @@ function chatStatusLine(): string | null {
   }
 }
 
-// chatLinesForDisplay の結果キャッシュ。(chatLinesCache, 待機行) の組が変わった時だけ
-// 作り直す。なぜ: 毎回 [...chatLinesCache, status] を組むと、スクロールの 1 tick ごとに
+// 送達未確認の注意行 (レンズ幅で折り返し済み)。文言が変わらない限り測り直さない。
+let deliveryWarnLinesCache: string[] = []
+let deliveryWarnLinesCacheKey = ''
+
+/**
+ * 「送ったのに届いていないようだ」の注意行。
+ *
+ * 画面ブロック中はヘッダ (buildG2Header) が同じことを既に伝えているので出さない。
+ * 届かない原因は同じ (画面が塞がっている) で、狭いレンズで二度言う価値が無い。
+ */
+function deliveryWarningLines(): string[] {
+  if (!claudeDeliveryWarning || currentSessionBlocked()) return []
+  const text = t('chatDeliveryUnconfirmed')
+  if (text !== deliveryWarnLinesCacheKey) {
+    deliveryWarnLinesCache = wrapText(text, CHAT_WRAP_PX)
+    deliveryWarnLinesCacheKey = text
+  }
+  return deliveryWarnLinesCache
+}
+
+// chatLinesForDisplay の結果キャッシュ。(chatLinesCache, 末尾に足す行) の組が変わった
+// 時だけ作り直す。なぜ: 毎回 [...chatLinesCache, ...] を組むと、スクロールの 1 tick ごとに
 // 会話全体ぶんの配列コピー (O(n)) が走り、会話が長いほどスクロールが重くなる。
 // chatLinesCache は常に丸ごと差し替えられる (要素を書き換えない) ので、参照一致で判定できる。
 let chatDisplayCache: string[] = []
 let chatDisplayCacheSource: string[] | null = null
 let chatDisplayCacheStatus: string | null = null
 
-/** 表示用の chat 行配列 = 整形済みキャッシュ + (あれば) 末尾の待機行 */
-function chatLinesForDisplay(): string[] {
+/** 末尾に足す行 (待機行 → 送達未確認の注意)。注意は最下段 = いちばん目に入る位置に置く。 */
+function chatTailLines(): string[] {
   const status = chatStatusLine()
-  if (chatDisplayCacheSource === chatLinesCache && chatDisplayCacheStatus === status) {
+  const warn = deliveryWarningLines()
+  if (!status) return warn
+  return warn.length === 0 ? [status] : [status, ...warn]
+}
+
+/** 表示用の chat 行配列 = 整形済みキャッシュ + (あれば) 末尾の待機行 / 注意行 */
+function chatLinesForDisplay(): string[] {
+  const tail = chatTailLines()
+  const key = tail.join('\n')
+  if (chatDisplayCacheSource === chatLinesCache && chatDisplayCacheStatus === key) {
     return chatDisplayCache
   }
-  chatDisplayCache = status ? [...chatLinesCache, status] : chatLinesCache
+  chatDisplayCache = tail.length > 0 ? [...chatLinesCache, ...tail] : chatLinesCache
   chatDisplayCacheSource = chatLinesCache
-  chatDisplayCacheStatus = status
+  chatDisplayCacheStatus = key
   return chatDisplayCache
 }
 
 /** 表示用 chat の行数だけが要る呼び出し用。配列を組まずに数える (スクロール中に毎 tick 呼ばれる)。 */
 function chatDisplayCount(): number {
-  return chatLinesCache.length + (chatStatusLine() ? 1 : 0)
+  return chatLinesCache.length + chatTailLines().length
 }
 
 function maxChatScrollOffset(): number {
@@ -1857,6 +1890,7 @@ sessionPillsEl.addEventListener('click', (e) => {
     chatLinesCache = []
     chatLinesCacheKey = ''
     claudeChatStatus = undefined
+    claudeDeliveryWarning = null
     claudeChatLoading = true
     // 前セッションの用件と作りかけの回答を捨てる (応答画面を開いていたら idle に戻る)。
     // recomputePhase は cc-* を「操作中」として抜けないので、先に phase を落としておく。
@@ -2022,6 +2056,7 @@ async function refreshClaudeData(): Promise<void> {
     // 片方だけ新しい中間状態で測ると、待機行の有無が実際とは違う判定になり、
     // pending の出現/消滅のたびに読んでいる位置が 1 行ずれる。
     claudeChatStatus = chatResponse.status
+    claudeDeliveryWarning = chatResponse.deliveryWarning ?? null
     claudePending = pending
     // chat: scrollback 中なら「末尾に増減したぶん」だけオフセットを補正して読み位置を保つ。
     //  - 追記 (新しい発言 / 待機行が出た)      → その行数ぶん繰り上げる
@@ -3183,6 +3218,7 @@ function openSelectedFromRoot(): void {
   chatLinesCache = []
   chatLinesCacheKey = ''
   claudeChatStatus = undefined
+  claudeDeliveryWarning = null
   claudeChatLoading = true
   currentAgentSource = sel.source
   // 前セッションの用件と作りかけの回答を捨てる (応答画面から直接来た場合も含む)
