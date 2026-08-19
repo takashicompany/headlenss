@@ -601,6 +601,8 @@ function syncRootCursor(): void {
  */
 function claudeStatusMark(s: ClaudeSessionInfo): string {
   // 全角「！」。⚠ はレンズのフォントに無く、行に置いても空白にしか見えない。
+  // ヘッダや本文の警告は括弧付き「(！)」だが、ここは記号 1 枠ぶんしか幅が無いので
+  // 括弧は付けない (付けると 3 枠になり、名前やプレビューを押し出す)。
   if (s.screenBlocked === true) return '！'
   switch (s.status) {
     case 'waiting-permission': return '⏸'
@@ -1441,9 +1443,38 @@ function buildG2Footer(): string {
 }
 
 // 画面ブロック警告の点滅位相。true = 警告を出すコマ、false = セッション名だけのコマ。
-// 専用タイマーは持たず、1.5 秒ポーリング由来の再描画 (refreshClaudeData) のたびに
-// 反転させることで約 1.5 秒周期の点滅にする。
+//
+// 周期タイマーは持たない。1.5 秒ポーリング由来の再描画では必ず「表示」に戻し、
+// その 750ms 後に one-shot タイマーで「非表示」へ落として 1 回だけ描き直す。
+// これで表示 0.75 秒 ⇔ 非表示 0.75 秒になる (ポーリング間隔の半分)。
 let blockedBlinkOn = true
+/** 非表示フェーズへ落とす one-shot タイマー。同時に 1 本だけ。 */
+let blockedBlinkOffTimer: ReturnType<typeof setTimeout> | null = null
+const BLOCKED_BLINK_OFF_MS = 750
+
+/** 点滅の one-shot タイマーを捨てる。位相は「表示」に戻す (中途半端な消灯で固まらせない)。 */
+function clearBlockedBlink(): void {
+  if (blockedBlinkOffTimer) clearTimeout(blockedBlinkOffTimer)
+  blockedBlinkOffTimer = null
+  blockedBlinkOn = true
+}
+
+/**
+ * 表示フェーズを描いた直後に呼ぶ。750ms 後に非表示フェーズへ落として 1 枚だけ描き直す。
+ * 発火時点で前提 (ブロック中 / idle を見ている / レンズが headlenss のもの) が
+ * 崩れていたら何もしない。張り直しは常に前の 1 本を捨ててから行う。
+ */
+function scheduleBlockedBlinkOff(): void {
+  if (blockedBlinkOffTimer) clearTimeout(blockedBlinkOffTimer)
+  blockedBlinkOffTimer = setTimeout(() => {
+    blockedBlinkOffTimer = null
+    // プラグイン遷移中はレンズが headlenss の画面ではない。ここで描くと被る。
+    if (pluginNavBlocksG2Render) return
+    if (phase !== 'idle' || !currentSessionBlocked()) return
+    blockedBlinkOn = false
+    void refreshG2(true)
+  }, BLOCKED_BLINK_OFF_MS)
+}
 
 /** 今開いているセッションが画面ブロック中か (一覧の最新の取得結果から見る) */
 function currentSessionBlocked(): boolean {
@@ -1493,7 +1524,7 @@ function buildG2Header(): string {
       // 画面が塞がっているなら、スクロールしても消えないヘッダで知らせる
       // (フッタは操作の案内なので変えない)
       if (currentSessionBlocked()) {
-        // 並びは「セッション名　！ 警告」。警告は必ず出したいので、ヘッダの実描画幅に
+        // 並びは「セッション名　(！) 警告」。警告は必ず出したいので、ヘッダの実描画幅に
         // 収まらないぶんはセッション名側を切り詰める。文字数ではなく px で測るのは、
         // レンズが裁ち落とすのが px 幅だから (全角名だと文字数では収まって見えても
         // 警告が画面外へ押し出される)。
@@ -2110,12 +2141,16 @@ async function refreshClaudeData(): Promise<void> {
       // ポーリング由来の再描画は「表示が変わる時だけ」。変わらないのに 1.5 秒ごとに
       // 全面送信 (3 フレーム) を掛け続けると、レンズ側の消化が追いつかない環境では
       // それだけで滞留が育つ (g2FrameWouldChange 参照)。
-      // 画面ブロック中の警告は、この再描画に便乗して表示/非表示を入れ替える (点滅)。
+      // 画面ブロック中の警告は点滅させる。ポーリング由来のこの描画は必ず「表示」に
+      // 戻し、下で張る one-shot タイマーが 750ms 後に「非表示」を 1 枚描く。
       // 副作用として、ブロック中はヘッダが毎回変わる = g2FrameWouldChange が常に
-      // 「変化あり」になり、1.5 秒ごとに full render が送られる。ブロック中の
-      // セッションを開いている間だけの話なので許容する。
-      // ブロックが解けたら位相を「表示」に戻し、次にブロックされたとき必ず警告から始める。
-      blockedBlinkOn = currentSessionBlocked() ? !blockedBlinkOn : true
+      // 「変化あり」になり、1.5 秒ごとの full render + その 0.75 秒後に 1 枚が出る。
+      // ブロック中のセッションを開いている間だけの話なので許容する。
+      // ブロックが解けていれば位相を「表示」に戻し、待機中のタイマーも捨てる
+      // (次にブロックされたとき必ず警告から始める)。
+      const blinkBlocked = currentSessionBlocked()
+      if (blinkBlocked) blockedBlinkOn = true
+      else clearBlockedBlink()
       // ただし送信が途絶えて久しい場合は、取りこぼし対策として dedup を捨てて 1 回通す。
       if (isForcedResyncDue()) {
         console.log('[refreshG2] forced resync: no send for a while')
@@ -2127,6 +2162,8 @@ async function refreshClaudeData(): Promise<void> {
         const frame = buildG2Frame()
         if (g2FrameWouldChange(frame)) void refreshG2(true, frame)
       }
+      // 表示フェーズを描いた後に消灯を予約する (ブロック中を見ている間だけ)
+      if (blinkBlocked && phase === 'idle') scheduleBlockedBlinkOff()
       // chat を実際に取得して描画している = ユーザは見ている前提なので既読化
       markAsRead(targetSession)
     }
@@ -2279,6 +2316,8 @@ function stopAllBackgroundWork(): void {
   hideToastNow()
   // 実行中の取得も打ち切る (完了時に描画へ回るため)
   abortInFlightRefresh()
+  // 点滅の消灯タイマーも捨てる。残すとプラグインのページに headlenss のヘッダが 1 枚被る
+  clearBlockedBlink()
   // レンズ送信の待機枠も捨てる。残しておくと in-flight が捌けた瞬間に headlenss の
   // フレームがプラグインのページに 1 枚だけ被さる。
   g2RenderPending = false
@@ -3520,6 +3559,8 @@ function assertRespondFlowInvariant(where: string): void {
 function resetRespondStateForSessionChange(): void {
   claudePending = null
   resetRespondFlow('session-change')
+  // 前のセッション向けに張った消灯タイマーを持ち越さない
+  clearBlockedBlink()
 }
 
 /**

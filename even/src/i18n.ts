@@ -51,8 +51,8 @@ const STRINGS = {
   chatStatusWaitQ:     { en: '(awaiting question…)',            ja: '(質問待ち…)' },
   // 送ったのにエージェントが受理した証拠 (フック) が期限内に来なかった時の注意。
   // tmux の画面が塞がっていると、キーは撃てても会話には入らない。
-  chatDeliveryUnconfirmed: { en: '！ It looks like your message did not arrive. Check the tmux screen.',
-                             ja: '！ 届いていないようです。tmux の画面を確認してください。' },
+  chatDeliveryUnconfirmed: { en: '(！) It looks like your message did not arrive. Check the tmux screen.',
+                             ja: '(！) 届いていないようです。tmux の画面を確認してください。' },
   rootListEmpty:       { en: '(no agent session)\n\nStart agent or Codex inside tmux',
                          ja: '(エージェントが動いている tmux が無い)\n\ntmux 内でエージェントを起動してください' },
 
@@ -170,9 +170,10 @@ const STRINGS = {
   g2HeadCcResponse:   { en: 'Agent Prompt',                    ja: 'エージェント応答' },
   g2HeadError:        { en: 'Error',                            ja: 'エラー' },
   // 画面ブロック時のヘッダ。前にセッション名を足すので短く保つ (長いと名前が削られる)。
-  // マークは全角「！」。⚠ は G2 レンズのフォントに収録されておらず、幅の実測が
-  // 置換文字と同じ = 実体が無い (レンズでは空白に見える) ため使わない。
-  g2HeadBlocked:      { en: '！ Check terminal',                 ja: '！ ターミナルを確認' },
+  // マークは丸括弧で囲った全角「！」。⚠ は G2 レンズのフォントに収録されておらず、
+  // 幅の実測が置換文字と同じ = 実体が無い (レンズでは空白に見える) ため使わない。
+  // 括弧で囲むのは、文中の句読点ではなく「印」だと一目で分かるようにするため。
+  g2HeadBlocked:      { en: '(！) Check terminal',               ja: '(！) ターミナルを確認' },
 
   // ─── G2 lens ─────────────────────────────────────────────────
   g2Booting:        { en: 'Booting…',                           ja: '起動中…' },
