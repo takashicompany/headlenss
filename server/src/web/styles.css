@@ -240,6 +240,14 @@ button {
   font-weight: 500;
 }
 
+/* 画面ブロック (対話ウィザード等が tmux の画面を占有中)。
+   セッションが idle に見えていても送ったメッセージが届かないので、
+   hook 警告より強い色で出す。 */
+.screen-blocked-warning {
+  color: #f5a623;
+  font-weight: 600;
+}
+
 .session-kill {
   background: transparent;
   border: none;
@@ -576,6 +584,16 @@ button {
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
+}
+
+/* 画面ブロックの注意文はスクロールで流れて消えないよう上端に貼り付ける
+   (背景を不透明にしないとチャット本文が透けるので、パネル色で塗る)。 */
+.chat-diagnostic-blocked {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--panel);
+  border-color: #f5a623;
 }
 
 .chat-diagnostic-title {

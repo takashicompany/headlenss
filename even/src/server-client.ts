@@ -29,6 +29,12 @@ export type ClaudeSessionInfo = {
   source?: AgentSource
   /** rootlist プレビュー用: 最後のメッセージ冒頭 (サーバ側で 48 文字に丸め済み)。 */
   lastChat?: string
+  /**
+   * 対話ウィザード等が tmux の画面を占有していて、通常の入力欄が見えていない。
+   * status は idle/busy のままなので、送っても会話に届かないことはこれでしか分からない。
+   * サーバは true のときだけ付けてくる (false は送らない)。
+   */
+  screenBlocked?: boolean
   /** このセッションの作業フォルダ配下で動いている G2 プラグインの dev server。 */
   g2Plugins?: G2PluginInfo[]
 }

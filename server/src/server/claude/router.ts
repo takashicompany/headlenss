@@ -13,7 +13,7 @@ import { resolveTmuxSessionName } from './tmux-resolver.ts';
 import { captureOutput, sendKey, sendKeys } from '../tmux.ts';
 import { extractChatFromTranscript, extractLastAssistantText, sanitizeChatText } from './transcript.ts';
 import { extractCodexChatFromTranscript } from '../codex/transcript.ts';
-import { detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
+import { detectAgentPaneTexts, detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
 import { matchUiSubmission } from '../uiSubmissions.ts';
 import { detectG2Plugins, tmuxSessionPaths, type G2Plugin } from '../g2-plugins.ts';
 import {
@@ -23,6 +23,7 @@ import {
   pruneSessionStatusObservations,
   resolveTrackedSessionStatus,
 } from '../session-status.ts';
+import { resolveScreenBlocked } from '../screen-block.ts';
 import type { AskQuestion, ChatItem, HookDecision, Pending, RespondInput, SessionStatus } from './types.ts';
 
 const exec = promisify(execFile);
@@ -687,10 +688,12 @@ claudeRouter.get('/claude/sessions', async (c) => {
   const trackedAlive = liveTmux ? store.listSessions() : tracked;
 
   // 検出 + live owner (今その画面を握っている本人)。失敗は [] / null に倒して sticky。
-  const [detected, codexDetected, liveOwners] = await Promise.all([
+  const [detected, codexDetected, liveOwners, paneTexts] = await Promise.all([
     detectClaudeSessions().catch(() => []),
     detectCodexSessions().catch(() => []),
     detectLiveOwners().catch(() => null),
+    // 画面ブロック検知用の pane テキスト。codex 検出と同じ走査結果なので tmux 呼び出しは増えない。
+    detectAgentPaneTexts().catch(() => new Map<string, string>()),
   ]);
 
   const merged: Array<{
@@ -705,6 +708,9 @@ claudeRouter.get('/claude/sessions', async (c) => {
     codexHookHealth?: ReturnType<typeof getCodexHookHealth>;
     codexNeedsHookAttention?: boolean;
     lastChat?: string;
+    /** 対話ウィザード等が pane を占有していて、通常の入力欄が画面に見えていない。
+     *  status は据え置きなので、既存クライアントはこのフィールドを無視できる。 */
+    screenBlocked?: true;
     /** セッションの作業フォルダ配下で動いている G2 プラグインの dev server */
     g2Plugins?: G2Plugin[];
   }> = [];
@@ -765,6 +771,13 @@ claudeRouter.get('/claude/sessions', async (c) => {
     if (effSource === 'claude') {
       const sc = storeMatched ? st : undefined;
       const { status, statusChangedAt } = resolveTrackedSessionStatus({ ...signals, source: 'claude' });
+      // /api/sessions と同じ共有関数で判定するので、2 つの一覧で答えがズレない。
+      const screenBlocked = resolveScreenBlocked({
+        tmuxSessionName: name,
+        source: 'claude',
+        status,
+        paneText: paneTexts.get(name),
+      });
       merged.push({
         tmuxSessionName: name,
         cwd: sc?.cwd || cd?.cwd || '',
@@ -774,6 +787,7 @@ claudeRouter.get('/claude/sessions', async (c) => {
         lastSeenAt: sc?.lastSeenAt ?? cd?.startedAt ?? 0,
         source: 'claude',
         lastChat,
+        screenBlocked: screenBlocked ? true : undefined,
       });
     } else {
       const sx = storeMatched ? st : undefined;
@@ -826,10 +840,12 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   // (store cwd/ccSessionId preferred, detect as fallback).
   type DetResult = Awaited<ReturnType<typeof detectClaudeSessions>>[number] | undefined;
   type CodexDetResult = Awaited<ReturnType<typeof detectCodexSessions>>[number] | undefined;
-  const [detected, codexDetected, liveOwners] = await Promise.all([
+  const [detected, codexDetected, liveOwners, paneTexts] = await Promise.all([
     detectClaudeSessions().catch(() => []),
     detectCodexSessions().catch(() => []),
     detectLiveOwners().catch(() => null),
+    // 画面ブロック検知用の pane テキスト (走査結果の使い回し。tmux 呼び出しは増えない)。
+    detectAgentPaneTexts().catch(() => new Map<string, string>()),
   ]);
   // live owner (今その画面を握っている本人) を source の権威にする。
   const owner = liveOwners?.get(tmuxName);
@@ -987,9 +1003,17 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   const codexHookHealth = effSource === 'codex'
     ? (!storeIsStale && session?.cwd ? getCodexHookHealth(session.cwd) : codexDet?.hookHealth)
     : undefined;
+  // 画面ブロック: 一覧と同じ共有関数で判定する (チャット画面の注意文用)。
+  const screenBlocked = resolveScreenBlocked({
+    tmuxSessionName: tmuxName,
+    source: effSource,
+    status,
+    paneText: paneTexts.get(tmuxName),
+  });
   return c.json({
     chat: merged,
     status,
+    ...(screenBlocked ? { screenBlocked: true as const } : {}),
     // stale (別 agent の残骸) の pending は表示しない (store は書き換えない=表示抑止のみ)。
     pending: storeIsStale ? null : (session?.pending ?? null),
     source: effSource,

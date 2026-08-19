@@ -82,6 +82,9 @@ const STRINGS = {
   claudeStatusBusy:      { en: 'busy',                          ja: 'ビジー' },
   claudeStatusWaitPerm:  { en: 'awaiting permission',           ja: '承認待ち' },
   claudeStatusWaitQ:     { en: 'awaiting question',             ja: '質問待ち' },
+  // 対話ウィザード等が tmux の画面を占有していて、送ったメッセージが会話に届かない状態。
+  // status ではなく別フラグ (screenBlocked) から出す。
+  claudeStatusBlocked:   { en: 'screen blocked',                ja: '画面が塞がっています' },
   claudeKillConfirm:     { en: 'Kill session "{name}"?',        ja: 'セッション "{name}" を終了しますか?' },
   claudeKillConfirmBtn:  { en: 'Confirm?',                      ja: '確定?' },
   claudeKillingBtn:      { en: 'Killing…',                      ja: '停止中…' },
@@ -162,6 +165,8 @@ const STRINGS = {
   g2HeadSending:      { en: 'Sending',                          ja: '送信中' },
   g2HeadCcResponse:   { en: 'Agent Prompt',                    ja: 'エージェント応答' },
   g2HeadError:        { en: 'Error',                            ja: 'エラー' },
+  // 画面ブロック時のヘッダ。後ろにセッション名を足して 56 半角以内に切るので短く保つ。
+  g2HeadBlocked:      { en: '⚠ Screen blocked',                 ja: '⚠ 画面が塞がっています' },
 
   // ─── G2 lens ─────────────────────────────────────────────────
   g2Booting:        { en: 'Booting…',                           ja: '起動中…' },

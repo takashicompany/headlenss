@@ -170,6 +170,9 @@ export function ChatView({
   const [source, setSource] = useState<'claude' | 'codex' | undefined>(undefined);
   const [codexHookHealth, setCodexHookHealth] = useState<CodexHookHealth | null>(null);
   const [codexNeedsHookAttention, setCodexNeedsHookAttention] = useState(false);
+  // 対話ウィザード等が tmux の画面を占有していて、ここから送っても会話に届かない状態。
+  // status は idle/busy のまま正しいので、これだけが「送っても届かない」の根拠になる。
+  const [screenBlocked, setScreenBlocked] = useState(false);
   // 質問への回答種別 (predefined / type-something / chat-about-this)
   const [qKind, setQKind] = useState<Record<number, 'predefined' | 'type-something' | 'chat-about-this'>>({});
   // predefined 用: 選んだ option の label (単一選択)
@@ -289,7 +292,10 @@ export function ChatView({
         if (!res.ok) {
           // 404 = まだ chat 履歴なし。エラー表示はしない。
           if (res.status !== 404) throw new Error(`HTTP ${res.status}`);
-          if (!disposed) setServerChat([]);
+          if (!disposed) {
+            setServerChat([]);
+            setScreenBlocked(false);
+          }
         } else {
           const json = (await res.json()) as {
             chat: ChatMessage[];
@@ -298,6 +304,7 @@ export function ChatView({
             source?: 'claude' | 'codex';
             codexHookHealth?: CodexHookHealth | null;
             codexNeedsHookAttention?: boolean;
+            screenBlocked?: true;
           };
           if (!disposed) {
             // 合成メッセージ (status 表示用に server 側で動的注入したもの) は
@@ -308,6 +315,7 @@ export function ChatView({
             setSource(json.source);
             setCodexHookHealth(json.codexHookHealth ?? null);
             setCodexNeedsHookAttention(json.codexNeedsHookAttention === true);
+            setScreenBlocked(json.screenBlocked === true);
             // pending が変わった(or null になった)ら入力中の選択肢/メモを破棄して
             // 別の質問に持ち越さないようにする
             setPendingInter((prev) => {
@@ -653,6 +661,13 @@ export function ChatView({
         className="chat-scroller"
         style={scrollerPaddingBottom ? { paddingBottom: scrollerPaddingBottom } : undefined}
       >
+        {screenBlocked && (
+          <div className="chat-diagnostic chat-diagnostic-blocked">
+            <div className="chat-diagnostic-title">⚠ {t('screenBlockedTitle')}</div>
+            <div className="chat-diagnostic-body">{t('screenBlockedBody')}</div>
+          </div>
+        )}
+
         {source === 'codex' && codexHookHealth && (codexHookHealth.status !== 'ok' || codexNeedsHookAttention) && (
           <div className="chat-diagnostic">
             <div className="chat-diagnostic-title">

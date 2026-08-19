@@ -14,7 +14,7 @@ import { cleanupAllHeadlessEntries, handlePtyConnection } from './pty.ts';
 import { getBackendName, isAsrReady, transcribePcm16, transcribeWav } from './asr/index.ts';
 import { claudeRouter } from './claude/router.ts';
 import { codexRouter } from './codex/router.ts';
-import { detectCodexSessions, getCodexHookHealth, invalidateCodexDetectCache } from './codex/status.ts';
+import { detectAgentPaneTexts, detectCodexSessions, getCodexHookHealth, invalidateCodexDetectCache } from './codex/status.ts';
 import { detectClaudeSessions, invalidateClaudeDetectCache } from './claude/process-detect.ts';
 import { detectLiveOwners, invalidateLiveOwnerCache } from './claude/live-owner.ts';
 import * as claudeStore from './claude/store.ts';
@@ -27,6 +27,7 @@ import {
   pruneSessionStatusObservations,
   resolveTrackedSessionStatus,
 } from './session-status.ts';
+import { pruneScreenBlockObservations, resolveScreenBlocked } from './screen-block.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -174,18 +175,21 @@ function buildLastChat(tmuxName: string): { role: 'user' | 'assistant'; text: st
 }
 
 app.get('/api/sessions', async (c) => {
-  const [sessions, detected, codexDetected, liveOwners] = await Promise.all([
+  const [sessions, detected, codexDetected, liveOwners, paneTexts] = await Promise.all([
     listSessions(),
     detectClaudeSessions().catch(() => []),
     detectCodexSessions().catch(() => []),
     // live owner (今その画面を握っている本人)。失敗時は null → sticky フォールバック。
     detectLiveOwners().catch(() => null),
+    // 画面ブロック検知用の pane テキスト。codex 検出と同じ走査結果なので tmux 呼び出しは増えない。
+    detectAgentPaneTexts().catch(() => new Map<string, string>()),
   ]);
   // codex の hookHealth / needsHookAttention 用 (status と source の判定は共有関数側)。
   const codexMap = new Map(codexDetected.map((d) => [d.tmuxSessionName, d]));
   const liveNames = new Set(sessions.map((s) => s.name));
   // 死んだ / 改名された tmux セッションの status 変化時刻は捨てる。
   pruneSessionStatusObservations(liveNames);
+  pruneScreenBlockObservations(liveNames);
   const enriched = sessions.map((s) => {
     const tracked = claudeStore.getSession(s.name);
     // agent (実効ソース) も status も /api/claude/sessions と同じ共有関数で決める。
@@ -208,6 +212,14 @@ app.get('/api/sessions', async (c) => {
     if (!agent) deleteSessionStatusObservation(s.name);
     const resolved = agent ? resolveTrackedSessionStatus({ ...signals, source: agent }) : undefined;
     const status = resolved?.status;
+    // 画面ブロック (対話ウィザード等が pane を占有していて通常の入力欄が見えない)。
+    // status は据え置きで、別フィールドとして足すだけ (既存クライアントは無視できる)。
+    const screenBlocked = resolveScreenBlocked({
+      tmuxSessionName: s.name,
+      source: agent,
+      status,
+      paneText: paneTexts.get(s.name),
+    });
     return {
       ...s,
       claudeStatus: agent === 'claude' ? status : undefined,
@@ -218,6 +230,7 @@ app.get('/api/sessions', async (c) => {
       codexHookHealth: codexMap.get(s.name)?.hookHealth ?? (agent === 'codex' ? getCodexHookHealth(tracked?.cwd) : getCodexHookHealth()),
       codexNeedsHookAttention: (agent === 'codex' && codexMap.get(s.name)?.needsHookAttention) ?? false,
       lastChat: storeMatches ? buildLastChat(s.name) : undefined,
+      screenBlocked: screenBlocked ? (true as const) : undefined,
     };
   });
   for (const retained of listRetainedSessions(liveNames)) {
@@ -230,6 +243,8 @@ app.get('/api/sessions', async (c) => {
       codexHookHealth: retained.agent === 'codex' ? getCodexHookHealth() : getCodexHookHealth(),
       codexNeedsHookAttention: false,
       lastChat: undefined,
+      // 解放済み (tmux が無い) セッションは画面そのものが無いので常に付けない。
+      screenBlocked: undefined,
     });
   }
   return c.json({ sessions: enriched });

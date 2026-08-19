@@ -58,6 +58,12 @@ const STRINGS = {
   codexHooksNeedTrustBody:{ en: 'Restart Codex and run /hooks to review and trust the HeadLenss hooks.', ja: 'Codex を再起動し、/hooks で HeadLenss hook を確認して trust してください。' },
   codexHooksMissingEvents:{ en: 'Missing events', ja: '不足イベント' },
 
+  // ── 画面ブロック (対話ウィザード等が tmux の画面を占有している) ──
+  screenBlocked:          { en: 'screen blocked', ja: '画面が塞がっています' },
+  screenBlockedTitle:     { en: 'The tmux screen is blocked', ja: 'tmux の画面が塞がっています' },
+  screenBlockedBody:      { en: 'A dialog or wizard is taking over the agent\u2019s tmux screen, so messages sent from here will not reach the conversation. Check the tmux screen directly and finish what is on it.',
+                            ja: 'エージェントの tmux 画面をウィザードやダイアログが占有しています。ここから送ったメッセージは会話に届きません。tmux の画面を直接確認して、表示されている操作を終わらせてください。' },
+
   // ── ChatView: question / pending ──
   confirmCancelTitle:     { en: 'Confirm question cancellation', ja: '質問のキャンセル確認' },
   confirmAnswersTitle:    { en: 'Review your answers', ja: '回答内容の確認' },

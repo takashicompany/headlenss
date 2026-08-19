@@ -547,7 +547,7 @@ function rootRowKey(row: RootRow): string {
 function rootRowSignature(): string {
   return rootRows()
     .map((r) => (r.kind === 'session'
-      ? `${rootRowKey(r)}|${r.session.status}|${r.session.source ?? ''}|${r.session.lastChat ?? ''}|${isUnread(r.session)}`
+      ? `${rootRowKey(r)}|${r.session.status}|${r.session.screenBlocked === true}|${r.session.source ?? ''}|${r.session.lastChat ?? ''}|${isUnread(r.session)}`
       : `${rootRowKey(r)}|${r.plugin.name}`))
     .join('\n')
 }
@@ -586,8 +586,16 @@ function syncRootCursor(): void {
   rootCursorKey = name ? `s:${name}` : null
 }
 
-/** Claude Code セッションの待機状態を1文字記号にする */
+/**
+ * Claude Code セッションの待機状態を1文字記号にする。
+ *
+ * 画面ブロック (対話ウィザード等が tmux の画面を占有中) は status より優先して出す。
+ * status は idle/busy のまま正しいが、その画面には送っても届かないので、
+ * 「考え中」を知らせるより「今は送れない」を知らせる方が先だという判断。
+ * (レンズの 1 行は狭く、記号は 1 枠しか置けない)
+ */
 function claudeStatusMark(s: ClaudeSessionInfo): string {
+  if (s.screenBlocked === true) return '⚠'
   switch (s.status) {
     case 'waiting-permission': return '⏸'
     case 'waiting-question': return '?'
@@ -1397,6 +1405,13 @@ function buildG2Footer(): string {
   }
 }
 
+/** 今開いているセッションが画面ブロック中か (一覧の最新の取得結果から見る) */
+function currentSessionBlocked(): boolean {
+  const name = settings.sessionName
+  if (!name) return false
+  return claudeSessions.some((s) => s.tmuxSessionName === name && s.screenBlocked === true)
+}
+
 /** G2 レンズ最上段に表示する「現在の画面/フェーズ」のタイトル文字列 */
 function buildG2Header(): string {
   switch (phase) {
@@ -1434,6 +1449,11 @@ function buildG2Header(): string {
         const isQ = claudePending.kind === 'question'
         const head = `${isQ ? '?' : '⏸'} ${isQ ? t('claudeStatusWaitQ') : t('claudeStatusWaitPerm')}`
         return `${head}　${settings.sessionName || ''}`.slice(0, 56)
+      }
+      // 画面が塞がっているなら、スクロールしても消えないヘッダで知らせる
+      // (フッタは操作の案内なので変えない)
+      if (currentSessionBlocked()) {
+        return `${t('g2HeadBlocked')}　${settings.sessionName || ''}`.slice(0, 56)
       }
       return settings.sessionName || t('appName')
     }
@@ -3686,10 +3706,14 @@ function renderClaudeSessionsList(): void {
       killLabel = escapeHtml(t('claudeKillConfirmBtn'))
     }
     const agent = s.source === 'codex' ? 'Codex' : s.source === 'claude' ? 'Claude' : 'Agent'
+    // 画面ブロック中は名前の横に警告を出す (status の dot はそのまま。status は正しいので変えない)
+    const blockedMark = s.screenBlocked === true
+      ? ` <span class="claude-blocked" title="${escapeAttr(t('claudeStatusBlocked'))}">⚠</span>`
+      : ''
     li.innerHTML =
       `<span class="claude-status" data-status="${escapeAttr(status)}" title="${escapeAttr(claudeStatusLabel(status))}">●</span>` +
       `<div class="claude-info">` +
-        `<div class="claude-name">${escapeHtml(s.tmuxSessionName)} <span class="agent-label">${agent}</span></div>` +
+        `<div class="claude-name">${escapeHtml(s.tmuxSessionName)} <span class="agent-label">${agent}</span>${blockedMark}</div>` +
         `<div class="claude-cwd">${escapeHtml(s.cwd || '~')}</div>` +
       `</div>` +
       `<button class="${killClass}" data-action="kill" aria-label="kill ${escapeAttr(s.tmuxSessionName)}"${killDisabled}>${killLabel}</button>`
