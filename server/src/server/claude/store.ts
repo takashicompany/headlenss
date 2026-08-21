@@ -135,6 +135,13 @@ export function getPending(tmuxName: string): Pending | undefined {
   return sessions.get(tmuxName)?.pending;
 }
 
+/** テスト用: pending の作成時刻を巻き戻す (時間経過を待たずに再現するため)。 */
+export function backdatePendingForTest(tmuxName: string, ageMs: number): void {
+  const p = sessions.get(tmuxName)?.pending;
+  if (!p) return;
+  p.createdAt = Date.now() - ageMs;
+}
+
 export function clearPending(tmuxName: string): void {
   const s = sessions.get(tmuxName);
   if (!s) return;
