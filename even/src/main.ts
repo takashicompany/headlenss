@@ -1442,38 +1442,42 @@ function buildG2Footer(): string {
   }
 }
 
-// 画面ブロック警告の点滅位相。true = 警告を出すコマ、false = セッション名だけのコマ。
+// idle ヘッダ末尾に出す状態表示 (画面ブロック警告 / 回答待ち) の点滅位相。
+// true = 状態を出すコマ、false = セッション名だけのコマ。
 //
 // 周期タイマーは持たない。1.5 秒ポーリング由来の再描画では必ず「表示」に戻し、
 // その 750ms 後に one-shot タイマーで「非表示」へ落として 1 回だけ描き直す。
 // これで表示 0.75 秒 ⇔ 非表示 0.75 秒になる (ポーリング間隔の半分)。
-let blockedBlinkOn = true
+//
+// 点滅させる対象が何であれ位相は 1 系統しか持たない。ブロックと回答待ちが同時に
+// 成立しても出すのは片方だけ (headBlinkBadge) なので、位相が競合することはない。
+let headBlinkOn = true
 /** 非表示フェーズへ落とす one-shot タイマー。同時に 1 本だけ。 */
-let blockedBlinkOffTimer: ReturnType<typeof setTimeout> | null = null
-const BLOCKED_BLINK_OFF_MS = 750
+let headBlinkOffTimer: ReturnType<typeof setTimeout> | null = null
+const HEAD_BLINK_OFF_MS = 750
 
 /** 点滅の one-shot タイマーを捨てる。位相は「表示」に戻す (中途半端な消灯で固まらせない)。 */
-function clearBlockedBlink(): void {
-  if (blockedBlinkOffTimer) clearTimeout(blockedBlinkOffTimer)
-  blockedBlinkOffTimer = null
-  blockedBlinkOn = true
+function clearHeadBlink(): void {
+  if (headBlinkOffTimer) clearTimeout(headBlinkOffTimer)
+  headBlinkOffTimer = null
+  headBlinkOn = true
 }
 
 /**
  * 表示フェーズを描いた直後に呼ぶ。750ms 後に非表示フェーズへ落として 1 枚だけ描き直す。
- * 発火時点で前提 (ブロック中 / idle を見ている / レンズが headlenss のもの) が
+ * 発火時点で前提 (点滅対象がある / idle を見ている / レンズが headlenss のもの) が
  * 崩れていたら何もしない。張り直しは常に前の 1 本を捨ててから行う。
  */
-function scheduleBlockedBlinkOff(): void {
-  if (blockedBlinkOffTimer) clearTimeout(blockedBlinkOffTimer)
-  blockedBlinkOffTimer = setTimeout(() => {
-    blockedBlinkOffTimer = null
+function scheduleHeadBlinkOff(): void {
+  if (headBlinkOffTimer) clearTimeout(headBlinkOffTimer)
+  headBlinkOffTimer = setTimeout(() => {
+    headBlinkOffTimer = null
     // プラグイン遷移中はレンズが headlenss の画面ではない。ここで描くと被る。
     if (pluginNavBlocksG2Render) return
-    if (phase !== 'idle' || !currentSessionBlocked()) return
-    blockedBlinkOn = false
+    if (phase !== 'idle' || headBlinkBadge() === null) return
+    headBlinkOn = false
     void refreshG2(true)
-  }, BLOCKED_BLINK_OFF_MS)
+  }, HEAD_BLINK_OFF_MS)
 }
 
 /** 今開いているセッションが画面ブロック中か (一覧の最新の取得結果から見る) */
@@ -1481,6 +1485,21 @@ function currentSessionBlocked(): boolean {
   const name = settings.sessionName
   if (!name) return false
   return claudeSessions.some((s) => s.tmuxSessionName === name && s.screenBlocked === true)
+}
+
+/**
+ * idle ヘッダでセッション名の後ろに出し、点滅させる状態表示。null = 点滅させるものが無い。
+ *
+ * 画面ブロックと回答待ちは同時に成立しうるが、出すのは常に片方だけにする。
+ * 2 つ並べると 56 文字にセッション名が残らないうえ、先に手を打つべきなのは
+ * 「送っても届かない」ブロックの方なので、ブロックを優先する。
+ */
+function headBlinkBadge(): string | null {
+  if (currentSessionBlocked()) return t('g2HeadBlocked')
+  if (claudePending) {
+    return claudePending.kind === 'question' ? t('g2HeadWaitQ') : t('g2HeadWaitPerm')
+  }
+  return null
 }
 
 /** G2 レンズ最上段に表示する「現在の画面/フェーズ」のタイトル文字列 */
@@ -1515,27 +1534,21 @@ function buildG2Header(): string {
     }
     case 'error':        return t('g2HeadError')
     case 'idle': {
-      // 回答待ちがあるなら、スクロールしても消えないヘッダで知らせる
-      if (claudePending) {
-        const isQ = claudePending.kind === 'question'
-        const head = `${isQ ? '?' : '⏸'} ${isQ ? t('claudeStatusWaitQ') : t('claudeStatusWaitPerm')}`
-        return `${head}　${settings.sessionName || ''}`.slice(0, 56)
-      }
-      // 画面が塞がっているなら、スクロールしても消えないヘッダで知らせる
+      // 画面が塞がっている / 回答待ちがあるなら、スクロールしても消えないヘッダで知らせる
       // (フッタは操作の案内なので変えない)
-      if (currentSessionBlocked()) {
-        // 並びは「セッション名　(！) 警告」。警告は必ず出したいので、ヘッダの実描画幅に
+      const badge = headBlinkBadge()
+      if (badge) {
+        // 並びは「セッション名　(印) 状態」。状態は必ず出したいので、ヘッダの実描画幅に
         // 収まらないぶんはセッション名側を切り詰める。文字数ではなく px で測るのは、
         // レンズが裁ち落とすのが px 幅だから (全角名だと文字数では収まって見えても
-        // 警告が画面外へ押し出される)。
+        // 状態が画面外へ押し出される)。
         // 切り詰めは点滅の両フェーズに同じだけ掛ける。非表示コマだけ名前が伸びると
         // 名前そのものがちらついて読みにくいため。
-        const warn = t('g2HeadBlocked')
         const sep = '　'
-        const avail = HEADER_INNER_WIDTH - getTextWidth(sep + warn)
+        const avail = HEADER_INNER_WIDTH - getTextWidth(sep + badge)
         const name = truncateToPx(settings.sessionName || '', avail).s
         // 56 は他のヘッダと揃えた最後の歯止め (px で切った後は通常ここに掛からない)
-        return (blockedBlinkOn ? `${name}${sep}${warn}` : name).slice(0, 56)
+        return (headBlinkOn ? `${name}${sep}${badge}` : name).slice(0, 56)
       }
       return settings.sessionName || t('appName')
     }
@@ -1812,7 +1825,9 @@ async function executeFullRender(force: boolean, frame: G2Frame | null = null): 
     // header / content / footer を同期的に一括ビルド (同一 phase スナップショット)。
     // 呼び出し側が既に組んだスナップショットがあればそれを使う (二重ビルドの解消)。
     const { header, content, footer } = frame ?? buildG2Frame()
-    console.log(`[refreshG2] firing (phase=${phase}, force=${force})`)
+    // ヘッダも出す: 点滅 (headBlinkOn) のように「同じ phase で送信内容だけが変わる」
+    // 挙動は、この行の時系列でしか外から確かめられない。
+    console.log(`[refreshG2] firing (phase=${phase}, force=${force}) header=${JSON.stringify(header)}`)
     // dedup 基準は「送れたもの」だけを 1 つずつ記録する: scroll tick とポーリング由来の
     // 再描画がこの 3 つと突き合わせる。3 つまとめて先に立てると、途中の await が失敗した
     // 時に「送っていない内容を送信済み」と記録したフレームが残る (catch の一括取り消しは
@@ -2141,16 +2156,17 @@ async function refreshClaudeData(): Promise<void> {
       // ポーリング由来の再描画は「表示が変わる時だけ」。変わらないのに 1.5 秒ごとに
       // 全面送信 (3 フレーム) を掛け続けると、レンズ側の消化が追いつかない環境では
       // それだけで滞留が育つ (g2FrameWouldChange 参照)。
-      // 画面ブロック中の警告は点滅させる。ポーリング由来のこの描画は必ず「表示」に
-      // 戻し、下で張る one-shot タイマーが 750ms 後に「非表示」を 1 枚描く。
-      // 副作用として、ブロック中はヘッダが毎回変わる = g2FrameWouldChange が常に
+      // ヘッダ末尾の状態表示 (画面ブロック警告 / 回答待ち) は点滅させる。ポーリング由来の
+      // この描画は必ず「表示」に戻し、下で張る one-shot タイマーが 750ms 後に「非表示」を
+      // 1 枚描く。
+      // 副作用として、点滅中はヘッダが毎回変わる = g2FrameWouldChange が常に
       // 「変化あり」になり、1.5 秒ごとの full render + その 0.75 秒後に 1 枚が出る。
-      // ブロック中のセッションを開いている間だけの話なので許容する。
-      // ブロックが解けていれば位相を「表示」に戻し、待機中のタイマーも捨てる
-      // (次にブロックされたとき必ず警告から始める)。
-      const blinkBlocked = currentSessionBlocked()
-      if (blinkBlocked) blockedBlinkOn = true
-      else clearBlockedBlink()
+      // 該当のセッションを開いている間だけの話なので許容する。
+      // 対象が消えていれば位相を「表示」に戻し、待機中のタイマーも捨てる
+      // (次に点滅するとき必ず表示から始める)。
+      const blinking = headBlinkBadge() !== null
+      if (blinking) headBlinkOn = true
+      else clearHeadBlink()
       // ただし送信が途絶えて久しい場合は、取りこぼし対策として dedup を捨てて 1 回通す。
       if (isForcedResyncDue()) {
         console.log('[refreshG2] forced resync: no send for a while')
@@ -2162,8 +2178,8 @@ async function refreshClaudeData(): Promise<void> {
         const frame = buildG2Frame()
         if (g2FrameWouldChange(frame)) void refreshG2(true, frame)
       }
-      // 表示フェーズを描いた後に消灯を予約する (ブロック中を見ている間だけ)
-      if (blinkBlocked && phase === 'idle') scheduleBlockedBlinkOff()
+      // 表示フェーズを描いた後に消灯を予約する (点滅対象があるのを見ている間だけ)
+      if (blinking && phase === 'idle') scheduleHeadBlinkOff()
       // chat を実際に取得して描画している = ユーザは見ている前提なので既読化
       markAsRead(targetSession)
     }
@@ -2317,7 +2333,7 @@ function stopAllBackgroundWork(): void {
   // 実行中の取得も打ち切る (完了時に描画へ回るため)
   abortInFlightRefresh()
   // 点滅の消灯タイマーも捨てる。残すとプラグインのページに headlenss のヘッダが 1 枚被る
-  clearBlockedBlink()
+  clearHeadBlink()
   // レンズ送信の待機枠も捨てる。残しておくと in-flight が捌けた瞬間に headlenss の
   // フレームがプラグインのページに 1 枚だけ被さる。
   g2RenderPending = false
@@ -3560,7 +3576,7 @@ function resetRespondStateForSessionChange(): void {
   claudePending = null
   resetRespondFlow('session-change')
   // 前のセッション向けに張った消灯タイマーを持ち越さない
-  clearBlockedBlink()
+  clearHeadBlink()
 }
 
 /**
