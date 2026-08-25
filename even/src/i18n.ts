@@ -216,6 +216,14 @@ const STRINGS = {
   g2FootCcRespMulti:{ en: '↑↓:Pick　Tap:Toggle & Submit',          ja: '↑↓:選択　タップ:切替　Submitで確定' },
   g2FootCcRespRec:  { en: 'Tap:Done　2Tap:Cancel',                  ja: 'タップ:録音終了　2タップ:取消' },
   g2NoOutput:       { en: '(no output yet)',                    ja: '(まだ出力なし)' },
+
+  // ─── G2 一時通知 (フッタに数秒だけ出す。56半角以内) ──────────────
+  // 録音が始まらなかった理由。レンズだけを見ていても切り分けられるよう、
+  // 「音声認識サービス側」「グラスのマイク側」「それ以外」を必ず書き分ける。
+  g2NoticeRecFailAuth: { en: 'Rec start failed (auth/quota {code})', ja: '録音開始に失敗 (認証/枠 {code})' },
+  g2NoticeRecFailAsr:  { en: 'Rec start failed (ASR)',               ja: '録音開始に失敗 (音声認識)' },
+  g2NoticeRecFailMic:  { en: 'Rec start failed (mic)',               ja: '録音開始に失敗 (マイク)' },
+  g2NoticeRecFail:     { en: 'Rec start failed',                     ja: '録音開始に失敗' },
 } as const
 
 export type StringKey = keyof typeof STRINGS

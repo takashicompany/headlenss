@@ -297,6 +297,9 @@ export async function updateHeader(header: string): Promise<void> {
 export async function updateFooter(footer: string): Promise<void> {
   if (!bridge) return
   drawSeq++ // 差分描画もガード再描画のスキップ判定に数える (数えないと復帰後に古いフレームで上書きされる)
+  // header/content と同じ書式で出す。3 コンテナの送信本数を同じ物差しで数えられるようにする
+  // (どのコンテナが実際に BLE へ流れたかは、この 3 行の時系列でしか外から確かめられない)。
+  console.log(`[renderer] textContainerUpgrade #3 (footer: "${footer.slice(0, 40)}")`)
   await withBridgeTimeout(
     'textContainerUpgrade #3',
     bridge.textContainerUpgrade(

@@ -1396,7 +1396,45 @@ function currentRespondRowIsTypeSomething(): boolean {
   return flowCursor() === optsCount + submitOffset
 }
 
+// ─── レンズ上の一時通知 ────────────────────────────────────────────────
+// フッタに数秒だけ差し込む 1 行。音声入力の失敗のように「操作した本人からは
+// 何も起きていないように見える」失敗を、グラスを掛けたまま切り分けられるようにする。
+// スマホ側のログや devMode に出しても、レンズだけ見ている人には届かない。
+//
+// 約束:
+//   - 出るのはフッタ 1 行だけ (本文の窓は潰さない)。全 phase で操作案内より優先する。
+//   - 消えるのは「G2_NOTICE_MS 経過」か「次のジェスチャー操作」の早い方。
+const G2_NOTICE_MS = 8000
+let g2Notice: string | null = null
+let g2NoticeTimer: ReturnType<typeof setTimeout> | null = null
+
+/** レンズに一時通知を出す (先客は置き換える)。56 = ヘッダ/フッタ共通の最後の歯止め。 */
+function showG2Notice(text: string): void {
+  if (g2NoticeTimer) clearTimeout(g2NoticeTimer)
+  g2Notice = text.slice(0, 56)
+  g2NoticeTimer = setTimeout(() => {
+    g2NoticeTimer = null
+    g2Notice = null
+    void refreshG2(true)
+  }, G2_NOTICE_MS)
+}
+
+/**
+ * 一時通知を消す。表示中だった場合だけ描き直しを要求する
+ * (要求しないと、何も描かない操作の後にフッタが通知のまま固まる)。
+ * redraw=false は「もうレンズに headlenss の画面を出さない」経路専用。
+ */
+function clearG2Notice(redraw = true): void {
+  if (g2NoticeTimer) clearTimeout(g2NoticeTimer)
+  g2NoticeTimer = null
+  if (g2Notice === null) return
+  g2Notice = null
+  if (redraw) void refreshG2(true)
+}
+
 function buildG2Footer(): string {
+  // 一時通知は操作案内より優先する。数秒か次の操作で自動的に消える。
+  if (g2Notice !== null) return g2Notice
   switch (phase) {
     case 'rootlist': {
       // 分母はカーソルが動ける行数 (プラグイン行を含む)。セッション数だと
@@ -1832,13 +1870,33 @@ async function executeFullRender(force: boolean, frame: G2Frame | null = null): 
     // 再描画がこの 3 つと突き合わせる。3 つまとめて先に立てると、途中の await が失敗した
     // 時に「送っていない内容を送信済み」と記録したフレームが残る (catch の一括取り消しは
     // 逆に、送れていた分まで捨てて無駄な再送を生む)。
-    await updateHeader(header)
-    g2HeaderLastSent = header
-    await updateContent(content)
-    g2ContentLastSent = content
-    await updateFooter(footer)
-    g2FooterLastSent = footer
-    g2LastSentAt = performance.now()  // 強制再同期の起点 (full render が通った時だけ更新する)
+    //
+    // 送るのは前回から変わったコンテナだけ。full render は「3 コンテナぶんの最新状態を
+    // レンズに反映しろ」という要求であって「3 本必ず流せ」ではない。点滅のように header
+    // だけが変わる更新で content/footer まで送り直すと、無変更の再送が BLE を占有して
+    // スクロール・カーソル移動・マイク取得まで巻き添えで遅くなる (点滅中は毎秒 4 本の
+    // うち 2/3 が無変更の再送だった)。3 つとも同じなら full render 自体が 0 本になる。
+    // 強制再同期 (invalidateG2Dedup) は 3 つの基準を null に落とすので従来どおり全送になる。
+    let sentAny = false
+    if (header !== g2HeaderLastSent) {
+      await updateHeader(header)
+      g2HeaderLastSent = header
+      sentAny = true
+    }
+    if (content !== g2ContentLastSent) {
+      await updateContent(content)
+      g2ContentLastSent = content
+      sentAny = true
+    }
+    if (footer !== g2FooterLastSent) {
+      await updateFooter(footer)
+      g2FooterLastSent = footer
+      sentAny = true
+    }
+    // 強制再同期の起点は「実際に 1 本でも送れた時」だけ進める。全スキップ = レンズは
+    // 既に最新のはず、という前提そのものを疑うのが強制再同期なので、ここで進めると
+    // ホスト側の取りこぼしを直す機会が永久に来なくなる。
+    if (sentAny) g2LastSentAt = performance.now()
   } catch (err) {
     // ここで dedup 基準を一括で捨てる必要は無い: 失敗した時点より後の 3 つは
     // 更新していないので、次の要求で自然に送り直される。
@@ -2334,6 +2392,8 @@ function stopAllBackgroundWork(): void {
   abortInFlightRefresh()
   // 点滅の消灯タイマーも捨てる。残すとプラグインのページに headlenss のヘッダが 1 枚被る
   clearHeadBlink()
+  // 一時通知の自動消灯も同じ理由で捨てる (ここで描き直させない)
+  clearG2Notice(false)
   // レンズ送信の待機枠も捨てる。残しておくと in-flight が捌けた瞬間に headlenss の
   // フレームがプラグインのページに 1 枚だけ被さる。
   g2RenderPending = false
@@ -2712,6 +2772,17 @@ function updateRecordButton(): void {
   recordBtn.classList.remove('recording')
 }
 
+/**
+ * Speechmatics への接続に失敗した理由を、レンズ 1 行ぶんの文言にする。
+ * HTTP ステータスが取れる失敗 (JWT 発行) は番号まで出す。401/403 なら鍵、429 なら
+ * 枠の使い切りと、レンズだけ見ていても次の一手が決まるため。
+ */
+function asrFailureNotice(message: string): string {
+  const m = /HTTP (\d{3})/.exec(message)
+  if (m) return t('g2NoticeRecFailAuth').replace('{code}', m[1])
+  return t('g2NoticeRecFailAsr')
+}
+
 async function startRecording(): Promise<void> {
   if (!bridge) {
     log('cannot record: G2 bridge not available')
@@ -2719,6 +2790,9 @@ async function startRecording(): Promise<void> {
   }
   if (!settings.speechmaticsApiKey || !settings.serverBaseUrl || !settings.sessionName) {
     log('startRecording blocked: not configured')
+    // タップしたのに何も起きない状態にしない。理由の切り分けはスマホ側で行う。
+    showG2Notice(t('g2NoticeRecFail'))
+    void refreshG2(true)
     return
   }
 
@@ -2747,8 +2821,14 @@ async function startRecording(): Promise<void> {
   const session = new SpeechmaticsRT()
   rtSession = session
 
-  const revertToIdle = () => {
+  /**
+   * 録音開始に失敗したので録音前の画面へ戻す。
+   * notice を渡すとレンズのフッタに失敗理由を数秒出す。戻り先が cc-response でも
+   * フローごと畳む場合でも同じように出したいので、分岐より先に出しておく。
+   */
+  const revertToIdle = (notice: string | null = null) => {
     if (rtSession !== session || phase !== 'recording') return
+    if (notice) showG2Notice(notice)
     stopRecordingTimer()
     try { session.abort() } catch { /* ignore */ }
     rtSession = null
@@ -2788,8 +2868,9 @@ async function startRecording(): Promise<void> {
       })
       log('Speechmatics RT connected')
     } catch (err) {
-      log(`RT connect failed: ${(err as Error).message}`)
-      revertToIdle()
+      const msg = (err as Error).message
+      log(`RT connect failed: ${msg}`)
+      revertToIdle(asrFailureNotice(msg))
       return
     }
 
@@ -2804,7 +2885,7 @@ async function startRecording(): Promise<void> {
       const ok = await localBridge.audioControl(true)
       if (ok === false) {
         log('audioControl(true) returned false')
-        revertToIdle()
+        revertToIdle(t('g2NoticeRecFailMic'))
         return
       }
       // 接続&マイク起動完了 → レンズ表示を「録音中」に切り替え
@@ -2814,7 +2895,7 @@ async function startRecording(): Promise<void> {
       }
     } catch (err) {
       log(`audioControl error: ${err}`)
-      revertToIdle()
+      revertToIdle(t('g2NoticeRecFailMic'))
     }
   })()
 }
@@ -4139,6 +4220,7 @@ async function boot(): Promise<void> {
       // cc-message:  上下=本文スクロール / click=選択肢画面へ / dbl=キャンセルして idle へ
       // cc-response: 上下=選択肢移動 / dbl=cc-message へ戻る
       onScrollUp: () => {
+        clearG2Notice()  // 一時通知は次の操作で消す
         if (respondInputBlocked()) return  // 応答 POST 中は応答画面の入力を無視
         if (phase === 'rootlist') moveRootCursor(-1)
         else if (phase === 'pending') void confirmAndSend()
@@ -4148,6 +4230,7 @@ async function boot(): Promise<void> {
         else if (phase === 'cc-response') moveRespondCursor(-1)
       },
       onScrollDown: () => {
+        clearG2Notice()  // 一時通知は次の操作で消す
         if (respondInputBlocked()) return  // 応答 POST 中は応答画面の入力を無視
         if (phase === 'rootlist') moveRootCursor(1)
         else if (phase === 'pending') removeLastSentence() // 末尾1文だけ削除。空になれば idle
@@ -4157,11 +4240,13 @@ async function boot(): Promise<void> {
         else if (phase === 'cc-response') moveRespondCursor(1)
       },
       onClick: () => {
+        clearG2Notice()  // 一時通知は次の操作で消す
         if (respondInputBlocked()) return  // 応答 POST 中はタップも無視
         void toggleRecording()
       },
       // 二重クリック: 各 phase での「戻る/キャンセル」操作
       onDoubleClick: () => {
+        clearG2Notice()  // 一時通知は次の操作で消す
         // プラグインへの遷移待ちで固まっている場合は、まずそれを中止する。
         // (接続先が落ちていると Connecting 表示のまま戻れなくなるため)
         // 描画停止だけが残っている状態 (取り込み直前で失敗した等) も同じ口で解く。
