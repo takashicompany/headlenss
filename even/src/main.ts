@@ -62,6 +62,7 @@ import {
   closeMic,
   initMic,
   micGenIsCurrent,
+  micHealth,
   micIsHeld,
   openMic,
   resetMicAtBoot,
@@ -239,6 +240,43 @@ let probeDebounceTimer: ReturnType<typeof setTimeout> | null = null
 let rtSession: SpeechmaticsRT | null = null
 let liveTranscript = '' // 録音中のpartial+final結合表示用
 let recordingReady = false // RT接続+G2マイク起動が完了して実際に音声を取り始めたか
+/**
+ * いま録音に使っているマイクの世代。PCM の受け口はこれと一致する時しか流さない。
+ * 古い録音のマイクが遅れて音を吐いても、新しい録音の文字起こしに混ぜない。
+ */
+let recordingMicGen = -1
+/**
+ * 'finalizing' / 'sending' に入った時刻。この 2 状態は操作を一切受け付けないので、
+ * 居座りが長引いたらタップ 1 回で強制的に抜けられるようにするための計測点。
+ */
+let blockingPhaseSince = 0
+/**
+ * 強制脱出 (forceResetBlockedPhase) のたびに進む世代。
+ * 脱出後に元の処理が遅れて戻ってきても、新しい状態を上書きしないための目印。
+ */
+let recoveryEpoch = 0
+/** 'finalizing'/'sending' の居座りをタップで打ち切るまでの猶予。 */
+const BLOCKING_PHASE_ESCAPE_MS = 3000
+/** マイク解放を待つ上限。ここを超えたら解放は投げっぱなしにして先へ進む。 */
+const MIC_CLOSE_WAIT_MS = 1500
+
+/**
+ * マイク解放を待つが、上限を超えたら待つのをやめて先へ進む。
+ * 解放そのものは mic.ts の直列キューに残るので、遅れて決着したらそこで反映される。
+ * 「確定中」表示がホストの無応答に引きずられて何十秒も居座るのを断つのが目的。
+ */
+async function closeMicWithLimit(reason: string): Promise<void> {
+  const done = closeMic(reason).then(() => 'done' as const, () => 'done' as const)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const limit = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), MIC_CLOSE_WAIT_MS)
+  })
+  const which = await Promise.race([done, limit])
+  if (timer !== undefined) clearTimeout(timer)
+  if (which === 'timeout') {
+    diag(`mic: ${reason} の解放が ${MIC_CLOSE_WAIT_MS}ms で決着しないので待たずに進みます`)
+  }
+}
 // 確定待ちのテキストを「録音1回ぶん = 1文」単位で配列管理する。
 // pending 中に追加クリック → 新たな録音 → 末尾に append。
 // 下スクロールで末尾の1文だけ削除。
@@ -454,13 +492,45 @@ const client = new HeadlenssClient('')
 // 1回の log で全文を read/concat/再代入するため累積コストが二乗的になり、巨大な <pre>
 // の再レイアウトで「使うほど重く」なる。直近 LOG_MAX_LINES 行だけ保持して抑える。
 const LOG_MAX_LINES = 200
-function log(msg: string): void {
+function emitLog(msg: string, always: boolean): void {
   // 開発モードがオフ (既定) のときは画面ログを出力しない (肥大による重さを根から断つ)。
+  // 診断行 (always) だけは console には必ず残す。実機で拾えないと機序が追えない。
+  if (always) console.log(`[headlenss] ${msg}`)
   if (!settings.devMode) return
   const time = new Date().toLocaleTimeString()
   const lines = (`[${time}] ${msg}\n` + (logEl.textContent ?? '')).split('\n')
   logEl.textContent = lines.length > LOG_MAX_LINES ? lines.slice(0, LOG_MAX_LINES).join('\n') : lines.join('\n')
-  console.log(`[headlenss] ${msg}`)
+  if (!always) console.log(`[headlenss] ${msg}`)
+}
+function log(msg: string): void {
+  emitLog(msg, false)
+}
+
+/**
+ * 起動ごとの通し番号。実機のログは複数回の起動が混ざるので、
+ * どの起動の話かをこれで分ける (localStorage が使えない環境では 0 のまま)。
+ */
+const bootSerial = (() => {
+  try {
+    const next = (Number(localStorage.getItem('headlenss.bootSerial') ?? '0') || 0) + 1
+    localStorage.setItem('headlenss.bootSerial', String(next))
+    return next
+  } catch {
+    return 0
+  }
+})()
+
+/**
+ * 診断行。devMode の画面ログに加えて console にも必ず出す。
+ * 頭に起動通し番号を付けるので、実機ログを後から並べても混ざらない。
+ */
+function diag(msg: string): void {
+  emitLog(`#${bootSerial} ${msg}`, true)
+}
+
+/** マイク周りの健康状態を 1 行だけ吐く (録音のライフサイクルの節目で呼ぶ)。 */
+function dumpMicHealth(where: string): void {
+  diag(`${micHealth()} phase=${phase} rt=${rtSession ? 'live' : 'none'} ready=${recordingReady} @${where}`)
 }
 
 // ─── Status (top bar + G2) ─────────────────────────────────────────────
@@ -3030,6 +3100,15 @@ async function startRecording(): Promise<void> {
     return
   }
 
+  // 前の録音の ASR 接続が残っていることがある (停止経路が途中で折れた等)。
+  // 残したまま新しい接続を張ると、古い接続の partial が新しい表示を上書きする。
+  if (rtSession) {
+    diag('前の ASR 接続が残っていたので破棄してから始めます')
+    const stale = rtSession
+    rtSession = null
+    try { stale.abort() } catch { /* ignore */ }
+  }
+
   resetPcmCounter()
 
   recordingScrollOffset = 0
@@ -3039,6 +3118,7 @@ async function startRecording(): Promise<void> {
   recordingLinesCacheKey = ''
   liveTranscript = ''
   recordingReady = false
+  recordingMicGen = -1
   durationEl.textContent = '0.0s'
   resetScroll()
 
@@ -3099,6 +3179,14 @@ async function startRecording(): Promise<void> {
           void refreshG2()
         },
         onError: (err) => log(`RT error: ${err.message}`),
+        // 録音中に接続が死んだ場合。放っておくと「録音中」のまま無音を撮り続け、
+        // 停止しても何も出てこない。ここで録音前の画面まで畳む。
+        onDead: (reason) => {
+          diag(`RT 接続が録音中に切れました (${reason}) — 録音を畳みます`)
+          if (rtSession === session && phase === 'recording') {
+            revertToIdle(t('g2NoticeRecFailAsr'))
+          }
+        },
       })
       log('Speechmatics RT connected')
     } catch (err) {
@@ -3117,8 +3205,9 @@ async function startRecording(): Promise<void> {
     // 3. G2マイク開始
     //    失敗 (false / 例外 / 時間切れ) の場合、openMic が補償の解放まで済ませて返す。
     //    ここで畳むだけでよく、マイクが握られたまま残ることはない。
-    const { ok, gen } = await openMic()
+    const { ok, gen, reason } = await openMic()
     if (!ok) {
+      dumpMicHealth(`open-failed:${reason}`)
       revertToIdle(t('g2NoticeRecFailMic'))
       return
     }
@@ -3127,13 +3216,15 @@ async function startRecording(): Promise<void> {
     // その解放はキューで既に流れているか、これから流れる)。
     if (!micGenIsCurrent(gen) || rtSession !== session || phase !== 'recording') {
       log('mic: 取得できた時には録音が終わっていました — 解放してから畳みます')
-      await closeMic('stale-after-open')
-      try { session.abort() } catch { /* ignore */ }
       if (rtSession === session) rtSession = null
+      try { session.abort() } catch { /* ignore */ }
+      await closeMicWithLimit('stale-after-open')
       return
     }
     // 接続&マイク起動完了 → レンズ表示を「録音中」に切り替え
+    recordingMicGen = gen
     recordingReady = true
+    dumpMicHealth('recording-started')
     void refreshG2(true)
   })()
 }
@@ -3148,12 +3239,22 @@ async function stopRecordingToPending(): Promise<void> {
   const startedSession = settings.sessionName
   const recordingFlow = respondFlow?.recording ? respondFlow : null
   const startedRt = rtSession
+  const startedEpoch = recoveryEpoch
   /**
    * 録音を止め始めた時と同じセッション (世代) のままか。
    * 違っていたら、この録音の結果は行き先ごと消えているので破棄する。
    * 新しい状態 (切替後のセッションの phase / pending / 録音) には一切触らない。
+   * 強制脱出 (タップで finalizing を打ち切った) 後も同じ扱いにする。
    */
   const abandonIfSessionSwitched = (where: string): boolean => {
+    if (recoveryEpoch !== startedEpoch) {
+      log(`録音停止 (${where}): 強制リセット後なので結果を破棄します`)
+      if (startedRt && rtSession === startedRt) {
+        try { rtSession.abort() } catch { /* ignore */ }
+        rtSession = null
+      }
+      return true
+    }
     if (settings.sessionName === startedSession) return false
     log(`録音停止 (${where}): セッションが切り替わったので結果を破棄します`)
     // 自分が始めた ASR 接続だけを片付ける (切替後に始まった新しい録音は触らない)
@@ -3175,104 +3276,133 @@ async function stopRecordingToPending(): Promise<void> {
   }
 
   stopRecordingTimer()
+  recordingReady = false
   phase = 'finalizing'
+  blockingPhaseSince = Date.now()
   paintStatus()
   updateRecordButton()
   void refreshG2(true)
 
-  // G2マイク停止 (直列キュー経由。戻り値まで見て、駄目なら 1 回だけ出し直す)
-  await closeMic('stop')
-  if (abandonIfSessionSwitched('マイク停止後')) return
+  try {
+    // G2マイク停止 (直列キュー経由。戻り値まで見て、駄目なら 1 回だけ出し直す)。
+    // ホストが無応答でも 1.5 秒で待つのをやめる。解放そのものはキューに残るので、
+    // 「確定中」表示がホストの都合で何十秒も居座ることだけを断つ。
+    await closeMicWithLimit('stop')
+    if (abandonIfSessionSwitched('マイク停止後')) return
 
-  /** 録音終了時の戻り先を決める共通ハンドラ。
-   *  録音が cc-response の Type something 用なら応答画面へ、そうでなければ tmux 用 pending へ。 */
-  const finishWithText = (text: string): void => {
-    if (recordingFlow) {
-      recordingFlow.recording = false
-      // 喋っている間に戻り先が消えていることがある (別経路で承認された / セッションを
-      // kill された / ポーリングで用件が入れ替わった)。戻る先が無いのに cc-response へ
-      // 帰すと、pending 無しの応答画面という作れないはずの状態になる。
-      const flow = respondFlow
-      if (flow !== recordingFlow || !claudePending || claudePending.id !== recordingFlow.pendingId) {
-        log('respond type-something: 戻り先の用件が消えていたので idle に戻ります')
-        resetRespondFlow('pending-gone', recordingFlow)
+    /** 録音終了時の戻り先を決める共通ハンドラ。
+     *  録音が cc-response の Type something 用なら応答画面へ、そうでなければ tmux 用 pending へ。 */
+    const finishWithText = (text: string): void => {
+      // 強制脱出で既に畳まれている場合、ここで書き戻すと現在の画面を壊す。
+      if (recoveryEpoch !== startedEpoch) {
+        log('録音停止: 強制リセット後なので結果は書き戻しません')
         return
       }
-      // cc-response の type-something 回答として記録、cc-response に戻る
-      if (text) {
-        flow.answers[flow.qIdx] = { kind: 'type-something', text }
-        log(`respond type-something: "${text.slice(0, 40)}"`)
-      } else {
-        log('respond type-something: empty, cancel')
+      if (recordingFlow) {
+        recordingFlow.recording = false
+        // 喋っている間に戻り先が消えていることがある (別経路で承認された / セッションを
+        // kill された / ポーリングで用件が入れ替わった)。戻る先が無いのに cc-response へ
+        // 帰すと、pending 無しの応答画面という作れないはずの状態になる。
+        const flow = respondFlow
+        if (flow !== recordingFlow || !claudePending || claudePending.id !== recordingFlow.pendingId) {
+          log('respond type-something: 戻り先の用件が消えていたので idle に戻ります')
+          resetRespondFlow('pending-gone', recordingFlow)
+          return
+        }
+        // cc-response の type-something 回答として記録、cc-response に戻る
+        if (text) {
+          flow.answers[flow.qIdx] = { kind: 'type-something', text }
+          log(`respond type-something: "${text.slice(0, 40)}"`)
+        } else {
+          log('respond type-something: empty, cancel')
+        }
+        phase = 'cc-response'
+        paintStatus()
+        updateRecordButton()
+        void refreshG2(true)
+        // 入力済なら自動で次の質問へ進む
+        if (text) {
+          advanceToNextQuestionOrSubmit()
+        }
+        return
       }
-      phase = 'cc-response'
+      // 通常 (tmux 用) フロー
+      if (text) {
+        pendingSentences.push(text)
+        log(`pending: appended sentence #${pendingSentences.length}`)
+      }
+      phase = 'pending'
       paintStatus()
       updateRecordButton()
+      updatePendingUI()
       void refreshG2(true)
-      // 入力済なら自動で次の質問へ進む
-      if (text) {
-        advanceToNextQuestionOrSubmit()
-      }
+    }
+
+    const seconds = getRecordingSeconds()
+    if (seconds < MIN_RECORDING_SEC || getPcmByteLength() === 0) {
+      log(`Recording too short: ${seconds.toFixed(2)}s`)
+      rtSession?.abort()
+      rtSession = null
+      durationEl.textContent = '0.0s'
+      liveTranscript = ''
+      finishWithText('')
       return
     }
-    // 通常 (tmux 用) フロー
-    if (text) {
-      pendingSentences.push(text)
-      log(`pending: appended sentence #${pendingSentences.length}`)
+
+    const rt = rtSession
+    if (!rt) {
+      finishWithText('')
+      return
     }
-    phase = 'pending'
-    paintStatus()
-    updateRecordButton()
-    updatePendingUI()
-    void refreshG2(true)
-  }
+    let text = ''
+    const t0 = performance.now()
+    try {
+      text = (await rt.stop()).trim()
+      log(`RT final: "${text.slice(0, 80)}" (${(performance.now() - t0).toFixed(0)}ms)`)
+    } catch (e) {
+      const errorMsg = (e as Error).message
+      log(`RT stop error: ${errorMsg}`)
+      // 停止に失敗した接続は捨てるだけでは閉じない (ソケットもコールバックも生きたまま
+      // 残り、遅れて届いた partial が次の録音の表示を上書きする)。必ず切り離す。
+      try { rt.abort() } catch { /* ignore */ }
+      if (abandonIfSessionSwitched('ASR 失敗後')) return
+      addHistoryEntry({
+        text: liveTranscript || '(ASR failed)',
+        session: settings.sessionName,
+        ok: false,
+        durationMs: performance.now() - t0,
+        errorMsg,
+      })
+      durationEl.textContent = '0.0s'
+      liveTranscript = ''
+      finishWithText('')
+      return
+    } finally {
+      // 片付けるのは自分が止めた接続だけ。世代が変わった後に始まった新しい録音の
+      // 接続まで手放すと、その録音が確定できなくなる。
+      if (rtSession === rt) rtSession = null
+    }
 
-  const seconds = getRecordingSeconds()
-  if (seconds < MIN_RECORDING_SEC || getPcmByteLength() === 0) {
-    log(`Recording too short: ${seconds.toFixed(2)}s`)
-    rtSession?.abort()
-    rtSession = null
+    if (abandonIfSessionSwitched('ASR 確定後')) return
     durationEl.textContent = '0.0s'
     liveTranscript = ''
-    finishWithText('')
-    return
-  }
-
-  const rt = rtSession
-  if (!rt) {
-    finishWithText('')
-    return
-  }
-  let text = ''
-  const t0 = performance.now()
-  try {
-    text = (await rt.stop()).trim()
-    log(`RT final: "${text.slice(0, 80)}" (${(performance.now() - t0).toFixed(0)}ms)`)
-  } catch (e) {
-    const errorMsg = (e as Error).message
-    log(`RT stop error: ${errorMsg}`)
-    if (abandonIfSessionSwitched('ASR 失敗後')) return
-    addHistoryEntry({
-      text: liveTranscript || '(ASR failed)',
-      session: settings.sessionName,
-      ok: false,
-      durationMs: performance.now() - t0,
-      errorMsg,
-    })
-    durationEl.textContent = '0.0s'
-    liveTranscript = ''
-    finishWithText('')
-    return
+    finishWithText(text)
   } finally {
-    // 片付けるのは自分が止めた接続だけ。世代が変わった後に始まった新しい録音の
-    // 接続まで手放すと、その録音が確定できなくなる。
-    if (rtSession === rt) rtSession = null
+    // どの経路 (return / 例外) から抜けても 'finalizing' を残さない。
+    // 残すと操作を一切受け付けない画面に閉じ込められる。
+    if (recoveryEpoch === startedEpoch) {
+      blockingPhaseSince = 0
+      if (phase === 'finalizing') {
+        diag('録音停止が finalizing のまま抜けました — 畳んで操作を受け付けます')
+        phase = pendingSentences.length > 0 ? 'pending' : 'idle'
+        paintStatus()
+        updateRecordButton()
+        updatePendingUI()
+        void refreshG2(true)
+      }
+    }
+    dumpMicHealth('stop-finished')
   }
-
-  if (abandonIfSessionSwitched('ASR 確定後')) return
-  durationEl.textContent = '0.0s'
-  liveTranscript = ''
-  finishWithText(text)
 }
 
 /** pending → サーバ送信 → idle */
@@ -3284,7 +3414,9 @@ async function confirmAndSend(): Promise<void> {
     return
   }
   const text = pendingSendText()
+  const startedEpoch = recoveryEpoch
   phase = 'sending'
+  blockingPhaseSince = Date.now()
   paintStatus()
   updateRecordButton()
   updatePendingUI()
@@ -3314,12 +3446,18 @@ async function confirmAndSend(): Promise<void> {
       errorMsg,
     })
   } finally {
-    pendingSentences = []
-    phase = 'idle'
-    resetScroll()
-    recomputePhase()
-    // 送信直後に出力ミラーを取り直し (反映を見える化)
-    void refreshClaudeData()
+    // 強制脱出でこの送信が既に打ち切られていたら、今の画面には触らない。
+    if (recoveryEpoch === startedEpoch) {
+      blockingPhaseSince = 0
+      pendingSentences = []
+      phase = 'idle'
+      resetScroll()
+      recomputePhase()
+      // 送信直後に出力ミラーを取り直し (反映を見える化)
+      void refreshClaudeData()
+    } else {
+      log('送信: 強制リセット後なので画面は触りません')
+    }
   }
 }
 
@@ -3354,46 +3492,114 @@ function removeLastSentence(): void {
  */
 async function abortRecording(): Promise<void> {
   // 判断の基準は phase ではなくマイクの実態。録音画面を既に離れていても
-  // (foreground exit / フローの畳み込みと競合した等) マイクだけ握られたまま
+  // (foreground exit / フローの畳み込みと競合した等) マイクや ASR 接続だけが
   // 残っていることがあり、その取り残しもここで解く。
   const wasRecording = phase === 'recording'
-  if (!wasRecording && !micIsHeld()) return
-  const startedRt = rtSession
+  // 'finalizing' 中の rtSession は停止処理が使っている最中なので触らない。
+  const orphanRt = !wasRecording && phase !== 'finalizing' ? rtSession : null
+  if (!wasRecording && !micIsHeld() && !orphanRt) return
   if (wasRecording) log(`recording aborted (kept ${pendingSentences.length} sentences)`)
+  else if (orphanRt) log('録音画面ではないが ASR 接続が残っているので破棄します')
   else log('録音画面ではないがマイクが握られたままなので解放します')
-  stopRecordingTimer()
-  // G2 マイク停止
-  await closeMic('abort')
-  // 解放を待っている間に別経路が畳んでいた / 新しい録音が始まっていたら、
-  // ここから先 (RT 破棄と phase の書き換え) は他人の状態を壊すのでやらない。
-  if (!wasRecording || phase !== 'recording' || rtSession !== startedRt) {
+
+  try {
+    // ── await より前に、画面と接続の畳み込みを全部終わらせる ──
+    // マイク解放はホスト次第でいくらでも待たされる。それを待ってから畳むと
+    // 「中止したのに録音画面のまま何も効かない」時間がそのまま生まれる。
+    stopRecordingTimer()
+    recordingReady = false
+    recordingMicGen = -1
+    // RT セッションを破棄 (final 結果は受け取らない)。
+    const rt = wasRecording ? rtSession : orphanRt
+    if (rt) {
+      if (rtSession === rt) rtSession = null
+      try { rt.abort() } catch { /* ignore */ }
+    }
+
+    if (wasRecording) {
+      resetPcmCounter()
+      recordingScrollOffset = 0
+      recordingLinesCache = []
+      recordingLinesCacheKey = ''
+      liveTranscript = ''
+      durationEl.textContent = '0.0s'
+      // 録音の用途が cc-response の type-something なら、cc-response に戻る。
+      // ただし戻り先の用件が消えていたら応答フローごと畳んで idle へ落とす
+      // (pending 無しの応答画面を作らない)。
+      const flow = respondFlow
+      if (flow?.recording) {
+        flow.recording = false
+        if (!claudePending || claudePending.id !== flow.pendingId) {
+          log('録音中止: 戻り先の用件が消えていたので idle に戻ります')
+          resetRespondFlow('pending-gone')
+        } else {
+          phase = 'cc-response'
+          paintStatus()
+          void refreshG2(true)
+        }
+      } else {
+        phase = pendingSentences.length > 0 ? 'pending' : 'idle'
+        paintStatus()
+        void refreshG2(true)
+      }
+      updatePendingUI()
+    }
+
+    // G2 マイク停止。待つのは上限つきで、超えたら投げっぱなしにする
+    // (解放そのものは mic.ts の直列キューに残り、そこで決着する)。
+    await closeMicWithLimit('abort')
+  } finally {
+    // 例外で抜けても 'recording' に固着させない。
+    if (phase === 'recording') {
+      diag('録音中止が recording のまま抜けました — 畳んで操作を受け付けます')
+      phase = pendingSentences.length > 0 ? 'pending' : 'idle'
+      paintStatus()
+      updatePendingUI()
+      void refreshG2(true)
+    }
     updateRecordButton()
-    return
+    dumpMicHealth('abort-finished')
   }
-  // RT セッションを破棄 (final 結果は受け取らない)
-  rtSession?.abort()
+}
+
+/**
+ * 'finalizing' / 'sending' に居座ってしまった時の脱出口。
+ * この 2 状態は操作を一切受け付けないので、外の都合 (ホスト無応答 / 通信断) で
+ * 長引くとレンズは完全に無反応になる。一定時間を超えたタップでここを通し、
+ * 手元の状態だけで畳んで操作を取り戻す。
+ *
+ * 進行中の処理は recoveryEpoch で無効化するので、遅れて戻ってきても
+ * 畳んだ後の画面を書き戻さない。
+ */
+function forceResetBlockedPhase(): void {
+  const stuck = blockingPhaseSince > 0 ? Date.now() - blockingPhaseSince : 0
+  diag(`${phase} が ${stuck}ms 続いたので強制的に畳みます`)
+  recoveryEpoch++
+  blockingPhaseSince = 0
+  stopRecordingTimer()
+  recordingReady = false
+  recordingMicGen = -1
+  const rt = rtSession
   rtSession = null
-  resetPcmCounter()
-  recordingScrollOffset = 0
-  recordingLinesCache = []
-  recordingLinesCacheKey = ''
+  if (rt) { try { rt.abort() } catch { /* ignore */ } }
+  // マイクは投げっぱなしで解放する (ここで待つと脱出口の意味がない)。
+  if (micIsHeld()) void closeMic('stuck-reset')
   liveTranscript = ''
   durationEl.textContent = '0.0s'
-  recordingReady = false
-  // 録音の用途が cc-response の type-something なら、cc-response に戻る。
-  // ただし戻り先の用件が消えていたら応答フローごと畳んで idle へ落とす
-  // (pending 無しの応答画面を作らない)。
+  if (phase === 'sending') {
+    // 送信は既にサーバへ出ている。ここで文を残すと同じ内容を二重に送りうるので、
+    // 決着した時と同じ扱い (破棄) にする。
+    log(`送信中の強制脱出: ${pendingSentences.length} 文を破棄します`)
+    pendingSentences = []
+  }
   const flow = respondFlow
   if (flow?.recording) {
     flow.recording = false
     if (!claudePending || claudePending.id !== flow.pendingId) {
-      log('録音中止: 戻り先の用件が消えていたので idle に戻ります')
       resetRespondFlow('pending-gone')
-      updateRecordButton()
-      updatePendingUI()
-      return
+    } else {
+      phase = 'cc-response'
     }
-    phase = 'cc-response'
   } else {
     phase = pendingSentences.length > 0 ? 'pending' : 'idle'
   }
@@ -3401,10 +3607,19 @@ async function abortRecording(): Promise<void> {
   updateRecordButton()
   updatePendingUI()
   void refreshG2(true)
+  dumpMicHealth('stuck-reset')
 }
 
 async function toggleRecording(): Promise<void> {
-  if (phase === 'finalizing' || phase === 'sending') return
+  if (phase === 'finalizing' || phase === 'sending') {
+    // 通常はここで無視する (二重停止・二重送信を作らない)。ただし長引いている
+    // 場合だけは、このタップを捨てずに脱出へ使う。捨てると「何度叩いても
+    // 反応しない」状態が続き、ユーザには壊れたようにしか見えない。
+    const stuck = blockingPhaseSince > 0 ? Date.now() - blockingPhaseSince : 0
+    if (stuck < BLOCKING_PHASE_ESCAPE_MS) return
+    forceResetBlockedPhase()
+    // 畳んだ後の phase で、このタップを改めて処理する (下へ落ちる)。
+  }
   // 応答 POST 中のタップは無視 (同じ用件へ 2 通目を送らせない)
   if (respondInputBlocked()) return
   if (phase === 'recording') {
@@ -3857,6 +4072,7 @@ function discardRespondRecording(): void {
   liveTranscript = ''
   durationEl.textContent = '0.0s'
   recordingReady = false
+  recordingMicGen = -1
 }
 
 /** 送信失敗の表示を消す (ユーザが次の操作をした時 / フローを畳む時)。 */
@@ -4459,7 +4675,22 @@ async function boot(): Promise<void> {
   // 実機側は開きっぱなしのことがあるので、起動時に 1 回だけ解放を出しておく
   // (失敗は無視。ここで待つと起動が遅れるので待たない)。
   initMic({ bridge: () => bridge, log })
-  if (bridge) void resetMicAtBoot()
+  diag(`boot: bridge=${bridge ? 'ok' : 'none'} ua=${navigator.userAgent.slice(0, 80)}`)
+  if (bridge) {
+    void resetMicAtBoot().then(() => dumpMicHealth('boot-reset'))
+  }
+
+  // ページごと消える経路 (WebView 破棄 / 遷移) の保険。
+  // SDK のイベントが来ないまま消えることがあり、その時はマイクも ASR 接続も
+  // 握られたまま残る。ここでは待てないので、出すだけ出して去る。
+  window.addEventListener('pagehide', () => {
+    if (rtSession) {
+      const rt = rtSession
+      rtSession = null
+      try { rt.abort() } catch { /* ignore */ }
+    }
+    if (micIsHeld()) void closeMic('pagehide')
+  })
 
   // G2 プラグインから戻ってきた場合、ホスト側セッションにはプラグインのコンテナが
   // 残っている。createStartUpPageContainer はセッションにつき 1 回きりなので、
@@ -4539,7 +4770,11 @@ async function boot(): Promise<void> {
         }
       },
       onAudio: (pcm) => {
-        if (phase !== 'recording') return
+        // 「録音画面である」だけでは足りない。マイクの取得が済んでいない間や、
+        // 古い録音のマイクが遅れて音を吐いている間に流すと、次の録音の文字起こしに
+        // 前の録音の音が混ざる。準備完了かつ *今の* マイク世代の音だけを通す。
+        if (phase !== 'recording' || !recordingReady) return
+        if (!micGenIsCurrent(recordingMicGen)) return
         trackPcmFrame(pcm)
         rtSession?.send(pcm)
       },
@@ -4569,11 +4804,18 @@ async function boot(): Promise<void> {
         // 録音済みの確定文 (pendingSentences) は abortRecording が保持する。
         // 判断は phase だけでなくマイクの実態でも行う: 取得の途中で畳まれた等で
         // 「録音画面ではないがマイクは握ったまま」になっている場合もここで解く。
-        if (phase === 'recording' || micIsHeld()) {
+        if (phase === 'recording' || micIsHeld() || rtSession) {
           log('foreground exit — 録音/マイクを後始末します')
           void abortRecording()
         }
         // ページが破棄されている可能性に備え、次回入場時に createStartUpPageContainer に戻す
+        resetPageState()
+      },
+      // 異常終了 / OS 側からの終了。foreground exit と同じ後始末をする。
+      // ここを黙殺していたので、落ち方によってはマイクを握ったまま消えていた。
+      onAppExit: (kind) => {
+        diag(`${kind} — foreground exit と同じ後始末をします`)
+        if (phase === 'recording' || micIsHeld() || rtSession) void abortRecording()
         resetPageState()
       },
       onLog: (msg) => log(msg),

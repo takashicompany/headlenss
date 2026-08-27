@@ -134,6 +134,8 @@ export type RespondInput = (
  */
 /** 応答 POST の上限時間 (ms)。サーバ側のキー注入と確認 (数百 ms〜数秒) より十分長く取る。 */
 const RESPOND_TIMEOUT_MS = 15000
+/** tmux への送信 (sendKeys) の締切。返らないと 'sending' 表示が固着する。 */
+const SEND_KEYS_TIMEOUT_MS = 15000
 
 /**
  * ms 後に abort する signal。
@@ -194,11 +196,17 @@ export class HeadlenssClient {
     return data.sessions
   }
 
+  /**
+   * tmux セッションへ本文を流し込む。
+   * 締切を必ず張る: ここが返らないと呼び出し側は 'sending' のまま操作を
+   * 受け付けない画面に閉じ込められる (電波が切れた時に実際に起きる)。
+   */
   async sendKeys(name: string, opts: SendKeysOptions): Promise<void> {
     const res = await fetch(this.url(`/api/sessions/${encodeURIComponent(name)}/input`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: opts.text, submit: opts.submit }),
+      signal: timeoutSignal(SEND_KEYS_TIMEOUT_MS),
     })
     if (!res.ok) {
       const body = await res.text().catch(() => '')
