@@ -99,12 +99,36 @@ function scheduleReturnRedraw(config: {
 }
 
 /**
+ * 時間切れで待つのをやめた送信の会計を、呼び出し元 (main.ts) に知らせるためのフック。
+ *
+ * なぜ要るか: withBridgeTimeout が reject しても SDK 側の処理は止まらない。
+ * 「こちらが待つのをやめただけで、まだ SDK に居座っているフレーム」が何本あるかは
+ * ここでしか分からないので、その数を外へ出す。呼び出し元はこれを使って
+ * 「詰まっている間は新規送信を見送る」背圧を掛ける。
+ *
+ *  onTimeout    … 時間切れで待つのをやめた (未決着が 1 本増えた)
+ *  onLateSettle … 諦めた後になって SDK 側が決着した (未決着が 1 本減った)
+ */
+export type BridgeStallHooks = {
+  onTimeout: (op: string) => void
+  onLateSettle: (op: string, ok: boolean) => void
+}
+let stallHooks: BridgeStallHooks = { onTimeout: () => {}, onLateSettle: () => {} }
+export function setRendererStallHooks(hooks: BridgeStallHooks): void {
+  stallHooks = hooks
+}
+
+/**
  * ブリッジ送信に上限時間を付ける。
  *
  * SDK 側の Promise が解決しないまま返ってこないと、呼び出し元 (main.ts) の
  * 送信ロックが解放されず、以降レンズが二度と更新されなくなる。
  * 時間切れ時は reject して呼び出し元にロックを解放させる。SDK 側の処理自体は
  * 止められないので、あくまで「こちらが待つのをやめる」ための保険。
+ *
+ * 待つのをやめた後も元の Promise は追い続け、遅れて決着したら報告する。
+ * 「まだ SDK に何本居座っているか」が分からないと、呼び出し元は詰まりの最中も
+ * 新規送信を積み続けてしまう (背圧が効かない)。
  */
 async function withBridgeTimeout<T>(op: string, p: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -112,10 +136,17 @@ async function withBridgeTimeout<T>(op: string, p: Promise<T>): Promise<T> {
     return await Promise.race([
       p,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`bridge ${op} timed out after ${BRIDGE_SEND_TIMEOUT_MS}ms`)),
-          BRIDGE_SEND_TIMEOUT_MS,
-        )
+        timer = setTimeout(() => {
+          stallHooks.onTimeout(op)
+          // 諦めた本数を後で戻せるよう、元の Promise の決着だけは見届ける。
+          // (never settle なら永久に減らないが、それが実態なので会計としては正しい。
+          //  飢餓しないよう、呼び出し元はバックオフ後に必ず 1 本試す。)
+          p.then(
+            () => stallHooks.onLateSettle(op, true),
+            () => stallHooks.onLateSettle(op, false),
+          )
+          reject(new Error(`bridge ${op} timed out after ${BRIDGE_SEND_TIMEOUT_MS}ms`))
+        }, BRIDGE_SEND_TIMEOUT_MS)
       }),
     ])
   } finally {

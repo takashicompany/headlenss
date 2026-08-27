@@ -187,8 +187,8 @@ export class HeadlenssClient {
     return (await res.json()) as { ok: boolean }
   }
 
-  async listSessions(): Promise<Session[]> {
-    const res = await fetch(this.url('/api/sessions'))
+  async listSessions(signal?: AbortSignal): Promise<Session[]> {
+    const res = await fetch(this.url('/api/sessions'), { signal })
     if (!res.ok) throw new Error(`listSessions HTTP ${res.status}`)
     const data = (await res.json()) as { sessions: Session[] }
     return data.sessions

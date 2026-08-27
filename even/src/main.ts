@@ -18,6 +18,7 @@ import {
   resetPageState,
   setRendererExclusiveSender,
   setRendererLog,
+  setRendererStallHooks,
   showScreen,
   updateContent,
   updateFooter,
@@ -1056,34 +1057,140 @@ function summarizeToolInput(input: unknown): string {
 
 /**
  * chatLinesCache の指紋。formatChatLines の出力を決めるのは各項目の role と text、
- * そして source (タグ表記) だけなので、それらだけを連結する。
+ * source (タグ表記)、そして言語 (長文を切り詰めた時の省略行の文言) だけなので、
+ * それらだけを連結する。
  * 文字列連結は総文字数に比例するが、グリフ幅測定を伴う整形より桁違いに安い。
  */
 function chatCacheKeyOf(items: ChatItem[], source: AgentSource | undefined): string {
-  let key = String(source)
+  let key = `${source}#${getLanguage()}`
   for (const item of items) key += `${item.role}${item.text}`
   return key
+}
+
+/** chatLinesCache を今の状態から作り直す (言語切替のように鍵の外側が変わった時に呼ぶ)。 */
+function rebuildChatLinesCache(): void {
+  chatLinesCache = formatChatLines(claudeChat, CHAT_WRAP_PX, currentAgentSource)
+  chatLinesCacheKey = chatCacheKeyOf(claudeChat, currentAgentSource)
+}
+
+// ─── グリフ幅のメモ化 ────────────────────────────────────────────────
+// pretext の getTextWidth は 1 コードポイントごとにフォント連鎖を走査し (toString +
+// `in` 判定 + カーニング表引き)、さらに Array.from で配列を作る。折り返しは全文字を
+// 何度も測るので、この素の呼び出しがチャット整形コストのほぼ全部になる。
+//
+// 幅はコードポイント単体と隣接ペアだけで決まる (LVGL のペアワイズ・カーニング) ので、
+// 「1〜2 コードポイントの文字列 → 幅」だけをメモ化すれば、任意長の文字列の幅は
+// メモの足し算で厳密に再現できる (measuredWidth 参照)。鍵が 1〜2 文字に限られる =
+// 実在する文字種ぶんで頭打ちになるので、長い会話でも辞書が肥大しない。
+// pretext 本体には手を入れない (ここはあくまで呼び出し側のラッパー)。
+const GLYPH_WIDTH_MEMO_MAX = 8000
+const glyphWidthMemo = new Map<string, number>()
+function glyphWidth(s: string): number {
+  const hit = glyphWidthMemo.get(s)
+  if (hit !== undefined) return hit
+  const w = getTextWidth(s)
+  // 上限に当たったら丸ごと捨てる。実際の文字種はふつう数百〜数千で頭打ちになるので
+  // この分岐にはまず入らない (LRU を持つ価値が無い)。
+  if (glyphWidthMemo.size >= GLYPH_WIDTH_MEMO_MAX) glyphWidthMemo.clear()
+  glyphWidthMemo.set(s, w)
+  return w
+}
+
+/**
+ * getTextWidth(text) と厳密に同じ値を、メモ化済みの 1〜2 文字ぶんの幅だけから求める。
+ *
+ * getTextWidth("ab") = adv(a→b) + adv(b→終端)、getTextWidth("b") = adv(b→終端) なので
+ * adv(a→b) = glyphWidth("ab") - glyphWidth("b")。これを全ペアで足し、末尾は
+ * glyphWidth(末尾文字) = adv(末尾→終端) を足す。すべて整数演算なので誤差は出ない。
+ */
+function measuredWidth(text: string): number {
+  let w = 0
+  let prev = ''
+  for (const ch of text) {
+    if (prev) w += glyphWidth(prev + ch) - glyphWidth(ch)
+    prev = ch
+  }
+  if (prev) w += glyphWidth(prev)
+  return w
+}
+
+/** 末尾が prev の文字列に ch を足した時の幅の増分 (カーニング込み)。 */
+function advanceWidth(prev: string, ch: string): number {
+  return prev ? glyphWidth(prev + ch) - glyphWidth(prev) : glyphWidth(ch)
+}
+
+// ─── チャット整形 ────────────────────────────────────────────────────
+/**
+ * 表示用に折り返す 1 発言あたりの最大文字数。
+ *
+ * なぜ要るか: 折り返しのコストは文字数に比例するので、1 発言の長さに上限が無いと
+ * 「エージェントが長文を吐いた瞬間だけメインスレッドが数百 ms 止まる」が起きる。
+ * 止まっている間はレンズ送信も操作も進まないので、そこから送信の時間切れ →
+ * 背圧の崩壊、と連鎖する。レンズは 7 行窓なので、この長さを超えて読める人はいない。
+ */
+const CHAT_MSG_MAX_CHARS = 4000
+
+/**
+ * 発言 1 件ぶんの折り返し結果キャッシュ。
+ *
+ * なぜ「発言単位」か: チャットは新着 1 件で 20 件窓がスライドするだけで、19 件は
+ * 前回と同じ内容のまま。窓全体を鍵にすると新着 1 件で 20 件ぶんを測り直すことになる。
+ * 発言単位で持てば、実際に測るのは新着・変更された発言だけで済む。
+ */
+const CHAT_ITEM_LINES_CACHE_MAX = 40
+const chatItemLinesCache = new Map<string, string[]>()
+
+/** 発言 1 件を行配列にする (先頭は役割タグ)。表示に出ない発言は空配列。 */
+function chatItemLines(item: ChatItem, maxWidthPx: number, agentName: string): string[] {
+  const text = item.text.replace(/\r/g, '').trim()
+  if (!text) return []
+  const total = text.length
+  // 切り口の末尾に空白が残ると、折り返し後の最終行に見えない余白が付く。落としておく。
+  const shown = total > CHAT_MSG_MAX_CHARS ? text.slice(0, CHAT_MSG_MAX_CHARS).trimEnd() : text
+  // 鍵は「出力を決めるもの」を全部含める: 折り返し幅 / 言語 (省略行の文言) /
+  // 役割 / エージェント名 (タグ表記) / 元の長さ (省略行の数値) / 表示本文。
+  // 本文は切り詰め後を使うので、巨大な発言でも鍵が上限文字数で頭打ちになる。
+  const key = `${maxWidthPx}\u0000${getLanguage()}\u0000${item.role}\u0000${agentName}\u0000${total}\u0000${shown}`
+  const hit = chatItemLinesCache.get(key)
+  if (hit) {
+    // 参照したものを最新扱いにする (窓に残り続ける発言が古い順の破棄で落ちないように)
+    chatItemLinesCache.delete(key)
+    chatItemLinesCache.set(key, hit)
+    return hit
+  }
+  const lines: string[] = [item.role === 'user' ? '[YOU]' : `[${agentName}]`]
+  for (const para of shown.split('\n')) {
+    for (const line of wrapText(para, maxWidthPx)) lines.push(line)
+  }
+  if (total > CHAT_MSG_MAX_CHARS) {
+    // 切り詰めたことを黙っていると「読み切った」と誤解されるので末尾に明示する
+    const notice = t('chatMsgTruncated').replace('{total}', String(total))
+    for (const line of wrapText(notice, maxWidthPx)) lines.push(line)
+  }
+  chatItemLinesCache.set(key, lines)
+  while (chatItemLinesCache.size > CHAT_ITEM_LINES_CACHE_MAX) {
+    const oldest = chatItemLinesCache.keys().next().value as string | undefined
+    if (oldest === undefined) break
+    chatItemLinesCache.delete(oldest)
+  }
+  return lines
 }
 
 /**
  * チャット項目を G2 レンズ用に整形。
  * 役割タグ ([YOU] / [Claude|Codex]) を独立行で挟み、タグの前に空行を入れる。
  * 生ログ (claudeChat) は書き換えず、表示時にこの関数で都度生成する。
+ * 実際の折り返しは chatItemLines のキャッシュ越しなので、20 件窓のうち
+ * 新着・変更ぶんだけが計算される。
  */
 function formatChatLines(items: ChatItem[], maxWidthPx: number, source: 'claude' | 'codex' | undefined = currentAgentSource): string[] {
+  const agentName = source === 'codex' ? 'Codex' : source === 'claude' ? 'Claude' : 'Agent'
   const out: string[] = []
   for (const item of items) {
-    const text = item.text.replace(/\r/g, '').trim()
-    if (!text) continue
-    const agentName = source === 'codex' ? 'Codex' : source === 'claude' ? 'Claude' : 'Agent'
-    const tag = item.role === 'user' ? '[YOU]' : `[${agentName}]`
+    const lines = chatItemLines(item, maxWidthPx, agentName)
+    if (lines.length === 0) continue
     if (out.length > 0) out.push('')  // タグの直前に空行を挟んで境目を強調
-    out.push(tag)
-    const paragraphs = text.split('\n')
-    for (const para of paragraphs) {
-      const wrapped = wrapText(para, maxWidthPx)
-      for (const line of wrapped) out.push(line)
-    }
+    for (const line of lines) out.push(line)
   }
   return out
 }
@@ -1098,17 +1205,16 @@ function formatChatLines(items: ChatItem[], maxWidthPx: number, source: 'claude'
  * ペアのみで決まる) ことを利用し、buf 全体を測り直さず O(1) で積算する。
  */
 function wrapText(text: string, maxWidthPx: number): string[] {
-  if (maxWidthPx <= 0 || getTextWidth(text) <= maxWidthPx) return [text || '']
+  if (maxWidthPx <= 0 || measuredWidth(text) <= maxWidthPx) return [text || '']
   const out: string[] = []
   let buf = ''
   let bufW = 0
   let lastChar = ''       // buf の末尾文字 (カーニング増分計算用)
   let lastSpaceLen = -1   // 直近の空白直後の位置 (buf の code unit index)
   for (const ch of text) {
-    // buf + ch の幅増分 = getTextWidth(末尾文字 + ch) - getTextWidth(末尾文字)
-    const addW = lastChar
-      ? getTextWidth(lastChar + ch) - getTextWidth(lastChar)
-      : getTextWidth(ch)
+    // buf + ch の幅増分 = 幅(末尾文字 + ch) - 幅(末尾文字)。measure は文字/ペア単位で
+    // メモ化されているので、同じ文字が繰り返し出る日本語でも実測は 1 回きりで済む。
+    const addW = advanceWidth(lastChar, ch)
     if (buf !== '' && bufW + addW > maxWidthPx) {
       if (lastSpaceLen >= 0) {
         // 直近の空白で折り返す
@@ -1119,7 +1225,7 @@ function wrapText(text: string, maxWidthPx: number): string[] {
         out.push(buf)
         buf = ch
       }
-      bufW = getTextWidth(buf)
+      bufW = measuredWidth(buf)
       lastSpaceLen = -1
     } else {
       if (ch === ' ') lastSpaceLen = buf.length + 1  // 空白の直後で折り返したい
@@ -1135,13 +1241,15 @@ function wrapText(text: string, maxWidthPx: number): string[] {
 /** text を px 幅 maxPx に収まる最長の接頭辞に切り詰める。切り詰めたかも返す。 */
 function truncateToPx(text: string, maxPx: number): { s: string; truncated: boolean } {
   if (maxPx <= 0) return { s: '', truncated: text.length > 0 }
-  if (getTextWidth(text) <= maxPx) return { s: text, truncated: false }
+  if (measuredWidth(text) <= maxPx) return { s: text, truncated: false }
   let buf = ''
+  let bufW = 0
   let last = ''
   for (const ch of text) {
-    const addW = last ? getTextWidth(last + ch) - getTextWidth(last) : getTextWidth(ch)
-    if (getTextWidth(buf) + addW > maxPx) return { s: buf, truncated: true }
+    const addW = advanceWidth(last, ch)
+    if (bufW + addW > maxPx) return { s: buf, truncated: true }
     buf += ch
+    bufW += addW
     last = ch
   }
   return { s: buf, truncated: false }
@@ -1152,10 +1260,10 @@ function appendRootPreview(prefix: string, preview: string | undefined): string 
   const p = (preview ?? '').replace(/\s+/g, ' ').trim()
   if (!p) return prefix
   const sep = ' '
-  const avail = CHAT_WRAP_PX - getTextWidth(prefix + sep)
-  const ellipsisW = getTextWidth('…')
+  const avail = CHAT_WRAP_PX - measuredWidth(prefix + sep)
+  const ellipsisW = measuredWidth('…')
   if (avail <= ellipsisW) return prefix // プレビューを置く余地が無い (名前が長い等)
-  if (getTextWidth(p) <= avail) return prefix + sep + p
+  if (measuredWidth(p) <= avail) return prefix + sep + p
   const { s } = truncateToPx(p, avail - ellipsisW)
   return s ? prefix + sep + s + '…' : prefix
 }
@@ -1591,7 +1699,7 @@ function buildG2Header(): string {
         // 切り詰めは点滅の両フェーズに同じだけ掛ける。非表示コマだけ名前が伸びると
         // 名前そのものがちらついて読みにくいため。
         const sep = '　'
-        const avail = HEADER_INNER_WIDTH - getTextWidth(sep + badge)
+        const avail = HEADER_INNER_WIDTH - measuredWidth(sep + badge)
         const name = truncateToPx(settings.sessionName || '', avail).s
         // 56 は他のヘッダと揃えた最後の歯止め (px で切った後は通常ここに掛からない)
         return (headBlinkOn ? `${name}${sep}${badge}` : name).slice(0, 56)
@@ -1635,6 +1743,96 @@ function buildG2Header(): string {
 /** レンズ 1 画面ぶんのスナップショット (同じ状態から組んだ 3 コンテナの内容)。 */
 type G2Frame = { header: string; content: string; footer: string }
 
+// ─── 未決着送信の会計 (時間切れ後の背圧) ────────────────────────────────
+// renderer の 5 秒タイムアウトは「こちらが待つのをやめる」だけで、SDK 側のフレームは
+// 消えない。やめた時点でポンプはロックを解放するので、詰まっている最中も次の送信が
+// 始まってしまう = 背圧が効かない。詰まりが続くとアプリは投げ続け、SDK の未処理は
+// 単調に増え、レンズは操作から数十秒遅れる (25 分使うと重い、の一因)。
+//
+// そこで「待つのをやめたが SDK に居座っているフレーム」の本数を数え、閾値以上ある
+// 間は新規送信を見送る。見送った要求は待機枠 (latest-wins) に溜まるだけなので、
+// アプリ内で積み上がることはなく、再開時には最新の状態が 1 回で届く。
+//
+// 飢餓しないための逃げ道: SDK が永久に決着を返さない可能性があるので、バックオフ
+// 時間が過ぎたら必ず 1 本試す (通れば詰まりは解けている)。
+/** これ以上「待つのをやめたまま」のフレームが居たら新規送信を見送る。 */
+const G2_UNSETTLED_LIMIT = 2
+/** 抑制に入ってから次の 1 本を試すまでの待ち時間 (ms)。 */
+const G2_UNSETTLED_BACKOFF_MS = 5000
+let g2UnsettledSends = 0
+let g2SuppressUntil = 0            // performance.now() でこの時刻まで見送る
+let g2SuppressResumeTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 抑制が解けた時に待機枠を流し直すための一発タイマー。 */
+function scheduleSuppressedResume(delayMs: number): void {
+  if (g2SuppressResumeTimer) return
+  g2SuppressResumeTimer = setTimeout(() => {
+    g2SuppressResumeTimer = null
+    void pumpG2Sends()
+  }, Math.max(0, delayMs))
+}
+
+/** ブリッジ送信が時間切れした (未決着が 1 本増えた)。 */
+function onBridgeSendTimeout(op: string): void {
+  g2UnsettledSends++
+  log(`G2 送信タイムアウト (${op}) — 未決着 ${g2UnsettledSends} 本`)
+  if (g2UnsettledSends >= G2_UNSETTLED_LIMIT) {
+    g2SuppressUntil = performance.now() + G2_UNSETTLED_BACKOFF_MS
+    scheduleSuppressedResume(G2_UNSETTLED_BACKOFF_MS)
+  }
+}
+
+/** 諦めた後で SDK 側が決着した (未決着が 1 本減った)。 */
+function onBridgeSendLateSettle(op: string, ok: boolean): void {
+  g2UnsettledSends = Math.max(0, g2UnsettledSends - 1)
+  log(`G2 送信が遅れて決着 (${op}, ok=${ok}) — 未決着 ${g2UnsettledSends} 本`)
+  if (g2UnsettledSends < G2_UNSETTLED_LIMIT) {
+    // 詰まりが解けた。待たずに再開する (溜まっている待機枠を今すぐ流す)。
+    g2SuppressUntil = 0
+    void pumpG2Sends()
+  }
+}
+
+/**
+ * 未決着のフレームが 1 本でも居るか (副作用なし。抑制の「試し 1 本」を消費しない)。
+ *
+ * 捨ててよい送信 (スクロールの中間コマ / 強制再同期) はここで止める。1 本でも
+ * SDK に居座っているなら、無くても困らないフレームを上に積む理由が無い。
+ * 必須の送信 (待機枠を流す直列路) の方は閾値 G2_UNSETTLED_LIMIT まで許す。
+ */
+function g2SendStalled(): boolean {
+  return g2UnsettledSends > 0
+}
+
+/**
+ * いま新規のブリッジ送信を見送るべきか。
+ *
+ * 見送るのは「未決着が閾値以上」かつ「バックオフの最中」の時だけ。バックオフが
+ * 過ぎたら 1 本通し、その場で次のバックオフを張り直す。通した 1 本がまた時間切れ
+ * すれば未決着が増えて抑制は続き、通れば (下の遅延決着 / 成功で) 抑制は解ける。
+ */
+function g2SendsSuppressed(): boolean {
+  if (!g2SendStalled()) return false
+  const now = performance.now()
+  if (now >= g2SuppressUntil) {
+    // バックオフ経過 — 飢餓を避けるため必ず 1 本試す
+    g2SuppressUntil = now + G2_UNSETTLED_BACKOFF_MS
+    scheduleSuppressedResume(G2_UNSETTLED_BACKOFF_MS)
+    log(`G2 送信抑制中だがバックオフ経過のため 1 本試す (未決着 ${g2UnsettledSends} 本)`)
+    return false
+  }
+  scheduleSuppressedResume(g2SuppressUntil - now)
+  return true
+}
+
+/**
+ * 送信が (時間切れではなく) 正常に完了した。送信路が生きている証拠なので抑制を解く。
+ * 未決着カウントはそのまま (遅延決着で減る) だが、実際に通った以上、待たせる理由が無い。
+ */
+function noteBridgeSendOk(): void {
+  if (g2SuppressUntil !== 0) g2SuppressUntil = 0
+}
+
 let g2SendLock = false            // ブリッジ送信中 (全経路共通の in-flight フラグ)
 let g2RenderPending = false       // full render の待機枠 (latest-wins)
 let g2RenderPendingForce = false  // 待機要求の force を OR で蓄積
@@ -1671,6 +1869,9 @@ const G2_FORCED_RESYNC_MS = 15000
 function isForcedResyncDue(): boolean {
   // そもそも送れない状況 (ブリッジ無し / プラグイン遷移中) では起点も進まないので数えない
   if (!bridge || pluginNavBlocksG2Render) return false
+  // 詰まっている間は再同期しない。dedup を捨てて 3 コンテナ全送する処理なので、
+  // 詰まりの最中にやると未決着を増やすだけになる (抑制が解けてから改めて期限が来る)。
+  if (g2SendStalled()) return false
   return performance.now() - g2LastSentAt >= G2_FORCED_RESYNC_MS
 }
 
@@ -1771,6 +1972,9 @@ function sendScrollFrameLoose(content: string): void {
   // 安全弁: レンズが遅すぎて投げっぱなし分が捌けていない。中間コマなので捨ててよい
   // (g2ContentLastSent を進めないので、同じ内容が後で必要になれば送り直される)。
   if (g2LooseScrollInFlight >= looseScrollMaxInFlight()) return
+  // 直列路が詰まっている (時間切れで諦めたフレームが SDK に居座っている) 間は、
+  // 中間コマを一切出さない。着地コマは直列路の待機枠で待ち、抑制が解けた時に届く。
+  if (g2SendStalled()) return
   g2ContentLastSent = content
   // スクロールは refreshG2 を通さずに scrollOffset を動かすので、待機中の full render の
   // スナップショットはここで古くなる (sendContentDirect と同じ理由)。
@@ -1796,6 +2000,13 @@ async function pumpG2Sends(): Promise<void> {
   g2SendLock = true
   try {
     for (;;) {
+      // 詰まっている間は新規送信を見送る。待機枠は latest-wins なので要求はここで
+      // 積み上がらず「最新 1 件」に畳まれたまま残り、再開時に 1 回で最新が届く。
+      // バックオフが過ぎた時だけ 1 本通る (飢餓しない)。
+      if ((g2RenderPending || g2ContentQueued !== null) && g2SendsSuppressed()) {
+        console.log('[refreshG2] suppressed: unsettled bridge sends')
+        break
+      }
       // full render を優先する (content-only より新しい状態を丸ごと反映するため)
       if (g2RenderPending && !isFullRenderDeferred(performance.now())) {
         const force = g2RenderPendingForce
@@ -1813,6 +2024,7 @@ async function pumpG2Sends(): Promise<void> {
       g2ContentQueued = null
       try {
         await updateContent(content)
+        noteBridgeSendOk()
         // ここでは g2LastSentAt を進めない。強制再同期は「header/footer も含めて
         // 一度描き直す」ための時計で、content だけを送り続けるスクロール中に進めると
         // 期限が永久に来ず、取りこぼした header/footer が直らないため。
@@ -1904,7 +2116,10 @@ async function executeFullRender(force: boolean, frame: G2Frame | null = null): 
     // 強制再同期の起点は「実際に 1 本でも送れた時」だけ進める。全スキップ = レンズは
     // 既に最新のはず、という前提そのものを疑うのが強制再同期なので、ここで進めると
     // ホスト側の取りこぼしを直す機会が永久に来なくなる。
-    if (sentAny) g2LastSentAt = performance.now()
+    if (sentAny) {
+      g2LastSentAt = performance.now()
+      noteBridgeSendOk()
+    }
   } catch (err) {
     // ここで dedup 基準を一括で捨てる必要は無い: 失敗した時点より後の 3 つは
     // 更新していないので、次の要求で自然に送り直される。
@@ -2045,10 +2260,18 @@ newSessionForm.addEventListener('submit', (e) => {
   void createAndSelectSession(name)
 })
 
+// 前回の応答待ち中は重ねて叩かない (reloadClaudeSessions と同じ流儀)。サーバ応答が
+// 停滞すると、15 秒ごとのポーリングで未完了 fetch と Promise が積み上がって重くなる。
+let reloadSessionsInFlight = false
 async function reloadSessions(verbose = false): Promise<void> {
   if (!settings.serverBaseUrl || !serverProbeOk) return
+  if (reloadSessionsInFlight) return
+  reloadSessionsInFlight = true
+  // 応答が返らないまま居座るのを防ぐ上限。時間切れで必ず in-flight が解ける。
+  const ctrl = new AbortController()
+  const timeout = setTimeout(() => ctrl.abort(), 10_000)
   try {
-    lastSessions = await client.listSessions()
+    lastSessions = await client.listSessions(ctrl.signal)
     if (verbose) log(`sessions: ${lastSessions.map((s) => s.name).join(', ') || '(none)'}`)
     if (lastSessions.length > 0 && !lastSessions.some((s) => s.name === settings.sessionName)) {
       if (isRespondFlowActive()) {
@@ -2071,7 +2294,10 @@ async function reloadSessions(verbose = false): Promise<void> {
     paintStatus()
     if (phase === 'rootlist') void refreshG2(true)
   } catch (e) {
-    log(`listSessions error: ${(e as Error).message}`)
+    if ((e as DOMException).name !== 'AbortError') log(`listSessions error: ${(e as Error).message}`)
+  } finally {
+    clearTimeout(timeout)
+    reloadSessionsInFlight = false
   }
 }
 
@@ -4200,6 +4426,9 @@ async function changeLanguage(lang: Language): Promise<void> {
     void probeServer()
   }
   await persistSettings()
+  // 整形済みのチャット行には言語依存の行 (長文の省略表示) が混ざるので作り直す。
+  // 次のポーリングを待つと、切り替えた直後の 1 画面だけ前の言語のまま出てしまう。
+  rebuildChatLinesCache()
   // G2 レンズも「言語切替」を 1 つの画面遷移と扱って rebuildPageContainer で再描画。
   // プラグイン遷移中は描かない (refreshG2 と同じ理由: 「接続中」を上書きしてしまう)。
   if (bridge && !pluginNavBlocksG2Render) {
@@ -4246,6 +4475,8 @@ async function boot(): Promise<void> {
     initRenderer(bridge)
     // renderer 内から出る例外的な送信 (復帰後ガード再描画) も、この 1 本の直列路を通す
     setRendererExclusiveSender(runExclusiveG2Send)
+    // 時間切れで諦めた送信の会計を受け取り、詰まっている間は新規送信を見送る
+    setRendererStallHooks({ onTimeout: onBridgeSendTimeout, onLateSettle: onBridgeSendLateSettle })
     // 取り込み (performTakeover) の直前に no-op へ差し替えるので、取り込みに失敗して
     // headlenss に戻る時に同じ内容を再登録できるよう、登録処理を関数で持っておく。
     const installHandlers = (): void => setEventHandlers({

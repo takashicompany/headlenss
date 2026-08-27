@@ -53,6 +53,10 @@ const STRINGS = {
   // tmux の画面が塞がっていると、キーは撃てても会話には入らない。
   chatDeliveryUnconfirmed: { en: '(!) It looks like your message did not arrive. Check the tmux screen.',
                              ja: '(!) 届いていないようです。tmux の画面を確認してください。' },
+  // チャット 1 発言が長すぎる時、表示用に切り詰めた末尾へ添える行。
+  // 折り返し (px 計測) のコストを 1 発言あたりで頭打ちにするための制限であることが
+  // 読み手に伝わるよう、元の文字数を必ず出す。
+  chatMsgTruncated:    { en: '… ({total} chars total)',         ja: '… (全{total}文字)' },
   rootListEmpty:       { en: '(no agent session)\n\nStart agent or Codex inside tmux',
                          ja: '(エージェントが動いている tmux が無い)\n\ntmux 内でエージェントを起動してください' },
 
