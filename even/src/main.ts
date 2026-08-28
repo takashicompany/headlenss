@@ -61,11 +61,9 @@ import {
 import {
   closeMic,
   initMic,
-  micGenIsCurrent,
   micHealth,
   micIsHeld,
   openMic,
-  resetMicAtBoot,
 } from './mic'
 import { SpeechmaticsRT } from './speechmatics-rt'
 import {
@@ -241,11 +239,6 @@ let rtSession: SpeechmaticsRT | null = null
 let liveTranscript = '' // 録音中のpartial+final結合表示用
 let recordingReady = false // RT接続+G2マイク起動が完了して実際に音声を取り始めたか
 /**
- * いま録音に使っているマイクの世代。PCM の受け口はこれと一致する時しか流さない。
- * 古い録音のマイクが遅れて音を吐いても、新しい録音の文字起こしに混ぜない。
- */
-let recordingMicGen = -1
-/**
  * 'finalizing' / 'sending' に入った時刻。この 2 状態は操作を一切受け付けないので、
  * 居座りが長引いたらタップ 1 回で強制的に抜けられるようにするための計測点。
  */
@@ -257,26 +250,6 @@ let blockingPhaseSince = 0
 let recoveryEpoch = 0
 /** 'finalizing'/'sending' の居座りをタップで打ち切るまでの猶予。 */
 const BLOCKING_PHASE_ESCAPE_MS = 3000
-/** マイク解放を待つ上限。ここを超えたら解放は投げっぱなしにして先へ進む。 */
-const MIC_CLOSE_WAIT_MS = 1500
-
-/**
- * マイク解放を待つが、上限を超えたら待つのをやめて先へ進む。
- * 解放そのものは mic.ts の直列キューに残るので、遅れて決着したらそこで反映される。
- * 「確定中」表示がホストの無応答に引きずられて何十秒も居座るのを断つのが目的。
- */
-async function closeMicWithLimit(reason: string): Promise<void> {
-  const done = closeMic(reason).then(() => 'done' as const, () => 'done' as const)
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const limit = new Promise<'timeout'>((resolve) => {
-    timer = setTimeout(() => resolve('timeout'), MIC_CLOSE_WAIT_MS)
-  })
-  const which = await Promise.race([done, limit])
-  if (timer !== undefined) clearTimeout(timer)
-  if (which === 'timeout') {
-    diag(`mic: ${reason} の解放が ${MIC_CLOSE_WAIT_MS}ms で決着しないので待たずに進みます`)
-  }
-}
 // 確定待ちのテキストを「録音1回ぶん = 1文」単位で配列管理する。
 // pending 中に追加クリック → 新たな録音 → 末尾に append。
 // 下スクロールで末尾の1文だけ削除。
@@ -3118,7 +3091,6 @@ async function startRecording(): Promise<void> {
   recordingLinesCacheKey = ''
   liveTranscript = ''
   recordingReady = false
-  recordingMicGen = -1
   durationEl.textContent = '0.0s'
   resetScroll()
 
@@ -3131,7 +3103,7 @@ async function startRecording(): Promise<void> {
 
   // 2. Speechmatics RT 接続 + マイク起動 を非同期で進める。
   //    途中でユーザが停止した場合に二重起動を防ぐため、session 同一性で gard する。
-  //    マイクの取得/解放は mic.ts の直列キュー経由なので、ここで bridge は掴まない。
+  //    マイクの取得/解放は mic.ts 経由なので、ここで bridge は掴まない。
   const session = new SpeechmaticsRT()
   rtSession = session
 
@@ -3203,26 +3175,23 @@ async function startRecording(): Promise<void> {
     }
 
     // 3. G2マイク開始
-    //    失敗 (false / 例外 / 時間切れ) の場合、openMic が補償の解放まで済ませて返す。
-    //    ここで畳むだけでよく、マイクが握られたまま残ることはない。
-    const { ok, gen, reason } = await openMic()
+    //    締切は置かない。実機は取得に数秒かかることがあり、待たずに見切ると
+    //    「実機は開いたのにアプリだけ失敗扱い」になる。失敗は例外の時だけ。
+    const { ok, reason } = await openMic()
     if (!ok) {
       dumpMicHealth(`open-failed:${reason}`)
       revertToIdle(t('g2NoticeRecFailMic'))
       return
     }
     // 取得を待っている間に停止/畳み込みが入っていないか。
-    // phase だけでなくマイクの世代も見る (取得の後に解放要求が積まれていたら、
-    // その解放はキューで既に流れているか、これから流れる)。
-    if (!micGenIsCurrent(gen) || rtSession !== session || phase !== 'recording') {
+    if (rtSession !== session || phase !== 'recording') {
       log('mic: 取得できた時には録音が終わっていました — 解放してから畳みます')
       if (rtSession === session) rtSession = null
       try { session.abort() } catch { /* ignore */ }
-      await closeMicWithLimit('stale-after-open')
+      await closeMic('stale-after-open')
       return
     }
     // 接続&マイク起動完了 → レンズ表示を「録音中」に切り替え
-    recordingMicGen = gen
     recordingReady = true
     dumpMicHealth('recording-started')
     void refreshG2(true)
@@ -3284,10 +3253,9 @@ async function stopRecordingToPending(): Promise<void> {
   void refreshG2(true)
 
   try {
-    // G2マイク停止 (直列キュー経由。戻り値まで見て、駄目なら 1 回だけ出し直す)。
-    // ホストが無応答でも 1.5 秒で待つのをやめる。解放そのものはキューに残るので、
-    // 「確定中」表示がホストの都合で何十秒も居座ることだけを断つ。
-    await closeMicWithLimit('stop')
+    // G2マイク停止。締切は置かずに決着まで待つ。万一ここで固まっても、
+    // 一定時間後のタップが 'finalizing' を強制的に畳む脱出口になっている。
+    await closeMic('stop')
     if (abandonIfSessionSwitched('マイク停止後')) return
 
     /** 録音終了時の戻り先を決める共通ハンドラ。
@@ -3508,8 +3476,7 @@ async function abortRecording(): Promise<void> {
     // 「中止したのに録音画面のまま何も効かない」時間がそのまま生まれる。
     stopRecordingTimer()
     recordingReady = false
-    recordingMicGen = -1
-    // RT セッションを破棄 (final 結果は受け取らない)。
+      // RT セッションを破棄 (final 結果は受け取らない)。
     const rt = wasRecording ? rtSession : orphanRt
     if (rt) {
       if (rtSession === rt) rtSession = null
@@ -3545,9 +3512,8 @@ async function abortRecording(): Promise<void> {
       updatePendingUI()
     }
 
-    // G2 マイク停止。待つのは上限つきで、超えたら投げっぱなしにする
-    // (解放そのものは mic.ts の直列キューに残り、そこで決着する)。
-    await closeMicWithLimit('abort')
+    // G2 マイク停止。画面はこの前に畳み終えているので、ここで待っても操作は塞がらない。
+    await closeMic('abort')
   } finally {
     // 例外で抜けても 'recording' に固着させない。
     if (phase === 'recording') {
@@ -3578,7 +3544,6 @@ function forceResetBlockedPhase(): void {
   blockingPhaseSince = 0
   stopRecordingTimer()
   recordingReady = false
-  recordingMicGen = -1
   const rt = rtSession
   rtSession = null
   if (rt) { try { rt.abort() } catch { /* ignore */ } }
@@ -4059,8 +4024,7 @@ function completeRespondFlow(pendingId: string): void {
  */
 function discardRespondRecording(): void {
   stopRecordingTimer()
-  // 投げっぱなしにはしない: closeMic は直列キューに積まれ、戻り値の検査と
-  // 出し直しまで mic.ts 側で決着する (ここは同期の後始末なので待たないだけ)。
+  // ここは同期の後始末なので待たない (解放そのものは出しっぱなしで決着させる)。
   // マイクを握っていなければ実機へは何も出ない。
   if (micIsHeld()) void closeMic('discard-respond')
   rtSession?.abort()
@@ -4072,7 +4036,6 @@ function discardRespondRecording(): void {
   liveTranscript = ''
   durationEl.textContent = '0.0s'
   recordingReady = false
-  recordingMicGen = -1
 }
 
 /** 送信失敗の表示を消す (ユーザが次の操作をした時 / フローを畳む時)。 */
@@ -4671,14 +4634,10 @@ async function boot(): Promise<void> {
     log('Even bridge not available — このアプリはG2 SDK経由でしか動作しません')
   }
 
-  // マイクの状態機械を接続する。前回セッションがマイクを握ったまま終わっていると
-  // 実機側は開きっぱなしのことがあるので、起動時に 1 回だけ解放を出しておく
-  // (失敗は無視。ここで待つと起動が遅れるので待たない)。
+  // マイクの呼び出し口を接続する。起動時に投機的な解放は撃たない
+  // (起動直後の audioControl がそのまま最初の録音開始の足を引っ張るため)。
   initMic({ bridge: () => bridge, log })
   diag(`boot: bridge=${bridge ? 'ok' : 'none'} ua=${navigator.userAgent.slice(0, 80)}`)
-  if (bridge) {
-    void resetMicAtBoot().then(() => dumpMicHealth('boot-reset'))
-  }
 
   // ページごと消える経路 (WebView 破棄 / 遷移) の保険。
   // SDK のイベントが来ないまま消えることがあり、その時はマイクも ASR 接続も
@@ -4770,11 +4729,8 @@ async function boot(): Promise<void> {
         }
       },
       onAudio: (pcm) => {
-        // 「録音画面である」だけでは足りない。マイクの取得が済んでいない間や、
-        // 古い録音のマイクが遅れて音を吐いている間に流すと、次の録音の文字起こしに
-        // 前の録音の音が混ざる。準備完了かつ *今の* マイク世代の音だけを通す。
+        // 録音画面で、かつ取得が済んで実際に録り始めている時だけ音を通す。
         if (phase !== 'recording' || !recordingReady) return
-        if (!micGenIsCurrent(recordingMicGen)) return
         trackPcmFrame(pcm)
         rtSession?.send(pcm)
       },
