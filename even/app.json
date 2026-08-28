@@ -2,7 +2,7 @@
   "package_id": "company.takashi.headlenss",
   "edition": "202601",
   "name": "HeadLenss",
-  "version": "2.7.7",
+  "version": "2.7.8",
   "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.9",
   "description": "Voice-driven Claude Code controller. G2 mic -> Speechmatics -> headlenss server (tmux send-keys).",
