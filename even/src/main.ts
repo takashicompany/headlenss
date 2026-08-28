@@ -6,6 +6,8 @@ import {
   getPcmByteLength,
   getRecordingSeconds,
   resetPcmCounter,
+  startRecordingClock,
+  stopRecordingClock,
   trackPcmFrame,
 } from './audio'
 import { onEvenHubEvent, setEventHandlers, setScrollCooldownMs } from './events'
@@ -64,6 +66,7 @@ import {
   micHealth,
   micIsHeld,
   openMic,
+  resetMicState,
 } from './mic'
 import { SpeechmaticsRT } from './speechmatics-rt'
 import {
@@ -86,6 +89,12 @@ const BRIDGE_TIMEOUT_MS = 4000
 // 実機で 30 秒を超えて録音し続けられることを確認したため、両方とも廃止した。
 // SDK の audioControl にも録音長の上限は明記されていない。
 const MIN_RECORDING_SEC = 0.2
+// マイク取得の決着を待つ上限。実機は応答を返さないことがあるので、
+// ここを過ぎたら未決着のまま録音を続ける (未決着 = 失敗ではない)。
+const MIC_OPEN_SETTLE_MS = 2000
+// マイク解放の決着を待つ上限。ここを過ぎたら解放はバックグラウンドに任せ、
+// 停止処理 (ASR 確定 → 送信) を先に進める。
+const MIC_CLOSE_WAIT_MS = 2000
 const HISTORY_LIMIT = 20
 const PROBE_DEBOUNCE_MS = 500
 const SESSIONS_REFRESH_MS = 15000
@@ -499,6 +508,22 @@ const bootSerial = (() => {
  */
 function diag(msg: string): void {
   emitLog(`#${bootSerial} ${msg}`, true)
+}
+
+/**
+ * 決着するか分からない Promise を締切付きで待つ。
+ * 締切を過ぎたら null を返して呼び出し側を先へ進める (元の Promise は
+ * バックグラウンドで決着させてよい)。ホストの返事に処理をぶら下げないための道具。
+ */
+function settleWithin<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  let done = false
+  const tracked = p.then((v) => { done = true; return v })
+  return Promise.race([
+    tracked,
+    new Promise<null>((resolve) => {
+      setTimeout(() => { if (!done) resolve(null) }, ms)
+    }),
+  ])
 }
 
 /** マイク周りの健康状態を 1 行だけ吐く (録音のライフサイクルの節目で呼ぶ)。 */
@@ -3095,7 +3120,10 @@ async function startRecording(): Promise<void> {
   resetScroll()
 
   // 1. UI を即座に recording 画面へ遷移 (体感ラグを減らす)
+  //    録音時間はここを起点にした経過時間で数える。受信 PCM のバイト数から
+  //    割り出すと、ホストがマイクを開けなかった時に 0.0s のまま止まって見える。
   phase = 'recording'
+  startRecordingClock()
   startRecordingTimer()
   paintStatus()
   updateRecordButton()
@@ -3175,23 +3203,29 @@ async function startRecording(): Promise<void> {
     }
 
     // 3. G2マイク開始
-    //    締切は置かない。実機は取得に数秒かかることがあり、待たずに見切ると
-    //    「実機は開いたのにアプリだけ失敗扱い」になる。失敗は例外の時だけ。
-    const { ok, reason } = await openMic()
-    if (!ok) {
-      dumpMicHealth(`open-failed:${reason}`)
-      revertToIdle(t('g2NoticeRecFailMic'))
-      return
+    //    取得は出すが、その決着に録音をぶら下げない。実機は audioControl(true) の
+    //    応答を返さないことがあり、待ち続けると録音そのものが固まる
+    //    (タイマー 0.0s / 音が入らない / 停止も効かない)。PCM が届く経路は
+    //    この応答とは別なので、決着しないまま音だけ来ることもある。
+    //    少しだけ待って、決着しなくてもそのまま録音を続ける。
+    const openResult = await settleWithin(openMic(), MIC_OPEN_SETTLE_MS)
+    if (openResult === null) {
+      // 未決着。失敗ではない。ここで畳むと「実機は開いているのにアプリだけ諦めた」
+      // になるので、診断だけ残して録音を続ける。
+      dumpMicHealth('open-unsettled')
+    } else if (!openResult.ok) {
+      // 例外 / 多重取得。これも録音は止めない (実機が開いていることがある)。
+      dumpMicHealth(`open-not-ok:${openResult.reason}`)
     }
-    // 取得を待っている間に停止/畳み込みが入っていないか。
+    // 待っている間に停止/畳み込みが入っていないか。
     if (rtSession !== session || phase !== 'recording') {
-      log('mic: 取得できた時には録音が終わっていました — 解放してから畳みます')
+      log('mic: 取得を待っている間に録音が終わっていました — 解放してから畳みます')
       if (rtSession === session) rtSession = null
       try { session.abort() } catch { /* ignore */ }
-      await closeMic('stale-after-open')
+      void closeMic('stale-after-open', MIC_CLOSE_WAIT_MS)
       return
     }
-    // 接続&マイク起動完了 → レンズ表示を「録音中」に切り替え
+    // レンズ表示を「録音中」に切り替え (取得の決着は待たない)
     recordingReady = true
     dumpMicHealth('recording-started')
     void refreshG2(true)
@@ -3245,6 +3279,7 @@ async function stopRecordingToPending(): Promise<void> {
   }
 
   stopRecordingTimer()
+  stopRecordingClock()   // 録音長はここで確定 (以降の待ち時間は録音に数えない)
   recordingReady = false
   phase = 'finalizing'
   blockingPhaseSince = Date.now()
@@ -3253,9 +3288,12 @@ async function stopRecordingToPending(): Promise<void> {
   void refreshG2(true)
 
   try {
-    // G2マイク停止。締切は置かずに決着まで待つ。万一ここで固まっても、
-    // 一定時間後のタップが 'finalizing' を強制的に畳む脱出口になっている。
-    await closeMic('stop')
+    // G2マイク停止。決着は待ちきらない。ホストが応答を返さないことがあり、
+    // 待ち続けると「停止を押しても固まったまま」になる。喋った内容の確定・送信を
+    // マイクの解放にぶら下げない。解放そのものはバックグラウンドで決着させる。
+    if (!await closeMic('stop', MIC_CLOSE_WAIT_MS)) {
+      dumpMicHealth('stop-close-unsettled')
+    }
     if (abandonIfSessionSwitched('マイク停止後')) return
 
     /** 録音終了時の戻り先を決める共通ハンドラ。
@@ -3475,6 +3513,7 @@ async function abortRecording(): Promise<void> {
     // マイク解放はホスト次第でいくらでも待たされる。それを待ってから畳むと
     // 「中止したのに録音画面のまま何も効かない」時間がそのまま生まれる。
     stopRecordingTimer()
+    stopRecordingClock()
     recordingReady = false
       // RT セッションを破棄 (final 結果は受け取らない)。
     const rt = wasRecording ? rtSession : orphanRt
@@ -3512,8 +3551,11 @@ async function abortRecording(): Promise<void> {
       updatePendingUI()
     }
 
-    // G2 マイク停止。画面はこの前に畳み終えているので、ここで待っても操作は塞がらない。
-    await closeMic('abort')
+    // G2 マイク停止。画面はこの前に畳み終えているが、決着まで待つと
+    // 「取得中」の内部状態が残り続けるので、ここも締切付きで待つ。
+    await closeMic('abort', MIC_CLOSE_WAIT_MS)
+    // 未決着の取得が残っていたらここで解く。残すと次のタップで取得が出せない。
+    resetMicState('abort')
   } finally {
     // 例外で抜けても 'recording' に固着させない。
     if (phase === 'recording') {
@@ -3543,12 +3585,15 @@ function forceResetBlockedPhase(): void {
   recoveryEpoch++
   blockingPhaseSince = 0
   stopRecordingTimer()
+  stopRecordingClock()
   recordingReady = false
   const rt = rtSession
   rtSession = null
   if (rt) { try { rt.abort() } catch { /* ignore */ } }
   // マイクは投げっぱなしで解放する (ここで待つと脱出口の意味がない)。
-  if (micIsHeld()) void closeMic('stuck-reset')
+  if (micIsHeld()) void closeMic('stuck-reset', MIC_CLOSE_WAIT_MS)
+  // 未決着の取得が残っていると次のタップで取得を出せない。手元だけで解く。
+  resetMicState('stuck-reset')
   liveTranscript = ''
   durationEl.textContent = '0.0s'
   if (phase === 'sending') {
@@ -4649,6 +4694,7 @@ async function boot(): Promise<void> {
       try { rt.abort() } catch { /* ignore */ }
     }
     if (micIsHeld()) void closeMic('pagehide')
+    resetMicState('pagehide')
   })
 
   // G2 プラグインから戻ってきた場合、ホスト側セッションにはプラグインのコンテナが
@@ -4729,8 +4775,11 @@ async function boot(): Promise<void> {
         }
       },
       onAudio: (pcm) => {
-        // 録音画面で、かつ取得が済んで実際に録り始めている時だけ音を通す。
-        if (phase !== 'recording' || !recordingReady) return
+        // 録音画面にいる間は無条件で音を通す。マイク取得の決着を条件にすると、
+        // ホストが応答を返さない時に届いている音まで捨ててしまう
+        // (PCM の経路は audioControl の応答とは別)。ASR 側は接続前なら
+        // rtSession?.send() が黙って捨てるので、ここで守る必要は無い。
+        if (phase !== 'recording') return
         trackPcmFrame(pcm)
         rtSession?.send(pcm)
       },
@@ -4772,15 +4821,20 @@ async function boot(): Promise<void> {
       onAppExit: (kind) => {
         diag(`${kind} — foreground exit と同じ後始末をします`)
         if (phase === 'recording' || micIsHeld() || rtSession) void abortRecording()
+        // 未決着の取得を握ったまま終わらせない (次の起動まで残ることがある)。
+        resetMicState('app-exit')
         resetPageState()
       },
       onLog: (msg) => log(msg),
     })
     reinstallG2EventHandlers = installHandlers
     installHandlers()
+    // イベント購読は初回描画より先に済ませる。描画の後ろに置くと、描画が 1 回
+    // タイムアウトしただけで購読ごと飛ばされ、以後タップも音声も一切届かない
+    // (画面は出ているのに全く反応しないアプリになる)。
+    bridge.onEvenHubEvent(onEvenHubEvent)
     try {
       await sendShowScreen(buildG2Header(), buildG2Content(), buildG2Footer())
-      bridge.onEvenHubEvent(onEvenHubEvent)
     } catch (err) {
       log(`G2 initial render error: ${err}`)
     }
