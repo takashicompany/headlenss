@@ -9,18 +9,18 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cpus, freemem, loadavg, tmpdir, totalmem } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { captureOutput, createSession, getSessionCwd, killSession, listSessions, renameSession, sendKey, sendKeys } from './tmux.ts';
+import { captureOutput, createSession, getSessionCwd, killSession, listSessions, renameSession, sendKey, sendKeys, sendTextAsPaste } from './tmux.ts';
 import { cleanupAllHeadlessEntries, handlePtyConnection } from './pty.ts';
 import { getBackendName, isAsrReady, transcribePcm16, transcribeWav } from './asr/index.ts';
 import { claudeRouter } from './claude/router.ts';
 import { codexRouter } from './codex/router.ts';
-import { detectAgentPaneTexts, detectCodexSessions, getCodexHookHealth, invalidateCodexDetectCache } from './codex/status.ts';
+import { detectAgentPaneTexts, detectCodexSessions, getCodexHookHealth, invalidateCodexDetectCache, isCodexPermissionPrompt } from './codex/status.ts';
 import { detectClaudeSessions, invalidateClaudeDetectCache } from './claude/process-detect.ts';
 import { detectLiveOwners, invalidateLiveOwnerCache } from './claude/live-owner.ts';
 import * as claudeStore from './claude/store.ts';
 import { sanitizeChatText } from './claude/transcript.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot, stopPeriodicSnapshot } from './persist.ts';
-import { createDelivery, getDeliveryWarning, markDeliveryFailed, markDeliveryInjected, pruneDeliveries } from './uiSubmissions.ts';
+import { createDelivery, getDeliveryState, getDeliveryWarning, markDeliveryFailed, markDeliveryInjected, pruneDeliveries, type DeliveryState } from './uiSubmissions.ts';
 import {
   deleteSessionStatusObservation,
   pickEffectiveSource,
@@ -432,6 +432,75 @@ async function acquireTmuxLockWithWait(name: string): Promise<boolean> {
   }
 }
 
+/**
+ * Codex への送信で「本文の流し込み」と「Enter」の間に置く待ち。
+ * これ自体は issue #73 の対策ではない (待ちを 2 秒に延ばしても直らないことを実測済み)。
+ * 貼り付けの反映と Enter が同じ描画フレームに重ならないようにするための保険。
+ */
+const CODEX_SUBMIT_KEY_DELAY_MS = 150;
+
+/**
+ * 送信後、送達 (ACK) を待ってから composer 残りを見るまでの時間。
+ * 受理されていれば UserPromptSubmit フックがこの間に届く。
+ */
+const CODEX_ENTER_RETRY_DELAY_MS = 3_000;
+
+/** 空白を全て落とした比較用の文字列。composer は pane 幅で折り返され行頭に余白が付くため。 */
+function squeezeSpaces(text: string): string {
+  return text.replace(/\s+/g, '');
+}
+
+/**
+ * 「送った本文がまだ composer に残っている」ことの確認。
+ * 長文の composer は pane に収まらず一部しか見えないので、本文の先頭 / 中央 / 末尾から
+ * 採った断片のどれかが見えていれば「残っている」とみなす。見えなければ追送しない
+ * (判断できない時は撃たない = 二重送信を出さない側に倒す)。
+ */
+function paneStillHoldsText(pane: string, text: string): boolean {
+  const body = squeezeSpaces(text);
+  const paneBody = squeezeSpaces(pane);
+  if (!body || !paneBody) return false;
+  const size = Math.min(24, body.length);
+  const mid = Math.max(0, Math.floor((body.length - size) / 2));
+  const samples = [body.slice(0, size), body.slice(mid, mid + size), body.slice(body.length - size)];
+  return samples.some((s) => paneBody.includes(s));
+}
+
+/**
+ * Codex 送信の最後の安全網 (issue #73)。
+ *
+ * 本文は bracketed paste で流し込むので Enter が貼り付けに食われることは無いはずだが、
+ * pane 内のアプリが bracketed paste を要求していない等で素のテキストとして届いた場合は
+ * 従来どおり Enter が食われて本文が composer に残りうる。そこで
+ *   - 送達が確認されていない (UserPromptSubmit フックが来ていない)
+ *   - Codex が動いていない (esc to interrupt が出ていない = 受理されていない)
+ *   - 許可ダイアログが出ていない (Enter が「承認」になってしまう画面では絶対に撃たない)
+ *   - 本文がまだ composer に見えている
+ * の 4 つが揃った時に限り、Enter を 1 回だけ追送する。1 送信につき 1 回だけ。
+ *
+ * 追送も tmux 単位の mutex の中で行う (応答注入や他の送信とキーを混ぜない)。
+ */
+async function retryCodexEnterIfStuck(name: string, deliveryId: string, text: string): Promise<void> {
+  const settled = (s: DeliveryState | undefined): boolean =>
+    s === undefined || s === 'confirmed' || s === 'confirmed_late';
+  if (settled(getDeliveryState(name, deliveryId))) return;
+  if (!(await acquireTmuxLockWithWait(name))) return;
+  try {
+    // ロック待ちの間に確定していることがあるので、握ってからもう一度見る。
+    if (settled(getDeliveryState(name, deliveryId))) return;
+    const pane = await captureOutput(name, 1);
+    if (/esc to interrupt/i.test(pane)) return;
+    if (isCodexPermissionPrompt(pane)) return;
+    if (!paneStillHoldsText(pane, text)) return;
+    await sendKey(name, 'Enter');
+    console.log(`[codex-send] re-sent Enter (text stayed in composer) tmux=${name} delivery=${deliveryId}`);
+  } catch (e) {
+    console.log(`[codex-send] enter retry skipped tmux=${name}: ${(e as Error).message}`);
+  } finally {
+    claudeStore.releaseRespondLock(name);
+  }
+}
+
 app.post('/api/sessions/:name/input', async (c) => {
   const name = c.req.param('name');
   const body = (await c.req.json().catch(() => ({}))) as { text?: unknown; submit?: unknown };
@@ -472,12 +541,24 @@ app.post('/api/sessions/:name/input', async (c) => {
     if (body.submit === true && isCodex) {
       const visiblePaneTail = pane.slice(-3000);
       const shouldQueueInCodex = /esc to interrupt/i.test(visiblePaneTail);
-      await sendKeys(name, body.text, false);
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      // 本文は「貼り付け」として流し込む。1 文字ずつのキーとして流すと、後段の Enter が
+      // Codex TUI の貼り付け判定に巻き込まれ、送信ではなく composer 内の改行になる
+      // (issue #73: 本文だけが入力欄に残る)。
+      await sendTextAsPaste(name, body.text);
+      await new Promise((resolve) => setTimeout(resolve, CODEX_SUBMIT_KEY_DELAY_MS));
       await sendKey(name, shouldQueueInCodex ? 'Tab' : 'Enter');
       // Tab キューに積んだ場合は、現ターンが終わる (Stop) まで受理されないので
       // 期限の考え方が変わる。その区別を送達側に渡す。
       if (deliveryId) markDeliveryInjected(name, deliveryId, { queued: shouldQueueInCodex });
+      // 追送の安全網は「今すぐ受理されるはずの送信」にだけ掛ける。Tab で積んだ分は
+      // 現ターンが終わるまで受理されないので、composer の残りからは判断できない。
+      if (deliveryId && !shouldQueueInCodex) {
+        const trackedId = deliveryId;
+        const sentText = body.text;
+        setTimeout(() => {
+          void retryCodexEnterIfStuck(name, trackedId, sentText);
+        }, CODEX_ENTER_RETRY_DELAY_MS).unref();
+      }
       return c.json({ ok: true, queued: shouldQueueInCodex, ...(deliveryId ? { deliveryId } : {}) });
     }
     await sendKeys(name, body.text, body.submit === true);
