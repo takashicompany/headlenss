@@ -2,13 +2,17 @@
   "package_id": "company.takashi.headlenss",
   "edition": "202601",
   "name": "HeadLenss",
-  "version": "2.7.10",
+  "version": "2.7.11",
   "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.9",
   "description": "Voice-driven Claude Code controller. G2 mic -> Speechmatics -> headlenss server (tmux send-keys).",
   "author": "takashicompany",
   "entrypoint": "index.html",
   "permissions": [
+    {
+      "name": "location",
+      "desc": "Provide current location to plugins opened through HeadLenss (e.g. walking guides). Location is not stored or sent to the headlenss server."
+    },
     {
       "name": "g2-microphone",
       "desc": "Capture voice input from G2 glasses microphone"
