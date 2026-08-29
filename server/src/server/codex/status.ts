@@ -147,48 +147,85 @@ export function codexPaneNeedsHookAttention(paneText: string): boolean {
   return /\/hooks|hook.+review|review.+hook|trust.+hook|hook.+trust|not trusted|skipped.+hook/i.test(paneText);
 }
 
-// ── TTL cache + singleflight for detectCodexSessions ──
+// ── pane 走査 (TTL cache + singleflight) ──
+//
+// この走査 1 回で 2 つの答えを作る:
+//   1. Codex セッションの検出結果 (従来どおり)
+//   2. tmux セッションごとの「エージェントが居る pane」のテキスト
+// 2 は画面ブロック検知 (screen-block.ts) が読む。走査済みのテキストを配るだけなので
+// tmux 呼び出しは 1 本も増えない。キャッシュ・singleflight も共有する。
+export type PaneScan = {
+  codexSessions: DetectedCodexSession[];
+  /** tmux セッション名 -> エージェント pane の capture-pane テキスト。 */
+  paneTextBySession: Map<string, string>;
+};
+
 const DETECT_TTL_MS = 2500;
-let codexDetectCache: { result: DetectedCodexSession[]; expiresAt: number } | null = null;
-let codexDetectInFlight: Promise<DetectedCodexSession[]> | null = null;
+let paneScanCache: { result: PaneScan; expiresAt: number } | null = null;
+let paneScanInFlight: Promise<PaneScan> | null = null;
 // Generation counter: incremented on invalidation. An in-flight scan captures
 // the generation at start and only writes its result to the cache when the
 // generation still matches — preventing a stale scan that started before an
 // invalidation from overwriting the (now-null) cache after it.
-let codexDetectGeneration = 0;
+let paneScanGeneration = 0;
 
-/** Invalidate the detect cache so the next call triggers a fresh scan. */
+/** Invalidate the pane scan cache so the next call triggers a fresh scan. */
 export function invalidateCodexDetectCache(): void {
-  codexDetectGeneration++;
-  codexDetectCache = null;
+  paneScanGeneration++;
+  paneScanCache = null;
 }
 
-export async function detectCodexSessions(): Promise<DetectedCodexSession[]> {
+async function scanPanes(): Promise<PaneScan> {
   const now = Date.now();
-  if (codexDetectCache && now < codexDetectCache.expiresAt) {
-    return codexDetectCache.result;
+  if (paneScanCache && now < paneScanCache.expiresAt) {
+    return paneScanCache.result;
   }
-  if (codexDetectInFlight) return codexDetectInFlight;
-  const genAtStart = codexDetectGeneration;
-  codexDetectInFlight = detectCodexSessionsUncached().then(
+  if (paneScanInFlight) return paneScanInFlight;
+  const genAtStart = paneScanGeneration;
+  paneScanInFlight = scanPanesUncached().then(
     (result) => {
       // Only cache if no invalidation occurred since scan started
-      if (codexDetectGeneration === genAtStart) {
-        codexDetectCache = { result, expiresAt: Date.now() + DETECT_TTL_MS };
+      if (paneScanGeneration === genAtStart) {
+        paneScanCache = { result, expiresAt: Date.now() + DETECT_TTL_MS };
       }
-      codexDetectInFlight = null;
+      paneScanInFlight = null;
       return result;
     },
     (err) => {
-      codexDetectInFlight = null;
+      paneScanInFlight = null;
       throw err;
     },
   );
-  return codexDetectInFlight;
+  return paneScanInFlight;
 }
 
-async function detectCodexSessionsUncached(): Promise<DetectedCodexSession[]> {
-  console.log('[detect] scan codex');
+export async function detectCodexSessions(): Promise<DetectedCodexSession[]> {
+  return (await scanPanes()).codexSessions;
+}
+
+/**
+ * tmux セッション名 -> エージェント pane のテキスト。
+ * detectCodexSessions と同じ走査結果を配るだけで、追加の tmux 呼び出しは無い。
+ */
+export async function detectAgentPaneTexts(): Promise<Map<string, string>> {
+  return (await scanPanes()).paneTextBySession;
+}
+
+/**
+ * そのセッションで「ユーザが見ている / エージェントが居る」pane をどれだけ確からしく
+ * 名乗れるか。同じセッションに dev server 用の window を足しても、エージェントの
+ * pane を取り違えないよう順位を付けて選ぶ。
+ */
+function panePriority(command: string, isActive: boolean): number {
+  const isAgent = /\b(claude|codex)\b/i.test(command);
+  if (isAgent && isActive) return 3;
+  if (isAgent) return 2;
+  if (isActive) return 1;
+  return 0;
+}
+
+async function scanPanesUncached(): Promise<PaneScan> {
+  console.log('[detect] scan panes');
 
   let stdout = '';
   try {
@@ -196,18 +233,22 @@ async function detectCodexSessionsUncached(): Promise<DetectedCodexSession[]> {
       'list-panes',
       '-a',
       '-F',
-      '#{session_name}\t#{session_created}\t#{session_activity}\t#{pane_id}\t#{pane_current_command}\t#{pane_current_path}',
+      '#{session_name}\t#{session_created}\t#{session_activity}\t#{pane_id}\t#{pane_current_command}\t#{window_active}\t#{pane_active}\t#{pane_current_path}',
     ]);
     stdout = result.stdout;
   } catch (err) {
     const stderr = (err as { stderr?: string }).stderr ?? '';
-    if (stderr.includes('no server running') || stderr.includes('error connecting')) return [];
+    if (stderr.includes('no server running') || stderr.includes('error connecting')) {
+      return { codexSessions: [], paneTextBySession: new Map() };
+    }
     throw err;
   }
 
   const bySession = new Map<string, DetectedCodexSession>();
+  const paneTextBySession = new Map<string, string>();
+  const paneTextRank = new Map<string, number>();
   for (const line of stdout.trim().split('\n').filter(Boolean)) {
-    const [tmuxSessionName, created, activity, paneId, command, ...cwdParts] = line.split('\t');
+    const [tmuxSessionName, created, activity, paneId, command, windowActive, paneActive, ...cwdParts] = line.split('\t');
     if (!tmuxSessionName) continue;
     const cwd = cwdParts.join('\t') || homedir();
     let paneText = '';
@@ -216,6 +257,14 @@ async function detectCodexSessionsUncached(): Promise<DetectedCodexSession[]> {
     } catch {
       continue;
     }
+
+    // 画面ブロック検知用のテキスト。順位が上の pane が来たら差し替える。
+    const rank = panePriority(command ?? '', windowActive === '1' && paneActive === '1');
+    if (rank > (paneTextRank.get(tmuxSessionName) ?? -1)) {
+      paneTextRank.set(tmuxSessionName, rank);
+      paneTextBySession.set(tmuxSessionName, paneText);
+    }
+
     if (!isLikelyCodexPane(command ?? '', paneText)) continue;
     const hookHealth = getCodexHookHealth(cwd);
     bySession.set(tmuxSessionName, {
@@ -228,5 +277,8 @@ async function detectCodexSessionsUncached(): Promise<DetectedCodexSession[]> {
       needsHookAttention: codexPaneNeedsHookAttention(paneText) || hookHealth.status !== 'ok',
     });
   }
-  return [...bySession.values()].sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+  return {
+    codexSessions: [...bySession.values()].sort((a, b) => b.lastSeenAt - a.lastSeenAt),
+    paneTextBySession,
+  };
 }

@@ -49,6 +49,14 @@ const STRINGS = {
   chatStatusThinking:  { en: '(thinking…)',                     ja: '(考え中…)' },
   chatStatusWaitPerm:  { en: '(awaiting permission…)',          ja: '(承認待ち…)' },
   chatStatusWaitQ:     { en: '(awaiting question…)',            ja: '(質問待ち…)' },
+  // 送ったのにエージェントが受理した証拠 (フック) が期限内に来なかった時の注意。
+  // tmux の画面が塞がっていると、キーは撃てても会話には入らない。
+  chatDeliveryUnconfirmed: { en: '(!) It looks like your message did not arrive. Check the tmux screen.',
+                             ja: '(!) 届いていないようです。tmux の画面を確認してください。' },
+  // チャット 1 発言が長すぎる時、表示用に切り詰めた末尾へ添える行。
+  // 折り返し (px 計測) のコストを 1 発言あたりで頭打ちにするための制限であることが
+  // 読み手に伝わるよう、元の文字数を必ず出す。
+  chatMsgTruncated:    { en: '… ({total} chars total)',         ja: '… (全{total}文字)' },
   rootListEmpty:       { en: '(no agent session)\n\nStart agent or Codex inside tmux',
                          ja: '(エージェントが動いている tmux が無い)\n\ntmux 内でエージェントを起動してください' },
 
@@ -82,6 +90,9 @@ const STRINGS = {
   claudeStatusBusy:      { en: 'busy',                          ja: 'ビジー' },
   claudeStatusWaitPerm:  { en: 'awaiting permission',           ja: '承認待ち' },
   claudeStatusWaitQ:     { en: 'awaiting question',             ja: '質問待ち' },
+  // 対話ウィザード等が tmux の画面を占有していて、送ったメッセージが会話に届かない状態。
+  // status ではなく別フラグ (screenBlocked) から出す。
+  claudeStatusBlocked:   { en: 'screen blocked',                ja: '画面が塞がっています' },
   claudeKillConfirm:     { en: 'Kill session "{name}"?',        ja: 'セッション "{name}" を終了しますか?' },
   claudeKillConfirmBtn:  { en: 'Confirm?',                      ja: '確定?' },
   claudeKillingBtn:      { en: 'Killing…',                      ja: '停止中…' },
@@ -162,6 +173,16 @@ const STRINGS = {
   g2HeadSending:      { en: 'Sending',                          ja: '送信中' },
   g2HeadCcResponse:   { en: 'Agent Prompt',                    ja: 'エージェント応答' },
   g2HeadError:        { en: 'Error',                            ja: 'エラー' },
+  // 画面ブロック時のヘッダ。前にセッション名を足すので短く保つ (長いと名前が削られる)。
+  // マークは丸括弧で囲った全角「！」。⚠ は G2 レンズのフォントに収録されておらず、
+  // 幅の実測が置換文字と同じ = 実体が無い (レンズでは空白に見える) ため使わない。
+  // 括弧で囲むのは、文中の句読点ではなく「印」だと一目で分かるようにするため。
+  g2HeadBlocked:      { en: '(!) Check terminal',               ja: '(!) ターミナルを確認' },
+  // 回答待ちのヘッダ。g2HeadBlocked と同じ流儀 (セッション名の後ろに置いて点滅させる) なので
+  // 同じく短く保つ。マークは両方とも丸括弧の「?」。⏸ は G2 レンズのフォントに収録されて
+  // いない疑いがある (Issue #72) ので使わない。質問待ち/承認待ちの区別は文言で伝える。
+  g2HeadWaitQ:        { en: '(?) Question waiting',             ja: '(?) 質問待ち' },
+  g2HeadWaitPerm:     { en: '(?) Approval waiting',             ja: '(?) 承認待ち' },
 
   // ─── G2 lens ─────────────────────────────────────────────────
   g2Booting:        { en: 'Booting…',                           ja: '起動中…' },
@@ -199,6 +220,14 @@ const STRINGS = {
   g2FootCcRespMulti:{ en: '↑↓:Pick　Tap:Toggle & Submit',          ja: '↑↓:選択　タップ:切替　Submitで確定' },
   g2FootCcRespRec:  { en: 'Tap:Done　2Tap:Cancel',                  ja: 'タップ:録音終了　2タップ:取消' },
   g2NoOutput:       { en: '(no output yet)',                    ja: '(まだ出力なし)' },
+
+  // ─── G2 一時通知 (フッタに数秒だけ出す。56半角以内) ──────────────
+  // 録音が始まらなかった理由。レンズだけを見ていても切り分けられるよう、
+  // 「音声認識サービス側」「グラスのマイク側」「それ以外」を必ず書き分ける。
+  g2NoticeRecFailAuth: { en: 'Rec start failed (auth/quota {code})', ja: '録音開始に失敗 (認証/枠 {code})' },
+  g2NoticeRecFailAsr:  { en: 'Rec start failed (ASR)',               ja: '録音開始に失敗 (音声認識)' },
+  g2NoticeRecFailMic:  { en: 'Rec start failed (mic)',               ja: '録音開始に失敗 (マイク)' },
+  g2NoticeRecFail:     { en: 'Rec start failed',                     ja: '録音開始に失敗' },
 } as const
 
 export type StringKey = keyof typeof STRINGS

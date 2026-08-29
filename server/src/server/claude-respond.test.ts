@@ -1,7 +1,12 @@
 import { strict as assert } from 'node:assert';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
-import { claudeRouter } from './claude/router.ts';
+import { claudeRouter, setTranscriptTailReaderForTest } from './claude/router.ts';
 import * as store from './claude/store.ts';
+import { readTailLines } from './claude/transcript.ts';
 import type { AskQuestion } from './claude/types.ts';
 
 const NAME = 'respond-test';
@@ -333,4 +338,183 @@ test('60 秒以上握られたままの mutex は次の取得時に回収され�
   assert.notEqual(((await res.json()) as { code?: string }).code, 'already_processing');
   assert.equal(store.isRespondLocked(NAME), false);
   store.removeSession(NAME);
+});
+
+// ───────── 回答済みなのに残った用件の自動解消 ─────────
+//
+// TUI 回答を見張る watcher は 10 分で自死するので、それ以降に TUI で回答されると
+// pending を消す主体が居なくなる。watcher を起動しない (= 寿命切れ後と同じ) 状態を
+// 作り、閲覧時の遅延検証と Stop hook の再判定だけで消えることを確かめる。
+
+const ANS_NAME = 'answered-pending-test';
+const TOOL_USE_ID = 'toolu_test_0001';
+
+let fixtureDir = '';
+/** tool_use (+ 任意で tool_result) を含む transcript JSONL を作る。 */
+function writeTranscript(opts: { answered: boolean; toolUseId?: string }): string {
+  if (!fixtureDir) fixtureDir = mkdtempSync(join(tmpdir(), 'headlenss-pending-'));
+  const id = opts.toolUseId ?? TOOL_USE_ID;
+  const lines = [
+    JSON.stringify({ type: 'user', message: { role: 'user', content: 'ask me' } }),
+    JSON.stringify({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id, name: 'AskUserQuestion', input: {} }],
+      },
+    }),
+  ];
+  if (opts.answered) {
+    lines.push(JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: id, content: 'picked A' }],
+      },
+    }));
+  }
+  const path = join(fixtureDir, `${id}-${opts.answered ? 'answered' : 'open'}.jsonl`);
+  writeFileSync(path, `${lines.join('\n')}\n`);
+  return path;
+}
+
+/** watcher を起動せず (= 寿命切れ後と同じ) に、質問の用件だけを store に置く。 */
+function setupAnsweredCase(opts: {
+  answered: boolean;
+  ageMs: number;
+  toolUseId?: string;
+  name?: string;
+}): { id: string; transcriptPath: string } {
+  const name = opts.name ?? ANS_NAME;
+  store.removeSession(name);
+  store.upsertSession({
+    ccSessionId: 'cc-1',
+    tmuxPane: '%1',
+    tmuxSessionName: name,
+    cwd: '/tmp',
+    source: 'claude',
+  });
+  const transcriptPath = writeTranscript({ answered: opts.answered, toolUseId: opts.toolUseId });
+  const pending = store.createPending(name, {
+    kind: 'question',
+    hookEvent: 'PreToolUse',
+    toolName: 'AskUserQuestion',
+    toolInput: {},
+    questions: [SINGLE_Q],
+    toolUseId: opts.toolUseId ?? TOOL_USE_ID,
+    transcriptPath,
+  });
+  store.backdatePendingForTest(name, opts.ageMs);
+  return { id: pending.id, transcriptPath };
+}
+
+async function getPending(name = ANS_NAME): Promise<unknown> {
+  const res = await claudeRouter.request(`/claude/sessions/${name}/pending`);
+  return ((await res.json()) as { pending: unknown }).pending;
+}
+
+test('回答済みの用件は、閲覧時 (30 秒経過後) に自動で消えて返らない', async () => {
+  setupAnsweredCase({ answered: true, ageMs: 31_000 });
+  assert.equal(await getPending(), null);
+  // 表示抑止ではなく store から消えている (status も idle に戻る)
+  assert.equal(store.getPending(ANS_NAME), undefined);
+  assert.equal(store.getSession(ANS_NAME)?.status, 'idle');
+  store.removeSession(ANS_NAME);
+});
+
+test('回答済みでも 30 秒未満の用件は消さない (watcher の担当時間)', async () => {
+  const { id } = setupAnsweredCase({ answered: true, ageMs: 5_000 });
+  const pending = (await getPending()) as { id: string } | null;
+  assert.equal(pending?.id, id);
+  assert.equal(store.getPending(ANS_NAME)?.id, id);
+  store.removeSession(ANS_NAME);
+});
+
+test('tool_result が無ければ消さず、判定は 10 秒キャッシュして読み直さない', async () => {
+  const { id } = setupAnsweredCase({ answered: false, ageMs: 31_000 });
+  let reads = 0;
+  setTranscriptTailReaderForTest(async (p, n) => { reads += 1; return await readTailLines(p, n); });
+  try {
+    for (let i = 0; i < 3; i++) {
+      const pending = (await getPending()) as { id: string } | null;
+      assert.equal(pending?.id, id);
+    }
+    // 未解決と分かった後は、キャッシュが効いてポーリングのたびに読みに行かない
+    assert.equal(reads, 1);
+  } finally {
+    setTranscriptTailReaderForTest(null);
+  }
+  store.removeSession(ANS_NAME);
+});
+
+/** Stop hook は X-Tmux-Pane からセッション名を引くので、実在する pane が要る。
+ *  読み取りのみ (list-panes)。tmux が無い環境では null を返してテストをスキップする。 */
+function anyLiveTmuxPane(): { name: string; pane: string } | null {
+  try {
+    const out = execFileSync('tmux', ['list-panes', '-a', '-F', '#{session_name} #{pane_id}'], {
+      encoding: 'utf-8',
+    });
+    const first = out.split('\n').find((l) => l.trim());
+    if (!first) return null;
+    const [name, pane] = first.trim().split(' ');
+    return name && pane ? { name, pane } : null;
+  } catch {
+    return null;
+  }
+}
+
+test('Stop hook でも、回答済みの用件は消える (年齢の閾値は見ない)', async (t) => {
+  // Stop は「ターンが終わった」= 決着済みの有力な契機なので、若い用件でも判定する。
+  const live = anyLiveTmuxPane();
+  if (!live) {
+    t.skip('tmux セッションが無いのでフック経路を通せない');
+    return;
+  }
+  const { transcriptPath } = setupAnsweredCase({ answered: true, ageMs: 1_000, name: live.name });
+  const res = await claudeRouter.request('/hooks/stop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Tmux-Pane': live.pane },
+    body: JSON.stringify({ transcript_path: transcriptPath, last_assistant_message: '' }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal(store.getPending(live.name), undefined);
+  store.removeSession(live.name);
+});
+
+test('別の用件 (別 toolUseId) は巻き込まれない', async () => {
+  // 回答済みの transcript を持つ用件の直後に、まだ答えの無い別の用件が来た状況。
+  setupAnsweredCase({ answered: true, ageMs: 31_000 });
+  const openPath = writeTranscript({ answered: false, toolUseId: 'toolu_test_0002' });
+  const next = store.createPending(ANS_NAME, {
+    kind: 'question',
+    hookEvent: 'PreToolUse',
+    toolName: 'AskUserQuestion',
+    toolInput: {},
+    questions: [SINGLE_Q],
+    toolUseId: 'toolu_test_0002',
+    transcriptPath: openPath,
+  });
+  store.backdatePendingForTest(ANS_NAME, 31_000);
+  const pending = (await getPending()) as { id: string } | null;
+  assert.equal(pending?.id, next.id);
+  store.removeSession(ANS_NAME);
+});
+
+test('回答済みの用件が消えても、別セッションの用件は残る', async () => {
+  setupAnsweredCase({ answered: true, ageMs: 31_000 });
+  const other = setupAnsweredCase({
+    answered: false,
+    ageMs: 31_000,
+    toolUseId: 'toolu_test_0003',
+    name: OTHER,
+  });
+  assert.equal(await getPending(), null);
+  const otherPending = (await getPending(OTHER)) as { id: string } | null;
+  assert.equal(otherPending?.id, other.id);
+  store.removeSession(ANS_NAME);
+  store.removeSession(OTHER);
+});
+
+test.after(() => {
+  if (fixtureDir) rmSync(fixtureDir, { recursive: true, force: true });
 });

@@ -7,7 +7,7 @@ import type {
   Pending,
   SessionStatus,
 } from './types.ts';
-import { clearUiSubmissions } from '../uiSubmissions.ts';
+import { clearDeliveries } from '../uiSubmissions.ts';
 
 const sessions = new Map<string, ClaudeSession>();
 const pendingResolvers = new Map<string, (decision: HookDecision) => void>();
@@ -66,7 +66,7 @@ export function removeSession(tmuxName: string): void {
     }
   }
   sessions.delete(tmuxName);
-  clearUiSubmissions(tmuxName);
+  clearDeliveries(tmuxName);
 }
 
 export function appendChat(
@@ -133,6 +133,13 @@ export function createPending(
 
 export function getPending(tmuxName: string): Pending | undefined {
   return sessions.get(tmuxName)?.pending;
+}
+
+/** テスト用: pending の作成時刻を巻き戻す (時間経過を待たずに再現するため)。 */
+export function backdatePendingForTest(tmuxName: string, ageMs: number): void {
+  const p = sessions.get(tmuxName)?.pending;
+  if (!p) return;
+  p.createdAt = Date.now() - ageMs;
 }
 
 export function clearPending(tmuxName: string): void {

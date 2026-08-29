@@ -6,10 +6,13 @@ import {
   getPcmByteLength,
   getRecordingSeconds,
   resetPcmCounter,
+  startRecordingClock,
+  stopRecordingClock,
   trackPcmFrame,
 } from './audio'
 import { onEvenHubEvent, setEventHandlers, setScrollCooldownMs } from './events'
 import {
+  HEADER_INNER_WIDTH,
   initRenderer,
   isPageBuilt,
   MAIN_INNER_WIDTH,
@@ -17,6 +20,7 @@ import {
   resetPageState,
   setRendererExclusiveSender,
   setRendererLog,
+  setRendererStallHooks,
   showScreen,
   updateContent,
   updateFooter,
@@ -36,6 +40,7 @@ import {
   type AgentSource,
   type ChatItem,
   type ClaudeSessionInfo,
+  type DeliveryWarning,
   type G2PluginInfo,
   type Pending,
   type Session,
@@ -55,6 +60,14 @@ import {
   type OperatingPoint,
   type Settings,
 } from './settings'
+import {
+  closeMic,
+  initMic,
+  micHealth,
+  micIsHeld,
+  openMic,
+  resetMicState,
+} from './mic'
 import { SpeechmaticsRT } from './speechmatics-rt'
 import {
   applyTranslations,
@@ -64,6 +77,18 @@ import {
   t,
   type Language,
 } from './i18n'
+import { installOneShotTimerGuard } from './timer-guard'
+
+// SDK (0.0.10 以降) の one-shot タイマーは、ホストの __tickShadowTimers と
+// 実タイマーの両方から発火することがある = 1 回のはずの処理が 2 回走る。
+// clearTimeout では防げない (詳細は timer-guard.ts)。ここで包んで「高々 1 回」にする。
+//
+// 呼ぶ位置が重要:
+//   ・SDK の import より後 … SDK は import 時に window.setTimeout を差し替えるので、
+//                            先に包むと上書きされて無意味になる。
+//                            import は本体より先に評価されるのでこの位置なら必ず後。
+//   ・アプリが最初のタイマーを張るより前 … 下の startHistoryRenderTimer() 等より上。
+installOneShotTimerGuard()
 
 // ───────────────────────────────────────────────────────────────────────
 // 利用シーン: G2 をかけてポケットのスマホ (このWebView) で動かす。
@@ -76,6 +101,12 @@ const BRIDGE_TIMEOUT_MS = 4000
 // 実機で 30 秒を超えて録音し続けられることを確認したため、両方とも廃止した。
 // SDK の audioControl にも録音長の上限は明記されていない。
 const MIN_RECORDING_SEC = 0.2
+// マイク取得の決着を待つ上限。実機は応答を返さないことがあるので、
+// ここを過ぎたら未決着のまま録音を続ける (未決着 = 失敗ではない)。
+const MIC_OPEN_SETTLE_MS = 2000
+// マイク解放の決着を待つ上限。ここを過ぎたら解放はバックグラウンドに任せ、
+// 停止処理 (ASR 確定 → 送信) を先に進める。
+const MIC_CLOSE_WAIT_MS = 2000
 const HISTORY_LIMIT = 20
 const PROBE_DEBOUNCE_MS = 500
 const SESSIONS_REFRESH_MS = 15000
@@ -228,6 +259,18 @@ let probeDebounceTimer: ReturnType<typeof setTimeout> | null = null
 let rtSession: SpeechmaticsRT | null = null
 let liveTranscript = '' // 録音中のpartial+final結合表示用
 let recordingReady = false // RT接続+G2マイク起動が完了して実際に音声を取り始めたか
+/**
+ * 'finalizing' / 'sending' に入った時刻。この 2 状態は操作を一切受け付けないので、
+ * 居座りが長引いたらタップ 1 回で強制的に抜けられるようにするための計測点。
+ */
+let blockingPhaseSince = 0
+/**
+ * 強制脱出 (forceResetBlockedPhase) のたびに進む世代。
+ * 脱出後に元の処理が遅れて戻ってきても、新しい状態を上書きしないための目印。
+ */
+let recoveryEpoch = 0
+/** 'finalizing'/'sending' の居座りをタップで打ち切るまでの猶予。 */
+const BLOCKING_PHASE_ESCAPE_MS = 3000
 // 確定待ちのテキストを「録音1回ぶん = 1文」単位で配列管理する。
 // pending 中に追加クリック → 新たな録音 → 末尾に append。
 // 下スクロールで末尾の1文だけ削除。
@@ -315,6 +358,9 @@ let chatLinesCacheKey = ''
 let currentAgentSource: AgentSource | undefined = undefined
 // サーバから来た Agent の動作状態 (idle / busy / waiting-*)。chat 末尾の待機行に使う。
 let claudeChatStatus: string | undefined = undefined
+// 送ったのに届いた確証が得られていない直近の送信 (サーバが未確認の間だけ載せてくる)。
+// 確認できたらサーバ側で消えるので、こちらは受け取った値をそのまま持つだけでよい。
+let claudeDeliveryWarning: DeliveryWarning | null = null
 let claudePending: Pending | null = null         // 現在選択中セッションの承認/質問待ち
 let claudeChatLoading = false                    // セッション切替直後のロード中フラグ
 // refreshClaudeData の非同期レース防止: 実行中の fetch を abort し、完了時にセッション名を検証する
@@ -440,13 +486,61 @@ const client = new HeadlenssClient('')
 // 1回の log で全文を read/concat/再代入するため累積コストが二乗的になり、巨大な <pre>
 // の再レイアウトで「使うほど重く」なる。直近 LOG_MAX_LINES 行だけ保持して抑える。
 const LOG_MAX_LINES = 200
-function log(msg: string): void {
+function emitLog(msg: string, always: boolean): void {
   // 開発モードがオフ (既定) のときは画面ログを出力しない (肥大による重さを根から断つ)。
+  // 診断行 (always) だけは console には必ず残す。実機で拾えないと機序が追えない。
+  if (always) console.log(`[headlenss] ${msg}`)
   if (!settings.devMode) return
   const time = new Date().toLocaleTimeString()
   const lines = (`[${time}] ${msg}\n` + (logEl.textContent ?? '')).split('\n')
   logEl.textContent = lines.length > LOG_MAX_LINES ? lines.slice(0, LOG_MAX_LINES).join('\n') : lines.join('\n')
-  console.log(`[headlenss] ${msg}`)
+  if (!always) console.log(`[headlenss] ${msg}`)
+}
+function log(msg: string): void {
+  emitLog(msg, false)
+}
+
+/**
+ * 起動ごとの通し番号。実機のログは複数回の起動が混ざるので、
+ * どの起動の話かをこれで分ける (localStorage が使えない環境では 0 のまま)。
+ */
+const bootSerial = (() => {
+  try {
+    const next = (Number(localStorage.getItem('headlenss.bootSerial') ?? '0') || 0) + 1
+    localStorage.setItem('headlenss.bootSerial', String(next))
+    return next
+  } catch {
+    return 0
+  }
+})()
+
+/**
+ * 診断行。devMode の画面ログに加えて console にも必ず出す。
+ * 頭に起動通し番号を付けるので、実機ログを後から並べても混ざらない。
+ */
+function diag(msg: string): void {
+  emitLog(`#${bootSerial} ${msg}`, true)
+}
+
+/**
+ * 決着するか分からない Promise を締切付きで待つ。
+ * 締切を過ぎたら null を返して呼び出し側を先へ進める (元の Promise は
+ * バックグラウンドで決着させてよい)。ホストの返事に処理をぶら下げないための道具。
+ */
+function settleWithin<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  let done = false
+  const tracked = p.then((v) => { done = true; return v })
+  return Promise.race([
+    tracked,
+    new Promise<null>((resolve) => {
+      setTimeout(() => { if (!done) resolve(null) }, ms)
+    }),
+  ])
+}
+
+/** マイク周りの健康状態を 1 行だけ吐く (録音のライフサイクルの節目で呼ぶ)。 */
+function dumpMicHealth(where: string): void {
+  diag(`${micHealth()} phase=${phase} rt=${rtSession ? 'live' : 'none'} ready=${recordingReady} @${where}`)
 }
 
 // ─── Status (top bar + G2) ─────────────────────────────────────────────
@@ -547,7 +641,7 @@ function rootRowKey(row: RootRow): string {
 function rootRowSignature(): string {
   return rootRows()
     .map((r) => (r.kind === 'session'
-      ? `${rootRowKey(r)}|${r.session.status}|${r.session.source ?? ''}|${r.session.lastChat ?? ''}|${isUnread(r.session)}`
+      ? `${rootRowKey(r)}|${r.session.status}|${r.session.screenBlocked === true}|${r.session.source ?? ''}|${r.session.lastChat ?? ''}|${isUnread(r.session)}`
       : `${rootRowKey(r)}|${r.plugin.name}`))
     .join('\n')
 }
@@ -586,8 +680,19 @@ function syncRootCursor(): void {
   rootCursorKey = name ? `s:${name}` : null
 }
 
-/** Claude Code セッションの待機状態を1文字記号にする */
+/**
+ * Claude Code セッションの待機状態を1文字記号にする。
+ *
+ * 画面ブロック (対話ウィザード等が tmux の画面を占有中) は status より優先して出す。
+ * status は idle/busy のまま正しいが、その画面には送っても届かないので、
+ * 「考え中」を知らせるより「今は送れない」を知らせる方が先だという判断。
+ * (レンズの 1 行は狭く、記号は 1 枠しか置けない)
+ */
 function claudeStatusMark(s: ClaudeSessionInfo): string {
+  // 全角「！」。⚠ はレンズのフォントに無く、行に置いても空白にしか見えない。
+  // ヘッダや本文の警告は括弧付き「(！)」だが、ここは記号 1 枠ぶんしか幅が無いので
+  // 括弧は付けない (付けると 3 枠になり、名前やプレビューを押し出す)。
+  if (s.screenBlocked === true) return '！'
   switch (s.status) {
     case 'waiting-permission': return '⏸'
     case 'waiting-question': return '?'
@@ -1032,34 +1137,140 @@ function summarizeToolInput(input: unknown): string {
 
 /**
  * chatLinesCache の指紋。formatChatLines の出力を決めるのは各項目の role と text、
- * そして source (タグ表記) だけなので、それらだけを連結する。
+ * source (タグ表記)、そして言語 (長文を切り詰めた時の省略行の文言) だけなので、
+ * それらだけを連結する。
  * 文字列連結は総文字数に比例するが、グリフ幅測定を伴う整形より桁違いに安い。
  */
 function chatCacheKeyOf(items: ChatItem[], source: AgentSource | undefined): string {
-  let key = String(source)
+  let key = `${source}#${getLanguage()}`
   for (const item of items) key += `${item.role}${item.text}`
   return key
+}
+
+/** chatLinesCache を今の状態から作り直す (言語切替のように鍵の外側が変わった時に呼ぶ)。 */
+function rebuildChatLinesCache(): void {
+  chatLinesCache = formatChatLines(claudeChat, CHAT_WRAP_PX, currentAgentSource)
+  chatLinesCacheKey = chatCacheKeyOf(claudeChat, currentAgentSource)
+}
+
+// ─── グリフ幅のメモ化 ────────────────────────────────────────────────
+// pretext の getTextWidth は 1 コードポイントごとにフォント連鎖を走査し (toString +
+// `in` 判定 + カーニング表引き)、さらに Array.from で配列を作る。折り返しは全文字を
+// 何度も測るので、この素の呼び出しがチャット整形コストのほぼ全部になる。
+//
+// 幅はコードポイント単体と隣接ペアだけで決まる (LVGL のペアワイズ・カーニング) ので、
+// 「1〜2 コードポイントの文字列 → 幅」だけをメモ化すれば、任意長の文字列の幅は
+// メモの足し算で厳密に再現できる (measuredWidth 参照)。鍵が 1〜2 文字に限られる =
+// 実在する文字種ぶんで頭打ちになるので、長い会話でも辞書が肥大しない。
+// pretext 本体には手を入れない (ここはあくまで呼び出し側のラッパー)。
+const GLYPH_WIDTH_MEMO_MAX = 8000
+const glyphWidthMemo = new Map<string, number>()
+function glyphWidth(s: string): number {
+  const hit = glyphWidthMemo.get(s)
+  if (hit !== undefined) return hit
+  const w = getTextWidth(s)
+  // 上限に当たったら丸ごと捨てる。実際の文字種はふつう数百〜数千で頭打ちになるので
+  // この分岐にはまず入らない (LRU を持つ価値が無い)。
+  if (glyphWidthMemo.size >= GLYPH_WIDTH_MEMO_MAX) glyphWidthMemo.clear()
+  glyphWidthMemo.set(s, w)
+  return w
+}
+
+/**
+ * getTextWidth(text) と厳密に同じ値を、メモ化済みの 1〜2 文字ぶんの幅だけから求める。
+ *
+ * getTextWidth("ab") = adv(a→b) + adv(b→終端)、getTextWidth("b") = adv(b→終端) なので
+ * adv(a→b) = glyphWidth("ab") - glyphWidth("b")。これを全ペアで足し、末尾は
+ * glyphWidth(末尾文字) = adv(末尾→終端) を足す。すべて整数演算なので誤差は出ない。
+ */
+function measuredWidth(text: string): number {
+  let w = 0
+  let prev = ''
+  for (const ch of text) {
+    if (prev) w += glyphWidth(prev + ch) - glyphWidth(ch)
+    prev = ch
+  }
+  if (prev) w += glyphWidth(prev)
+  return w
+}
+
+/** 末尾が prev の文字列に ch を足した時の幅の増分 (カーニング込み)。 */
+function advanceWidth(prev: string, ch: string): number {
+  return prev ? glyphWidth(prev + ch) - glyphWidth(prev) : glyphWidth(ch)
+}
+
+// ─── チャット整形 ────────────────────────────────────────────────────
+/**
+ * 表示用に折り返す 1 発言あたりの最大文字数。
+ *
+ * なぜ要るか: 折り返しのコストは文字数に比例するので、1 発言の長さに上限が無いと
+ * 「エージェントが長文を吐いた瞬間だけメインスレッドが数百 ms 止まる」が起きる。
+ * 止まっている間はレンズ送信も操作も進まないので、そこから送信の時間切れ →
+ * 背圧の崩壊、と連鎖する。レンズは 7 行窓なので、この長さを超えて読める人はいない。
+ */
+const CHAT_MSG_MAX_CHARS = 4000
+
+/**
+ * 発言 1 件ぶんの折り返し結果キャッシュ。
+ *
+ * なぜ「発言単位」か: チャットは新着 1 件で 20 件窓がスライドするだけで、19 件は
+ * 前回と同じ内容のまま。窓全体を鍵にすると新着 1 件で 20 件ぶんを測り直すことになる。
+ * 発言単位で持てば、実際に測るのは新着・変更された発言だけで済む。
+ */
+const CHAT_ITEM_LINES_CACHE_MAX = 40
+const chatItemLinesCache = new Map<string, string[]>()
+
+/** 発言 1 件を行配列にする (先頭は役割タグ)。表示に出ない発言は空配列。 */
+function chatItemLines(item: ChatItem, maxWidthPx: number, agentName: string): string[] {
+  const text = item.text.replace(/\r/g, '').trim()
+  if (!text) return []
+  const total = text.length
+  // 切り口の末尾に空白が残ると、折り返し後の最終行に見えない余白が付く。落としておく。
+  const shown = total > CHAT_MSG_MAX_CHARS ? text.slice(0, CHAT_MSG_MAX_CHARS).trimEnd() : text
+  // 鍵は「出力を決めるもの」を全部含める: 折り返し幅 / 言語 (省略行の文言) /
+  // 役割 / エージェント名 (タグ表記) / 元の長さ (省略行の数値) / 表示本文。
+  // 本文は切り詰め後を使うので、巨大な発言でも鍵が上限文字数で頭打ちになる。
+  const key = `${maxWidthPx}\u0000${getLanguage()}\u0000${item.role}\u0000${agentName}\u0000${total}\u0000${shown}`
+  const hit = chatItemLinesCache.get(key)
+  if (hit) {
+    // 参照したものを最新扱いにする (窓に残り続ける発言が古い順の破棄で落ちないように)
+    chatItemLinesCache.delete(key)
+    chatItemLinesCache.set(key, hit)
+    return hit
+  }
+  const lines: string[] = [item.role === 'user' ? '[YOU]' : `[${agentName}]`]
+  for (const para of shown.split('\n')) {
+    for (const line of wrapText(para, maxWidthPx)) lines.push(line)
+  }
+  if (total > CHAT_MSG_MAX_CHARS) {
+    // 切り詰めたことを黙っていると「読み切った」と誤解されるので末尾に明示する
+    const notice = t('chatMsgTruncated').replace('{total}', String(total))
+    for (const line of wrapText(notice, maxWidthPx)) lines.push(line)
+  }
+  chatItemLinesCache.set(key, lines)
+  while (chatItemLinesCache.size > CHAT_ITEM_LINES_CACHE_MAX) {
+    const oldest = chatItemLinesCache.keys().next().value as string | undefined
+    if (oldest === undefined) break
+    chatItemLinesCache.delete(oldest)
+  }
+  return lines
 }
 
 /**
  * チャット項目を G2 レンズ用に整形。
  * 役割タグ ([YOU] / [Claude|Codex]) を独立行で挟み、タグの前に空行を入れる。
  * 生ログ (claudeChat) は書き換えず、表示時にこの関数で都度生成する。
+ * 実際の折り返しは chatItemLines のキャッシュ越しなので、20 件窓のうち
+ * 新着・変更ぶんだけが計算される。
  */
 function formatChatLines(items: ChatItem[], maxWidthPx: number, source: 'claude' | 'codex' | undefined = currentAgentSource): string[] {
+  const agentName = source === 'codex' ? 'Codex' : source === 'claude' ? 'Claude' : 'Agent'
   const out: string[] = []
   for (const item of items) {
-    const text = item.text.replace(/\r/g, '').trim()
-    if (!text) continue
-    const agentName = source === 'codex' ? 'Codex' : source === 'claude' ? 'Claude' : 'Agent'
-    const tag = item.role === 'user' ? '[YOU]' : `[${agentName}]`
+    const lines = chatItemLines(item, maxWidthPx, agentName)
+    if (lines.length === 0) continue
     if (out.length > 0) out.push('')  // タグの直前に空行を挟んで境目を強調
-    out.push(tag)
-    const paragraphs = text.split('\n')
-    for (const para of paragraphs) {
-      const wrapped = wrapText(para, maxWidthPx)
-      for (const line of wrapped) out.push(line)
-    }
+    for (const line of lines) out.push(line)
   }
   return out
 }
@@ -1074,17 +1285,16 @@ function formatChatLines(items: ChatItem[], maxWidthPx: number, source: 'claude'
  * ペアのみで決まる) ことを利用し、buf 全体を測り直さず O(1) で積算する。
  */
 function wrapText(text: string, maxWidthPx: number): string[] {
-  if (maxWidthPx <= 0 || getTextWidth(text) <= maxWidthPx) return [text || '']
+  if (maxWidthPx <= 0 || measuredWidth(text) <= maxWidthPx) return [text || '']
   const out: string[] = []
   let buf = ''
   let bufW = 0
   let lastChar = ''       // buf の末尾文字 (カーニング増分計算用)
   let lastSpaceLen = -1   // 直近の空白直後の位置 (buf の code unit index)
   for (const ch of text) {
-    // buf + ch の幅増分 = getTextWidth(末尾文字 + ch) - getTextWidth(末尾文字)
-    const addW = lastChar
-      ? getTextWidth(lastChar + ch) - getTextWidth(lastChar)
-      : getTextWidth(ch)
+    // buf + ch の幅増分 = 幅(末尾文字 + ch) - 幅(末尾文字)。measure は文字/ペア単位で
+    // メモ化されているので、同じ文字が繰り返し出る日本語でも実測は 1 回きりで済む。
+    const addW = advanceWidth(lastChar, ch)
     if (buf !== '' && bufW + addW > maxWidthPx) {
       if (lastSpaceLen >= 0) {
         // 直近の空白で折り返す
@@ -1095,7 +1305,7 @@ function wrapText(text: string, maxWidthPx: number): string[] {
         out.push(buf)
         buf = ch
       }
-      bufW = getTextWidth(buf)
+      bufW = measuredWidth(buf)
       lastSpaceLen = -1
     } else {
       if (ch === ' ') lastSpaceLen = buf.length + 1  // 空白の直後で折り返したい
@@ -1111,13 +1321,15 @@ function wrapText(text: string, maxWidthPx: number): string[] {
 /** text を px 幅 maxPx に収まる最長の接頭辞に切り詰める。切り詰めたかも返す。 */
 function truncateToPx(text: string, maxPx: number): { s: string; truncated: boolean } {
   if (maxPx <= 0) return { s: '', truncated: text.length > 0 }
-  if (getTextWidth(text) <= maxPx) return { s: text, truncated: false }
+  if (measuredWidth(text) <= maxPx) return { s: text, truncated: false }
   let buf = ''
+  let bufW = 0
   let last = ''
   for (const ch of text) {
-    const addW = last ? getTextWidth(last + ch) - getTextWidth(last) : getTextWidth(ch)
-    if (getTextWidth(buf) + addW > maxPx) return { s: buf, truncated: true }
+    const addW = advanceWidth(last, ch)
+    if (bufW + addW > maxPx) return { s: buf, truncated: true }
     buf += ch
+    bufW += addW
     last = ch
   }
   return { s: buf, truncated: false }
@@ -1128,10 +1340,10 @@ function appendRootPreview(prefix: string, preview: string | undefined): string 
   const p = (preview ?? '').replace(/\s+/g, ' ').trim()
   if (!p) return prefix
   const sep = ' '
-  const avail = CHAT_WRAP_PX - getTextWidth(prefix + sep)
-  const ellipsisW = getTextWidth('…')
+  const avail = CHAT_WRAP_PX - measuredWidth(prefix + sep)
+  const ellipsisW = measuredWidth('…')
   if (avail <= ellipsisW) return prefix // プレビューを置く余地が無い (名前が長い等)
-  if (getTextWidth(p) <= avail) return prefix + sep + p
+  if (measuredWidth(p) <= avail) return prefix + sep + p
   const { s } = truncateToPx(p, avail - ellipsisW)
   return s ? prefix + sep + s + '…' : prefix
 }
@@ -1176,29 +1388,58 @@ function chatStatusLine(): string | null {
   }
 }
 
-// chatLinesForDisplay の結果キャッシュ。(chatLinesCache, 待機行) の組が変わった時だけ
-// 作り直す。なぜ: 毎回 [...chatLinesCache, status] を組むと、スクロールの 1 tick ごとに
+// 送達未確認の注意行 (レンズ幅で折り返し済み)。文言が変わらない限り測り直さない。
+let deliveryWarnLinesCache: string[] = []
+let deliveryWarnLinesCacheKey = ''
+
+/**
+ * 「送ったのに届いていないようだ」の注意行。
+ *
+ * 画面ブロック中はヘッダ (buildG2Header) が同じことを既に伝えているので出さない。
+ * 届かない原因は同じ (画面が塞がっている) で、狭いレンズで二度言う価値が無い。
+ */
+function deliveryWarningLines(): string[] {
+  if (!claudeDeliveryWarning || currentSessionBlocked()) return []
+  const text = t('chatDeliveryUnconfirmed')
+  if (text !== deliveryWarnLinesCacheKey) {
+    deliveryWarnLinesCache = wrapText(text, CHAT_WRAP_PX)
+    deliveryWarnLinesCacheKey = text
+  }
+  return deliveryWarnLinesCache
+}
+
+// chatLinesForDisplay の結果キャッシュ。(chatLinesCache, 末尾に足す行) の組が変わった
+// 時だけ作り直す。なぜ: 毎回 [...chatLinesCache, ...] を組むと、スクロールの 1 tick ごとに
 // 会話全体ぶんの配列コピー (O(n)) が走り、会話が長いほどスクロールが重くなる。
 // chatLinesCache は常に丸ごと差し替えられる (要素を書き換えない) ので、参照一致で判定できる。
 let chatDisplayCache: string[] = []
 let chatDisplayCacheSource: string[] | null = null
 let chatDisplayCacheStatus: string | null = null
 
-/** 表示用の chat 行配列 = 整形済みキャッシュ + (あれば) 末尾の待機行 */
-function chatLinesForDisplay(): string[] {
+/** 末尾に足す行 (待機行 → 送達未確認の注意)。注意は最下段 = いちばん目に入る位置に置く。 */
+function chatTailLines(): string[] {
   const status = chatStatusLine()
-  if (chatDisplayCacheSource === chatLinesCache && chatDisplayCacheStatus === status) {
+  const warn = deliveryWarningLines()
+  if (!status) return warn
+  return warn.length === 0 ? [status] : [status, ...warn]
+}
+
+/** 表示用の chat 行配列 = 整形済みキャッシュ + (あれば) 末尾の待機行 / 注意行 */
+function chatLinesForDisplay(): string[] {
+  const tail = chatTailLines()
+  const key = tail.join('\n')
+  if (chatDisplayCacheSource === chatLinesCache && chatDisplayCacheStatus === key) {
     return chatDisplayCache
   }
-  chatDisplayCache = status ? [...chatLinesCache, status] : chatLinesCache
+  chatDisplayCache = tail.length > 0 ? [...chatLinesCache, ...tail] : chatLinesCache
   chatDisplayCacheSource = chatLinesCache
-  chatDisplayCacheStatus = status
+  chatDisplayCacheStatus = key
   return chatDisplayCache
 }
 
 /** 表示用 chat の行数だけが要る呼び出し用。配列を組まずに数える (スクロール中に毎 tick 呼ばれる)。 */
 function chatDisplayCount(): number {
-  return chatLinesCache.length + (chatStatusLine() ? 1 : 0)
+  return chatLinesCache.length + chatTailLines().length
 }
 
 function maxChatScrollOffset(): number {
@@ -1351,7 +1592,45 @@ function currentRespondRowIsTypeSomething(): boolean {
   return flowCursor() === optsCount + submitOffset
 }
 
+// ─── レンズ上の一時通知 ────────────────────────────────────────────────
+// フッタに数秒だけ差し込む 1 行。音声入力の失敗のように「操作した本人からは
+// 何も起きていないように見える」失敗を、グラスを掛けたまま切り分けられるようにする。
+// スマホ側のログや devMode に出しても、レンズだけ見ている人には届かない。
+//
+// 約束:
+//   - 出るのはフッタ 1 行だけ (本文の窓は潰さない)。全 phase で操作案内より優先する。
+//   - 消えるのは「G2_NOTICE_MS 経過」か「次のジェスチャー操作」の早い方。
+const G2_NOTICE_MS = 8000
+let g2Notice: string | null = null
+let g2NoticeTimer: ReturnType<typeof setTimeout> | null = null
+
+/** レンズに一時通知を出す (先客は置き換える)。56 = ヘッダ/フッタ共通の最後の歯止め。 */
+function showG2Notice(text: string): void {
+  if (g2NoticeTimer) clearTimeout(g2NoticeTimer)
+  g2Notice = text.slice(0, 56)
+  g2NoticeTimer = setTimeout(() => {
+    g2NoticeTimer = null
+    g2Notice = null
+    void refreshG2(true)
+  }, G2_NOTICE_MS)
+}
+
+/**
+ * 一時通知を消す。表示中だった場合だけ描き直しを要求する
+ * (要求しないと、何も描かない操作の後にフッタが通知のまま固まる)。
+ * redraw=false は「もうレンズに headlenss の画面を出さない」経路専用。
+ */
+function clearG2Notice(redraw = true): void {
+  if (g2NoticeTimer) clearTimeout(g2NoticeTimer)
+  g2NoticeTimer = null
+  if (g2Notice === null) return
+  g2Notice = null
+  if (redraw) void refreshG2(true)
+}
+
 function buildG2Footer(): string {
+  // 一時通知は操作案内より優先する。数秒か次の操作で自動的に消える。
+  if (g2Notice !== null) return g2Notice
   switch (phase) {
     case 'rootlist': {
       // 分母はカーソルが動ける行数 (プラグイン行を含む)。セッション数だと
@@ -1397,6 +1676,66 @@ function buildG2Footer(): string {
   }
 }
 
+// idle ヘッダ末尾に出す状態表示 (画面ブロック警告 / 回答待ち) の点滅位相。
+// true = 状態を出すコマ、false = セッション名だけのコマ。
+//
+// 周期タイマーは持たない。1.5 秒ポーリング由来の再描画では必ず「表示」に戻し、
+// その 750ms 後に one-shot タイマーで「非表示」へ落として 1 回だけ描き直す。
+// これで表示 0.75 秒 ⇔ 非表示 0.75 秒になる (ポーリング間隔の半分)。
+//
+// 点滅させる対象が何であれ位相は 1 系統しか持たない。ブロックと回答待ちが同時に
+// 成立しても出すのは片方だけ (headBlinkBadge) なので、位相が競合することはない。
+let headBlinkOn = true
+/** 非表示フェーズへ落とす one-shot タイマー。同時に 1 本だけ。 */
+let headBlinkOffTimer: ReturnType<typeof setTimeout> | null = null
+const HEAD_BLINK_OFF_MS = 750
+
+/** 点滅の one-shot タイマーを捨てる。位相は「表示」に戻す (中途半端な消灯で固まらせない)。 */
+function clearHeadBlink(): void {
+  if (headBlinkOffTimer) clearTimeout(headBlinkOffTimer)
+  headBlinkOffTimer = null
+  headBlinkOn = true
+}
+
+/**
+ * 表示フェーズを描いた直後に呼ぶ。750ms 後に非表示フェーズへ落として 1 枚だけ描き直す。
+ * 発火時点で前提 (点滅対象がある / idle を見ている / レンズが headlenss のもの) が
+ * 崩れていたら何もしない。張り直しは常に前の 1 本を捨ててから行う。
+ */
+function scheduleHeadBlinkOff(): void {
+  if (headBlinkOffTimer) clearTimeout(headBlinkOffTimer)
+  headBlinkOffTimer = setTimeout(() => {
+    headBlinkOffTimer = null
+    // プラグイン遷移中はレンズが headlenss の画面ではない。ここで描くと被る。
+    if (pluginNavBlocksG2Render) return
+    if (phase !== 'idle' || headBlinkBadge() === null) return
+    headBlinkOn = false
+    void refreshG2(true)
+  }, HEAD_BLINK_OFF_MS)
+}
+
+/** 今開いているセッションが画面ブロック中か (一覧の最新の取得結果から見る) */
+function currentSessionBlocked(): boolean {
+  const name = settings.sessionName
+  if (!name) return false
+  return claudeSessions.some((s) => s.tmuxSessionName === name && s.screenBlocked === true)
+}
+
+/**
+ * idle ヘッダでセッション名の後ろに出し、点滅させる状態表示。null = 点滅させるものが無い。
+ *
+ * 画面ブロックと回答待ちは同時に成立しうるが、出すのは常に片方だけにする。
+ * 2 つ並べると 56 文字にセッション名が残らないうえ、先に手を打つべきなのは
+ * 「送っても届かない」ブロックの方なので、ブロックを優先する。
+ */
+function headBlinkBadge(): string | null {
+  if (currentSessionBlocked()) return t('g2HeadBlocked')
+  if (claudePending) {
+    return claudePending.kind === 'question' ? t('g2HeadWaitQ') : t('g2HeadWaitPerm')
+  }
+  return null
+}
+
 /** G2 レンズ最上段に表示する「現在の画面/フェーズ」のタイトル文字列 */
 function buildG2Header(): string {
   switch (phase) {
@@ -1429,11 +1768,21 @@ function buildG2Header(): string {
     }
     case 'error':        return t('g2HeadError')
     case 'idle': {
-      // 回答待ちがあるなら、スクロールしても消えないヘッダで知らせる
-      if (claudePending) {
-        const isQ = claudePending.kind === 'question'
-        const head = `${isQ ? '?' : '⏸'} ${isQ ? t('claudeStatusWaitQ') : t('claudeStatusWaitPerm')}`
-        return `${head}　${settings.sessionName || ''}`.slice(0, 56)
+      // 画面が塞がっている / 回答待ちがあるなら、スクロールしても消えないヘッダで知らせる
+      // (フッタは操作の案内なので変えない)
+      const badge = headBlinkBadge()
+      if (badge) {
+        // 並びは「セッション名　(印) 状態」。状態は必ず出したいので、ヘッダの実描画幅に
+        // 収まらないぶんはセッション名側を切り詰める。文字数ではなく px で測るのは、
+        // レンズが裁ち落とすのが px 幅だから (全角名だと文字数では収まって見えても
+        // 状態が画面外へ押し出される)。
+        // 切り詰めは点滅の両フェーズに同じだけ掛ける。非表示コマだけ名前が伸びると
+        // 名前そのものがちらついて読みにくいため。
+        const sep = '　'
+        const avail = HEADER_INNER_WIDTH - measuredWidth(sep + badge)
+        const name = truncateToPx(settings.sessionName || '', avail).s
+        // 56 は他のヘッダと揃えた最後の歯止め (px で切った後は通常ここに掛からない)
+        return (headBlinkOn ? `${name}${sep}${badge}` : name).slice(0, 56)
       }
       return settings.sessionName || t('appName')
     }
@@ -1474,6 +1823,96 @@ function buildG2Header(): string {
 /** レンズ 1 画面ぶんのスナップショット (同じ状態から組んだ 3 コンテナの内容)。 */
 type G2Frame = { header: string; content: string; footer: string }
 
+// ─── 未決着送信の会計 (時間切れ後の背圧) ────────────────────────────────
+// renderer の 5 秒タイムアウトは「こちらが待つのをやめる」だけで、SDK 側のフレームは
+// 消えない。やめた時点でポンプはロックを解放するので、詰まっている最中も次の送信が
+// 始まってしまう = 背圧が効かない。詰まりが続くとアプリは投げ続け、SDK の未処理は
+// 単調に増え、レンズは操作から数十秒遅れる (25 分使うと重い、の一因)。
+//
+// そこで「待つのをやめたが SDK に居座っているフレーム」の本数を数え、閾値以上ある
+// 間は新規送信を見送る。見送った要求は待機枠 (latest-wins) に溜まるだけなので、
+// アプリ内で積み上がることはなく、再開時には最新の状態が 1 回で届く。
+//
+// 飢餓しないための逃げ道: SDK が永久に決着を返さない可能性があるので、バックオフ
+// 時間が過ぎたら必ず 1 本試す (通れば詰まりは解けている)。
+/** これ以上「待つのをやめたまま」のフレームが居たら新規送信を見送る。 */
+const G2_UNSETTLED_LIMIT = 2
+/** 抑制に入ってから次の 1 本を試すまでの待ち時間 (ms)。 */
+const G2_UNSETTLED_BACKOFF_MS = 5000
+let g2UnsettledSends = 0
+let g2SuppressUntil = 0            // performance.now() でこの時刻まで見送る
+let g2SuppressResumeTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 抑制が解けた時に待機枠を流し直すための一発タイマー。 */
+function scheduleSuppressedResume(delayMs: number): void {
+  if (g2SuppressResumeTimer) return
+  g2SuppressResumeTimer = setTimeout(() => {
+    g2SuppressResumeTimer = null
+    void pumpG2Sends()
+  }, Math.max(0, delayMs))
+}
+
+/** ブリッジ送信が時間切れした (未決着が 1 本増えた)。 */
+function onBridgeSendTimeout(op: string): void {
+  g2UnsettledSends++
+  log(`G2 送信タイムアウト (${op}) — 未決着 ${g2UnsettledSends} 本`)
+  if (g2UnsettledSends >= G2_UNSETTLED_LIMIT) {
+    g2SuppressUntil = performance.now() + G2_UNSETTLED_BACKOFF_MS
+    scheduleSuppressedResume(G2_UNSETTLED_BACKOFF_MS)
+  }
+}
+
+/** 諦めた後で SDK 側が決着した (未決着が 1 本減った)。 */
+function onBridgeSendLateSettle(op: string, ok: boolean): void {
+  g2UnsettledSends = Math.max(0, g2UnsettledSends - 1)
+  log(`G2 送信が遅れて決着 (${op}, ok=${ok}) — 未決着 ${g2UnsettledSends} 本`)
+  if (g2UnsettledSends < G2_UNSETTLED_LIMIT) {
+    // 詰まりが解けた。待たずに再開する (溜まっている待機枠を今すぐ流す)。
+    g2SuppressUntil = 0
+    void pumpG2Sends()
+  }
+}
+
+/**
+ * 未決着のフレームが 1 本でも居るか (副作用なし。抑制の「試し 1 本」を消費しない)。
+ *
+ * 捨ててよい送信 (スクロールの中間コマ / 強制再同期) はここで止める。1 本でも
+ * SDK に居座っているなら、無くても困らないフレームを上に積む理由が無い。
+ * 必須の送信 (待機枠を流す直列路) の方は閾値 G2_UNSETTLED_LIMIT まで許す。
+ */
+function g2SendStalled(): boolean {
+  return g2UnsettledSends > 0
+}
+
+/**
+ * いま新規のブリッジ送信を見送るべきか。
+ *
+ * 見送るのは「未決着が閾値以上」かつ「バックオフの最中」の時だけ。バックオフが
+ * 過ぎたら 1 本通し、その場で次のバックオフを張り直す。通した 1 本がまた時間切れ
+ * すれば未決着が増えて抑制は続き、通れば (下の遅延決着 / 成功で) 抑制は解ける。
+ */
+function g2SendsSuppressed(): boolean {
+  if (!g2SendStalled()) return false
+  const now = performance.now()
+  if (now >= g2SuppressUntil) {
+    // バックオフ経過 — 飢餓を避けるため必ず 1 本試す
+    g2SuppressUntil = now + G2_UNSETTLED_BACKOFF_MS
+    scheduleSuppressedResume(G2_UNSETTLED_BACKOFF_MS)
+    log(`G2 送信抑制中だがバックオフ経過のため 1 本試す (未決着 ${g2UnsettledSends} 本)`)
+    return false
+  }
+  scheduleSuppressedResume(g2SuppressUntil - now)
+  return true
+}
+
+/**
+ * 送信が (時間切れではなく) 正常に完了した。送信路が生きている証拠なので抑制を解く。
+ * 未決着カウントはそのまま (遅延決着で減る) だが、実際に通った以上、待たせる理由が無い。
+ */
+function noteBridgeSendOk(): void {
+  if (g2SuppressUntil !== 0) g2SuppressUntil = 0
+}
+
 let g2SendLock = false            // ブリッジ送信中 (全経路共通の in-flight フラグ)
 let g2RenderPending = false       // full render の待機枠 (latest-wins)
 let g2RenderPendingForce = false  // 待機要求の force を OR で蓄積
@@ -1510,6 +1949,9 @@ const G2_FORCED_RESYNC_MS = 15000
 function isForcedResyncDue(): boolean {
   // そもそも送れない状況 (ブリッジ無し / プラグイン遷移中) では起点も進まないので数えない
   if (!bridge || pluginNavBlocksG2Render) return false
+  // 詰まっている間は再同期しない。dedup を捨てて 3 コンテナ全送する処理なので、
+  // 詰まりの最中にやると未決着を増やすだけになる (抑制が解けてから改めて期限が来る)。
+  if (g2SendStalled()) return false
   return performance.now() - g2LastSentAt >= G2_FORCED_RESYNC_MS
 }
 
@@ -1610,6 +2052,9 @@ function sendScrollFrameLoose(content: string): void {
   // 安全弁: レンズが遅すぎて投げっぱなし分が捌けていない。中間コマなので捨ててよい
   // (g2ContentLastSent を進めないので、同じ内容が後で必要になれば送り直される)。
   if (g2LooseScrollInFlight >= looseScrollMaxInFlight()) return
+  // 直列路が詰まっている (時間切れで諦めたフレームが SDK に居座っている) 間は、
+  // 中間コマを一切出さない。着地コマは直列路の待機枠で待ち、抑制が解けた時に届く。
+  if (g2SendStalled()) return
   g2ContentLastSent = content
   // スクロールは refreshG2 を通さずに scrollOffset を動かすので、待機中の full render の
   // スナップショットはここで古くなる (sendContentDirect と同じ理由)。
@@ -1635,6 +2080,13 @@ async function pumpG2Sends(): Promise<void> {
   g2SendLock = true
   try {
     for (;;) {
+      // 詰まっている間は新規送信を見送る。待機枠は latest-wins なので要求はここで
+      // 積み上がらず「最新 1 件」に畳まれたまま残り、再開時に 1 回で最新が届く。
+      // バックオフが過ぎた時だけ 1 本通る (飢餓しない)。
+      if ((g2RenderPending || g2ContentQueued !== null) && g2SendsSuppressed()) {
+        console.log('[refreshG2] suppressed: unsettled bridge sends')
+        break
+      }
       // full render を優先する (content-only より新しい状態を丸ごと反映するため)
       if (g2RenderPending && !isFullRenderDeferred(performance.now())) {
         const force = g2RenderPendingForce
@@ -1652,6 +2104,7 @@ async function pumpG2Sends(): Promise<void> {
       g2ContentQueued = null
       try {
         await updateContent(content)
+        noteBridgeSendOk()
         // ここでは g2LastSentAt を進めない。強制再同期は「header/footer も含めて
         // 一度描き直す」ための時計で、content だけを送り続けるスクロール中に進めると
         // 期限が永久に来ず、取りこぼした header/footer が直らないため。
@@ -1710,18 +2163,43 @@ async function executeFullRender(force: boolean, frame: G2Frame | null = null): 
     // header / content / footer を同期的に一括ビルド (同一 phase スナップショット)。
     // 呼び出し側が既に組んだスナップショットがあればそれを使う (二重ビルドの解消)。
     const { header, content, footer } = frame ?? buildG2Frame()
-    console.log(`[refreshG2] firing (phase=${phase}, force=${force})`)
+    // ヘッダも出す: 点滅 (headBlinkOn) のように「同じ phase で送信内容だけが変わる」
+    // 挙動は、この行の時系列でしか外から確かめられない。
+    console.log(`[refreshG2] firing (phase=${phase}, force=${force}) header=${JSON.stringify(header)}`)
     // dedup 基準は「送れたもの」だけを 1 つずつ記録する: scroll tick とポーリング由来の
     // 再描画がこの 3 つと突き合わせる。3 つまとめて先に立てると、途中の await が失敗した
     // 時に「送っていない内容を送信済み」と記録したフレームが残る (catch の一括取り消しは
     // 逆に、送れていた分まで捨てて無駄な再送を生む)。
-    await updateHeader(header)
-    g2HeaderLastSent = header
-    await updateContent(content)
-    g2ContentLastSent = content
-    await updateFooter(footer)
-    g2FooterLastSent = footer
-    g2LastSentAt = performance.now()  // 強制再同期の起点 (full render が通った時だけ更新する)
+    //
+    // 送るのは前回から変わったコンテナだけ。full render は「3 コンテナぶんの最新状態を
+    // レンズに反映しろ」という要求であって「3 本必ず流せ」ではない。点滅のように header
+    // だけが変わる更新で content/footer まで送り直すと、無変更の再送が BLE を占有して
+    // スクロール・カーソル移動・マイク取得まで巻き添えで遅くなる (点滅中は毎秒 4 本の
+    // うち 2/3 が無変更の再送だった)。3 つとも同じなら full render 自体が 0 本になる。
+    // 強制再同期 (invalidateG2Dedup) は 3 つの基準を null に落とすので従来どおり全送になる。
+    let sentAny = false
+    if (header !== g2HeaderLastSent) {
+      await updateHeader(header)
+      g2HeaderLastSent = header
+      sentAny = true
+    }
+    if (content !== g2ContentLastSent) {
+      await updateContent(content)
+      g2ContentLastSent = content
+      sentAny = true
+    }
+    if (footer !== g2FooterLastSent) {
+      await updateFooter(footer)
+      g2FooterLastSent = footer
+      sentAny = true
+    }
+    // 強制再同期の起点は「実際に 1 本でも送れた時」だけ進める。全スキップ = レンズは
+    // 既に最新のはず、という前提そのものを疑うのが強制再同期なので、ここで進めると
+    // ホスト側の取りこぼしを直す機会が永久に来なくなる。
+    if (sentAny) {
+      g2LastSentAt = performance.now()
+      noteBridgeSendOk()
+    }
   } catch (err) {
     // ここで dedup 基準を一括で捨てる必要は無い: 失敗した時点より後の 3 つは
     // 更新していないので、次の要求で自然に送り直される。
@@ -1837,6 +2315,7 @@ sessionPillsEl.addEventListener('click', (e) => {
     chatLinesCache = []
     chatLinesCacheKey = ''
     claudeChatStatus = undefined
+    claudeDeliveryWarning = null
     claudeChatLoading = true
     // 前セッションの用件と作りかけの回答を捨てる (応答画面を開いていたら idle に戻る)。
     // recomputePhase は cc-* を「操作中」として抜けないので、先に phase を落としておく。
@@ -1861,10 +2340,18 @@ newSessionForm.addEventListener('submit', (e) => {
   void createAndSelectSession(name)
 })
 
+// 前回の応答待ち中は重ねて叩かない (reloadClaudeSessions と同じ流儀)。サーバ応答が
+// 停滞すると、15 秒ごとのポーリングで未完了 fetch と Promise が積み上がって重くなる。
+let reloadSessionsInFlight = false
 async function reloadSessions(verbose = false): Promise<void> {
   if (!settings.serverBaseUrl || !serverProbeOk) return
+  if (reloadSessionsInFlight) return
+  reloadSessionsInFlight = true
+  // 応答が返らないまま居座るのを防ぐ上限。時間切れで必ず in-flight が解ける。
+  const ctrl = new AbortController()
+  const timeout = setTimeout(() => ctrl.abort(), 10_000)
   try {
-    lastSessions = await client.listSessions()
+    lastSessions = await client.listSessions(ctrl.signal)
     if (verbose) log(`sessions: ${lastSessions.map((s) => s.name).join(', ') || '(none)'}`)
     if (lastSessions.length > 0 && !lastSessions.some((s) => s.name === settings.sessionName)) {
       if (isRespondFlowActive()) {
@@ -1887,7 +2374,10 @@ async function reloadSessions(verbose = false): Promise<void> {
     paintStatus()
     if (phase === 'rootlist') void refreshG2(true)
   } catch (e) {
-    log(`listSessions error: ${(e as Error).message}`)
+    if ((e as DOMException).name !== 'AbortError') log(`listSessions error: ${(e as Error).message}`)
+  } finally {
+    clearTimeout(timeout)
+    reloadSessionsInFlight = false
   }
 }
 
@@ -2002,6 +2492,7 @@ async function refreshClaudeData(): Promise<void> {
     // 片方だけ新しい中間状態で測ると、待機行の有無が実際とは違う判定になり、
     // pending の出現/消滅のたびに読んでいる位置が 1 行ずれる。
     claudeChatStatus = chatResponse.status
+    claudeDeliveryWarning = chatResponse.deliveryWarning ?? null
     claudePending = pending
     // chat: scrollback 中なら「末尾に増減したぶん」だけオフセットを補正して読み位置を保つ。
     //  - 追記 (新しい発言 / 待機行が出た)      → その行数ぶん繰り上げる
@@ -2037,6 +2528,17 @@ async function refreshClaudeData(): Promise<void> {
       // ポーリング由来の再描画は「表示が変わる時だけ」。変わらないのに 1.5 秒ごとに
       // 全面送信 (3 フレーム) を掛け続けると、レンズ側の消化が追いつかない環境では
       // それだけで滞留が育つ (g2FrameWouldChange 参照)。
+      // ヘッダ末尾の状態表示 (画面ブロック警告 / 回答待ち) は点滅させる。ポーリング由来の
+      // この描画は必ず「表示」に戻し、下で張る one-shot タイマーが 750ms 後に「非表示」を
+      // 1 枚描く。
+      // 副作用として、点滅中はヘッダが毎回変わる = g2FrameWouldChange が常に
+      // 「変化あり」になり、1.5 秒ごとの full render + その 0.75 秒後に 1 枚が出る。
+      // 該当のセッションを開いている間だけの話なので許容する。
+      // 対象が消えていれば位相を「表示」に戻し、待機中のタイマーも捨てる
+      // (次に点滅するとき必ず表示から始める)。
+      const blinking = headBlinkBadge() !== null
+      if (blinking) headBlinkOn = true
+      else clearHeadBlink()
       // ただし送信が途絶えて久しい場合は、取りこぼし対策として dedup を捨てて 1 回通す。
       if (isForcedResyncDue()) {
         console.log('[refreshG2] forced resync: no send for a while')
@@ -2048,6 +2550,8 @@ async function refreshClaudeData(): Promise<void> {
         const frame = buildG2Frame()
         if (g2FrameWouldChange(frame)) void refreshG2(true, frame)
       }
+      // 表示フェーズを描いた後に消灯を予約する (点滅対象があるのを見ている間だけ)
+      if (blinking && phase === 'idle') scheduleHeadBlinkOff()
       // chat を実際に取得して描画している = ユーザは見ている前提なので既読化
       markAsRead(targetSession)
     }
@@ -2200,6 +2704,10 @@ function stopAllBackgroundWork(): void {
   hideToastNow()
   // 実行中の取得も打ち切る (完了時に描画へ回るため)
   abortInFlightRefresh()
+  // 点滅の消灯タイマーも捨てる。残すとプラグインのページに headlenss のヘッダが 1 枚被る
+  clearHeadBlink()
+  // 一時通知の自動消灯も同じ理由で捨てる (ここで描き直させない)
+  clearG2Notice(false)
   // レンズ送信の待機枠も捨てる。残しておくと in-flight が捌けた瞬間に headlenss の
   // フレームがプラグインのページに 1 枚だけ被さる。
   g2RenderPending = false
@@ -2578,6 +3086,17 @@ function updateRecordButton(): void {
   recordBtn.classList.remove('recording')
 }
 
+/**
+ * Speechmatics への接続に失敗した理由を、レンズ 1 行ぶんの文言にする。
+ * HTTP ステータスが取れる失敗 (JWT 発行) は番号まで出す。401/403 なら鍵、429 なら
+ * 枠の使い切りと、レンズだけ見ていても次の一手が決まるため。
+ */
+function asrFailureNotice(message: string): string {
+  const m = /HTTP (\d{3})/.exec(message)
+  if (m) return t('g2NoticeRecFailAuth').replace('{code}', m[1])
+  return t('g2NoticeRecFailAsr')
+}
+
 async function startRecording(): Promise<void> {
   if (!bridge) {
     log('cannot record: G2 bridge not available')
@@ -2585,7 +3104,19 @@ async function startRecording(): Promise<void> {
   }
   if (!settings.speechmaticsApiKey || !settings.serverBaseUrl || !settings.sessionName) {
     log('startRecording blocked: not configured')
+    // タップしたのに何も起きない状態にしない。理由の切り分けはスマホ側で行う。
+    showG2Notice(t('g2NoticeRecFail'))
+    void refreshG2(true)
     return
+  }
+
+  // 前の録音の ASR 接続が残っていることがある (停止経路が途中で折れた等)。
+  // 残したまま新しい接続を張ると、古い接続の partial が新しい表示を上書きする。
+  if (rtSession) {
+    diag('前の ASR 接続が残っていたので破棄してから始めます')
+    const stale = rtSession
+    rtSession = null
+    try { stale.abort() } catch { /* ignore */ }
   }
 
   resetPcmCounter()
@@ -2601,7 +3132,10 @@ async function startRecording(): Promise<void> {
   resetScroll()
 
   // 1. UI を即座に recording 画面へ遷移 (体感ラグを減らす)
+  //    録音時間はここを起点にした経過時間で数える。受信 PCM のバイト数から
+  //    割り出すと、ホストがマイクを開けなかった時に 0.0s のまま止まって見える。
   phase = 'recording'
+  startRecordingClock()
   startRecordingTimer()
   paintStatus()
   updateRecordButton()
@@ -2609,12 +3143,18 @@ async function startRecording(): Promise<void> {
 
   // 2. Speechmatics RT 接続 + マイク起動 を非同期で進める。
   //    途中でユーザが停止した場合に二重起動を防ぐため、session 同一性で gard する。
-  const localBridge = bridge
+  //    マイクの取得/解放は mic.ts 経由なので、ここで bridge は掴まない。
   const session = new SpeechmaticsRT()
   rtSession = session
 
-  const revertToIdle = () => {
+  /**
+   * 録音開始に失敗したので録音前の画面へ戻す。
+   * notice を渡すとレンズのフッタに失敗理由を数秒出す。戻り先が cc-response でも
+   * フローごと畳む場合でも同じように出したいので、分岐より先に出しておく。
+   */
+  const revertToIdle = (notice: string | null = null) => {
     if (rtSession !== session || phase !== 'recording') return
+    if (notice) showG2Notice(notice)
     stopRecordingTimer()
     try { session.abort() } catch { /* ignore */ }
     rtSession = null
@@ -2651,11 +3191,20 @@ async function startRecording(): Promise<void> {
           void refreshG2()
         },
         onError: (err) => log(`RT error: ${err.message}`),
+        // 録音中に接続が死んだ場合。放っておくと「録音中」のまま無音を撮り続け、
+        // 停止しても何も出てこない。ここで録音前の画面まで畳む。
+        onDead: (reason) => {
+          diag(`RT 接続が録音中に切れました (${reason}) — 録音を畳みます`)
+          if (rtSession === session && phase === 'recording') {
+            revertToIdle(t('g2NoticeRecFailAsr'))
+          }
+        },
       })
       log('Speechmatics RT connected')
     } catch (err) {
-      log(`RT connect failed: ${(err as Error).message}`)
-      revertToIdle()
+      const msg = (err as Error).message
+      log(`RT connect failed: ${msg}`)
+      revertToIdle(asrFailureNotice(msg))
       return
     }
 
@@ -2666,22 +3215,32 @@ async function startRecording(): Promise<void> {
     }
 
     // 3. G2マイク開始
-    try {
-      const ok = await localBridge.audioControl(true)
-      if (ok === false) {
-        log('audioControl(true) returned false')
-        revertToIdle()
-        return
-      }
-      // 接続&マイク起動完了 → レンズ表示を「録音中」に切り替え
-      if (rtSession === session && phase === 'recording') {
-        recordingReady = true
-        void refreshG2(true)
-      }
-    } catch (err) {
-      log(`audioControl error: ${err}`)
-      revertToIdle()
+    //    取得は出すが、その決着に録音をぶら下げない。実機は audioControl(true) の
+    //    応答を返さないことがあり、待ち続けると録音そのものが固まる
+    //    (タイマー 0.0s / 音が入らない / 停止も効かない)。PCM が届く経路は
+    //    この応答とは別なので、決着しないまま音だけ来ることもある。
+    //    少しだけ待って、決着しなくてもそのまま録音を続ける。
+    const openResult = await settleWithin(openMic(), MIC_OPEN_SETTLE_MS)
+    if (openResult === null) {
+      // 未決着。失敗ではない。ここで畳むと「実機は開いているのにアプリだけ諦めた」
+      // になるので、診断だけ残して録音を続ける。
+      dumpMicHealth('open-unsettled')
+    } else if (!openResult.ok) {
+      // 例外 / 多重取得。これも録音は止めない (実機が開いていることがある)。
+      dumpMicHealth(`open-not-ok:${openResult.reason}`)
     }
+    // 待っている間に停止/畳み込みが入っていないか。
+    if (rtSession !== session || phase !== 'recording') {
+      log('mic: 取得を待っている間に録音が終わっていました — 解放してから畳みます')
+      if (rtSession === session) rtSession = null
+      try { session.abort() } catch { /* ignore */ }
+      void closeMic('stale-after-open', MIC_CLOSE_WAIT_MS)
+      return
+    }
+    // レンズ表示を「録音中」に切り替え (取得の決着は待たない)
+    recordingReady = true
+    dumpMicHealth('recording-started')
+    void refreshG2(true)
   })()
 }
 
@@ -2695,12 +3254,22 @@ async function stopRecordingToPending(): Promise<void> {
   const startedSession = settings.sessionName
   const recordingFlow = respondFlow?.recording ? respondFlow : null
   const startedRt = rtSession
+  const startedEpoch = recoveryEpoch
   /**
    * 録音を止め始めた時と同じセッション (世代) のままか。
    * 違っていたら、この録音の結果は行き先ごと消えているので破棄する。
    * 新しい状態 (切替後のセッションの phase / pending / 録音) には一切触らない。
+   * 強制脱出 (タップで finalizing を打ち切った) 後も同じ扱いにする。
    */
   const abandonIfSessionSwitched = (where: string): boolean => {
+    if (recoveryEpoch !== startedEpoch) {
+      log(`録音停止 (${where}): 強制リセット後なので結果を破棄します`)
+      if (startedRt && rtSession === startedRt) {
+        try { rtSession.abort() } catch { /* ignore */ }
+        rtSession = null
+      }
+      return true
+    }
     if (settings.sessionName === startedSession) return false
     log(`録音停止 (${where}): セッションが切り替わったので結果を破棄します`)
     // 自分が始めた ASR 接続だけを片付ける (切替後に始まった新しい録音は触らない)
@@ -2708,112 +3277,150 @@ async function stopRecordingToPending(): Promise<void> {
       try { rtSession.abort() } catch { /* ignore */ }
       rtSession = null
     }
+    // 'finalizing' を立てたのはこの関数だけ。まだ残っているなら誰も畳んでいない
+    // ということなので、ここで畳む。放置すると「確定中」表示のまま操作を一切
+    // 受け付けない画面に閉じ込められる (切替側が phase を戻さない経路がある)。
+    if (phase === 'finalizing') {
+      phase = pendingSentences.length > 0 ? 'pending' : 'idle'
+      paintStatus()
+      updateRecordButton()
+      updatePendingUI()
+      void refreshG2(true)
+    }
     return true
   }
 
   stopRecordingTimer()
+  stopRecordingClock()   // 録音長はここで確定 (以降の待ち時間は録音に数えない)
+  recordingReady = false
   phase = 'finalizing'
+  blockingPhaseSince = Date.now()
   paintStatus()
   updateRecordButton()
   void refreshG2(true)
 
-  // G2マイク停止
   try {
-    if (bridge) await bridge.audioControl(false)
-  } catch (err) {
-    log(`Stop error: ${err}`)
-  }
-  if (abandonIfSessionSwitched('マイク停止後')) return
+    // G2マイク停止。決着は待ちきらない。ホストが応答を返さないことがあり、
+    // 待ち続けると「停止を押しても固まったまま」になる。喋った内容の確定・送信を
+    // マイクの解放にぶら下げない。解放そのものはバックグラウンドで決着させる。
+    if (!await closeMic('stop', MIC_CLOSE_WAIT_MS)) {
+      dumpMicHealth('stop-close-unsettled')
+    }
+    if (abandonIfSessionSwitched('マイク停止後')) return
 
-  /** 録音終了時の戻り先を決める共通ハンドラ。
-   *  録音が cc-response の Type something 用なら応答画面へ、そうでなければ tmux 用 pending へ。 */
-  const finishWithText = (text: string): void => {
-    if (recordingFlow) {
-      recordingFlow.recording = false
-      // 喋っている間に戻り先が消えていることがある (別経路で承認された / セッションを
-      // kill された / ポーリングで用件が入れ替わった)。戻る先が無いのに cc-response へ
-      // 帰すと、pending 無しの応答画面という作れないはずの状態になる。
-      const flow = respondFlow
-      if (flow !== recordingFlow || !claudePending || claudePending.id !== recordingFlow.pendingId) {
-        log('respond type-something: 戻り先の用件が消えていたので idle に戻ります')
-        resetRespondFlow('pending-gone', recordingFlow)
+    /** 録音終了時の戻り先を決める共通ハンドラ。
+     *  録音が cc-response の Type something 用なら応答画面へ、そうでなければ tmux 用 pending へ。 */
+    const finishWithText = (text: string): void => {
+      // 強制脱出で既に畳まれている場合、ここで書き戻すと現在の画面を壊す。
+      if (recoveryEpoch !== startedEpoch) {
+        log('録音停止: 強制リセット後なので結果は書き戻しません')
         return
       }
-      // cc-response の type-something 回答として記録、cc-response に戻る
-      if (text) {
-        flow.answers[flow.qIdx] = { kind: 'type-something', text }
-        log(`respond type-something: "${text.slice(0, 40)}"`)
-      } else {
-        log('respond type-something: empty, cancel')
+      if (recordingFlow) {
+        recordingFlow.recording = false
+        // 喋っている間に戻り先が消えていることがある (別経路で承認された / セッションを
+        // kill された / ポーリングで用件が入れ替わった)。戻る先が無いのに cc-response へ
+        // 帰すと、pending 無しの応答画面という作れないはずの状態になる。
+        const flow = respondFlow
+        if (flow !== recordingFlow || !claudePending || claudePending.id !== recordingFlow.pendingId) {
+          log('respond type-something: 戻り先の用件が消えていたので idle に戻ります')
+          resetRespondFlow('pending-gone', recordingFlow)
+          return
+        }
+        // cc-response の type-something 回答として記録、cc-response に戻る
+        if (text) {
+          flow.answers[flow.qIdx] = { kind: 'type-something', text }
+          log(`respond type-something: "${text.slice(0, 40)}"`)
+        } else {
+          log('respond type-something: empty, cancel')
+        }
+        phase = 'cc-response'
+        paintStatus()
+        updateRecordButton()
+        void refreshG2(true)
+        // 入力済なら自動で次の質問へ進む
+        if (text) {
+          advanceToNextQuestionOrSubmit()
+        }
+        return
       }
-      phase = 'cc-response'
+      // 通常 (tmux 用) フロー
+      if (text) {
+        pendingSentences.push(text)
+        log(`pending: appended sentence #${pendingSentences.length}`)
+      }
+      phase = 'pending'
       paintStatus()
       updateRecordButton()
+      updatePendingUI()
       void refreshG2(true)
-      // 入力済なら自動で次の質問へ進む
-      if (text) {
-        advanceToNextQuestionOrSubmit()
-      }
+    }
+
+    const seconds = getRecordingSeconds()
+    if (seconds < MIN_RECORDING_SEC || getPcmByteLength() === 0) {
+      log(`Recording too short: ${seconds.toFixed(2)}s`)
+      rtSession?.abort()
+      rtSession = null
+      durationEl.textContent = '0.0s'
+      liveTranscript = ''
+      finishWithText('')
       return
     }
-    // 通常 (tmux 用) フロー
-    if (text) {
-      pendingSentences.push(text)
-      log(`pending: appended sentence #${pendingSentences.length}`)
+
+    const rt = rtSession
+    if (!rt) {
+      finishWithText('')
+      return
     }
-    phase = 'pending'
-    paintStatus()
-    updateRecordButton()
-    updatePendingUI()
-    void refreshG2(true)
-  }
+    let text = ''
+    const t0 = performance.now()
+    try {
+      text = (await rt.stop()).trim()
+      log(`RT final: "${text.slice(0, 80)}" (${(performance.now() - t0).toFixed(0)}ms)`)
+    } catch (e) {
+      const errorMsg = (e as Error).message
+      log(`RT stop error: ${errorMsg}`)
+      // 停止に失敗した接続は捨てるだけでは閉じない (ソケットもコールバックも生きたまま
+      // 残り、遅れて届いた partial が次の録音の表示を上書きする)。必ず切り離す。
+      try { rt.abort() } catch { /* ignore */ }
+      if (abandonIfSessionSwitched('ASR 失敗後')) return
+      addHistoryEntry({
+        text: liveTranscript || '(ASR failed)',
+        session: settings.sessionName,
+        ok: false,
+        durationMs: performance.now() - t0,
+        errorMsg,
+      })
+      durationEl.textContent = '0.0s'
+      liveTranscript = ''
+      finishWithText('')
+      return
+    } finally {
+      // 片付けるのは自分が止めた接続だけ。世代が変わった後に始まった新しい録音の
+      // 接続まで手放すと、その録音が確定できなくなる。
+      if (rtSession === rt) rtSession = null
+    }
 
-  const seconds = getRecordingSeconds()
-  if (seconds < MIN_RECORDING_SEC || getPcmByteLength() === 0) {
-    log(`Recording too short: ${seconds.toFixed(2)}s`)
-    rtSession?.abort()
-    rtSession = null
+    if (abandonIfSessionSwitched('ASR 確定後')) return
     durationEl.textContent = '0.0s'
     liveTranscript = ''
-    finishWithText('')
-    return
-  }
-
-  const rt = rtSession
-  if (!rt) {
-    finishWithText('')
-    return
-  }
-  let text = ''
-  const t0 = performance.now()
-  try {
-    text = (await rt.stop()).trim()
-    log(`RT final: "${text.slice(0, 80)}" (${(performance.now() - t0).toFixed(0)}ms)`)
-  } catch (e) {
-    const errorMsg = (e as Error).message
-    log(`RT stop error: ${errorMsg}`)
-    if (abandonIfSessionSwitched('ASR 失敗後')) return
-    addHistoryEntry({
-      text: liveTranscript || '(ASR failed)',
-      session: settings.sessionName,
-      ok: false,
-      durationMs: performance.now() - t0,
-      errorMsg,
-    })
-    durationEl.textContent = '0.0s'
-    liveTranscript = ''
-    finishWithText('')
-    return
+    finishWithText(text)
   } finally {
-    // 片付けるのは自分が止めた接続だけ。世代が変わった後に始まった新しい録音の
-    // 接続まで手放すと、その録音が確定できなくなる。
-    if (rtSession === rt) rtSession = null
+    // どの経路 (return / 例外) から抜けても 'finalizing' を残さない。
+    // 残すと操作を一切受け付けない画面に閉じ込められる。
+    if (recoveryEpoch === startedEpoch) {
+      blockingPhaseSince = 0
+      if (phase === 'finalizing') {
+        diag('録音停止が finalizing のまま抜けました — 畳んで操作を受け付けます')
+        phase = pendingSentences.length > 0 ? 'pending' : 'idle'
+        paintStatus()
+        updateRecordButton()
+        updatePendingUI()
+        void refreshG2(true)
+      }
+    }
+    dumpMicHealth('stop-finished')
   }
-
-  if (abandonIfSessionSwitched('ASR 確定後')) return
-  durationEl.textContent = '0.0s'
-  liveTranscript = ''
-  finishWithText(text)
 }
 
 /** pending → サーバ送信 → idle */
@@ -2825,7 +3432,9 @@ async function confirmAndSend(): Promise<void> {
     return
   }
   const text = pendingSendText()
+  const startedEpoch = recoveryEpoch
   phase = 'sending'
+  blockingPhaseSince = Date.now()
   paintStatus()
   updateRecordButton()
   updatePendingUI()
@@ -2855,12 +3464,18 @@ async function confirmAndSend(): Promise<void> {
       errorMsg,
     })
   } finally {
-    pendingSentences = []
-    phase = 'idle'
-    resetScroll()
-    recomputePhase()
-    // 送信直後に出力ミラーを取り直し (反映を見える化)
-    void refreshClaudeData()
+    // 強制脱出でこの送信が既に打ち切られていたら、今の画面には触らない。
+    if (recoveryEpoch === startedEpoch) {
+      blockingPhaseSince = 0
+      pendingSentences = []
+      phase = 'idle'
+      resetScroll()
+      recomputePhase()
+      // 送信直後に出力ミラーを取り直し (反映を見える化)
+      void refreshClaudeData()
+    } else {
+      log('送信: 強制リセット後なので画面は触りません')
+    }
   }
 }
 
@@ -2894,39 +3509,119 @@ function removeLastSentence(): void {
  * 既存 pendingSentences があれば pending 状態に戻り、無ければ idle へ戻る。
  */
 async function abortRecording(): Promise<void> {
-  if (phase !== 'recording') return
-  log(`recording aborted (kept ${pendingSentences.length} sentences)`)
-  stopRecordingTimer()
-  // G2 マイク停止
+  // 判断の基準は phase ではなくマイクの実態。録音画面を既に離れていても
+  // (foreground exit / フローの畳み込みと競合した等) マイクや ASR 接続だけが
+  // 残っていることがあり、その取り残しもここで解く。
+  const wasRecording = phase === 'recording'
+  // 'finalizing' 中の rtSession は停止処理が使っている最中なので触らない。
+  const orphanRt = !wasRecording && phase !== 'finalizing' ? rtSession : null
+  if (!wasRecording && !micIsHeld() && !orphanRt) return
+  if (wasRecording) log(`recording aborted (kept ${pendingSentences.length} sentences)`)
+  else if (orphanRt) log('録音画面ではないが ASR 接続が残っているので破棄します')
+  else log('録音画面ではないがマイクが握られたままなので解放します')
+
   try {
-    if (bridge) await bridge.audioControl(false)
-  } catch (err) {
-    log(`Stop error: ${err}`)
+    // ── await より前に、画面と接続の畳み込みを全部終わらせる ──
+    // マイク解放はホスト次第でいくらでも待たされる。それを待ってから畳むと
+    // 「中止したのに録音画面のまま何も効かない」時間がそのまま生まれる。
+    stopRecordingTimer()
+    stopRecordingClock()
+    recordingReady = false
+      // RT セッションを破棄 (final 結果は受け取らない)。
+    const rt = wasRecording ? rtSession : orphanRt
+    if (rt) {
+      if (rtSession === rt) rtSession = null
+      try { rt.abort() } catch { /* ignore */ }
+    }
+
+    if (wasRecording) {
+      resetPcmCounter()
+      recordingScrollOffset = 0
+      recordingLinesCache = []
+      recordingLinesCacheKey = ''
+      liveTranscript = ''
+      durationEl.textContent = '0.0s'
+      // 録音の用途が cc-response の type-something なら、cc-response に戻る。
+      // ただし戻り先の用件が消えていたら応答フローごと畳んで idle へ落とす
+      // (pending 無しの応答画面を作らない)。
+      const flow = respondFlow
+      if (flow?.recording) {
+        flow.recording = false
+        if (!claudePending || claudePending.id !== flow.pendingId) {
+          log('録音中止: 戻り先の用件が消えていたので idle に戻ります')
+          resetRespondFlow('pending-gone')
+        } else {
+          phase = 'cc-response'
+          paintStatus()
+          void refreshG2(true)
+        }
+      } else {
+        phase = pendingSentences.length > 0 ? 'pending' : 'idle'
+        paintStatus()
+        void refreshG2(true)
+      }
+      updatePendingUI()
+    }
+
+    // G2 マイク停止。画面はこの前に畳み終えているが、決着まで待つと
+    // 「取得中」の内部状態が残り続けるので、ここも締切付きで待つ。
+    await closeMic('abort', MIC_CLOSE_WAIT_MS)
+    // 未決着の取得が残っていたらここで解く。残すと次のタップで取得が出せない。
+    resetMicState('abort')
+  } finally {
+    // 例外で抜けても 'recording' に固着させない。
+    if (phase === 'recording') {
+      diag('録音中止が recording のまま抜けました — 畳んで操作を受け付けます')
+      phase = pendingSentences.length > 0 ? 'pending' : 'idle'
+      paintStatus()
+      updatePendingUI()
+      void refreshG2(true)
+    }
+    updateRecordButton()
+    dumpMicHealth('abort-finished')
   }
-  // RT セッションを破棄 (final 結果は受け取らない)
-  rtSession?.abort()
+}
+
+/**
+ * 'finalizing' / 'sending' に居座ってしまった時の脱出口。
+ * この 2 状態は操作を一切受け付けないので、外の都合 (ホスト無応答 / 通信断) で
+ * 長引くとレンズは完全に無反応になる。一定時間を超えたタップでここを通し、
+ * 手元の状態だけで畳んで操作を取り戻す。
+ *
+ * 進行中の処理は recoveryEpoch で無効化するので、遅れて戻ってきても
+ * 畳んだ後の画面を書き戻さない。
+ */
+function forceResetBlockedPhase(): void {
+  const stuck = blockingPhaseSince > 0 ? Date.now() - blockingPhaseSince : 0
+  diag(`${phase} が ${stuck}ms 続いたので強制的に畳みます`)
+  recoveryEpoch++
+  blockingPhaseSince = 0
+  stopRecordingTimer()
+  stopRecordingClock()
+  recordingReady = false
+  const rt = rtSession
   rtSession = null
-  resetPcmCounter()
-  recordingScrollOffset = 0
-  recordingLinesCache = []
-  recordingLinesCacheKey = ''
+  if (rt) { try { rt.abort() } catch { /* ignore */ } }
+  // マイクは投げっぱなしで解放する (ここで待つと脱出口の意味がない)。
+  if (micIsHeld()) void closeMic('stuck-reset', MIC_CLOSE_WAIT_MS)
+  // 未決着の取得が残っていると次のタップで取得を出せない。手元だけで解く。
+  resetMicState('stuck-reset')
   liveTranscript = ''
   durationEl.textContent = '0.0s'
-  recordingReady = false
-  // 録音の用途が cc-response の type-something なら、cc-response に戻る。
-  // ただし戻り先の用件が消えていたら応答フローごと畳んで idle へ落とす
-  // (pending 無しの応答画面を作らない)。
+  if (phase === 'sending') {
+    // 送信は既にサーバへ出ている。ここで文を残すと同じ内容を二重に送りうるので、
+    // 決着した時と同じ扱い (破棄) にする。
+    log(`送信中の強制脱出: ${pendingSentences.length} 文を破棄します`)
+    pendingSentences = []
+  }
   const flow = respondFlow
   if (flow?.recording) {
     flow.recording = false
     if (!claudePending || claudePending.id !== flow.pendingId) {
-      log('録音中止: 戻り先の用件が消えていたので idle に戻ります')
       resetRespondFlow('pending-gone')
-      updateRecordButton()
-      updatePendingUI()
-      return
+    } else {
+      phase = 'cc-response'
     }
-    phase = 'cc-response'
   } else {
     phase = pendingSentences.length > 0 ? 'pending' : 'idle'
   }
@@ -2934,10 +3629,19 @@ async function abortRecording(): Promise<void> {
   updateRecordButton()
   updatePendingUI()
   void refreshG2(true)
+  dumpMicHealth('stuck-reset')
 }
 
 async function toggleRecording(): Promise<void> {
-  if (phase === 'finalizing' || phase === 'sending') return
+  if (phase === 'finalizing' || phase === 'sending') {
+    // 通常はここで無視する (二重停止・二重送信を作らない)。ただし長引いている
+    // 場合だけは、このタップを捨てずに脱出へ使う。捨てると「何度叩いても
+    // 反応しない」状態が続き、ユーザには壊れたようにしか見えない。
+    const stuck = blockingPhaseSince > 0 ? Date.now() - blockingPhaseSince : 0
+    if (stuck < BLOCKING_PHASE_ESCAPE_MS) return
+    forceResetBlockedPhase()
+    // 畳んだ後の phase で、このタップを改めて処理する (下へ落ちる)。
+  }
   // 応答 POST 中のタップは無視 (同じ用件へ 2 通目を送らせない)
   if (respondInputBlocked()) return
   if (phase === 'recording') {
@@ -3163,6 +3867,7 @@ function openSelectedFromRoot(): void {
   chatLinesCache = []
   chatLinesCacheKey = ''
   claudeChatStatus = undefined
+  claudeDeliveryWarning = null
   claudeChatLoading = true
   currentAgentSource = sel.source
   // 前セッションの用件と作りかけの回答を捨てる (応答画面から直接来た場合も含む)
@@ -3376,7 +4081,9 @@ function completeRespondFlow(pendingId: string): void {
  */
 function discardRespondRecording(): void {
   stopRecordingTimer()
-  try { void bridge?.audioControl(false) } catch { /* ignore */ }
+  // ここは同期の後始末なので待たない (解放そのものは出しっぱなしで決着させる)。
+  // マイクを握っていなければ実機へは何も出ない。
+  if (micIsHeld()) void closeMic('discard-respond')
   rtSession?.abort()
   rtSession = null
   resetPcmCounter()
@@ -3440,6 +4147,8 @@ function assertRespondFlowInvariant(where: string): void {
 function resetRespondStateForSessionChange(): void {
   claudePending = null
   resetRespondFlow('session-change')
+  // 前のセッション向けに張った消灯タイマーを持ち越さない
+  clearHeadBlink()
 }
 
 /**
@@ -3686,10 +4395,14 @@ function renderClaudeSessionsList(): void {
       killLabel = escapeHtml(t('claudeKillConfirmBtn'))
     }
     const agent = s.source === 'codex' ? 'Codex' : s.source === 'claude' ? 'Claude' : 'Agent'
+    // 画面ブロック中は名前の横に警告を出す (status の dot はそのまま。status は正しいので変えない)
+    const blockedMark = s.screenBlocked === true
+      ? ` <span class="claude-blocked" title="${escapeAttr(t('claudeStatusBlocked'))}">⚠</span>`
+      : ''
     li.innerHTML =
       `<span class="claude-status" data-status="${escapeAttr(status)}" title="${escapeAttr(claudeStatusLabel(status))}">●</span>` +
       `<div class="claude-info">` +
-        `<div class="claude-name">${escapeHtml(s.tmuxSessionName)} <span class="agent-label">${agent}</span></div>` +
+        `<div class="claude-name">${escapeHtml(s.tmuxSessionName)} <span class="agent-label">${agent}</span>${blockedMark}</div>` +
         `<div class="claude-cwd">${escapeHtml(s.cwd || '~')}</div>` +
       `</div>` +
       `<button class="${killClass}" data-action="kill" aria-label="kill ${escapeAttr(s.tmuxSessionName)}"${killDisabled}>${killLabel}</button>`
@@ -3949,6 +4662,9 @@ async function changeLanguage(lang: Language): Promise<void> {
     void probeServer()
   }
   await persistSettings()
+  // 整形済みのチャット行には言語依存の行 (長文の省略表示) が混ざるので作り直す。
+  // 次のポーリングを待つと、切り替えた直後の 1 画面だけ前の言語のまま出てしまう。
+  rebuildChatLinesCache()
   // G2 レンズも「言語切替」を 1 つの画面遷移と扱って rebuildPageContainer で再描画。
   // プラグイン遷移中は描かない (refreshG2 と同じ理由: 「接続中」を上書きしてしまう)。
   if (bridge && !pluginNavBlocksG2Render) {
@@ -3975,6 +4691,24 @@ async function boot(): Promise<void> {
     log('Even bridge not available — このアプリはG2 SDK経由でしか動作しません')
   }
 
+  // マイクの呼び出し口を接続する。起動時に投機的な解放は撃たない
+  // (起動直後の audioControl がそのまま最初の録音開始の足を引っ張るため)。
+  initMic({ bridge: () => bridge, log })
+  diag(`boot: bridge=${bridge ? 'ok' : 'none'} ua=${navigator.userAgent.slice(0, 80)}`)
+
+  // ページごと消える経路 (WebView 破棄 / 遷移) の保険。
+  // SDK のイベントが来ないまま消えることがあり、その時はマイクも ASR 接続も
+  // 握られたまま残る。ここでは待てないので、出すだけ出して去る。
+  window.addEventListener('pagehide', () => {
+    if (rtSession) {
+      const rt = rtSession
+      rtSession = null
+      try { rt.abort() } catch { /* ignore */ }
+    }
+    if (micIsHeld()) void closeMic('pagehide')
+    resetMicState('pagehide')
+  })
+
   // G2 プラグインから戻ってきた場合、ホスト側セッションにはプラグインのコンテナが
   // 残っている。createStartUpPageContainer はセッションにつき 1 回きりなので、
   // 初回描画を rebuildPageContainer に切り替える (拒否されたら create へ戻る)。
@@ -3989,6 +4723,8 @@ async function boot(): Promise<void> {
     initRenderer(bridge)
     // renderer 内から出る例外的な送信 (復帰後ガード再描画) も、この 1 本の直列路を通す
     setRendererExclusiveSender(runExclusiveG2Send)
+    // 時間切れで諦めた送信の会計を受け取り、詰まっている間は新規送信を見送る
+    setRendererStallHooks({ onTimeout: onBridgeSendTimeout, onLateSettle: onBridgeSendLateSettle })
     // 取り込み (performTakeover) の直前に no-op へ差し替えるので、取り込みに失敗して
     // headlenss に戻る時に同じ内容を再登録できるよう、登録処理を関数で持っておく。
     const installHandlers = (): void => setEventHandlers({
@@ -3998,6 +4734,7 @@ async function boot(): Promise<void> {
       // cc-message:  上下=本文スクロール / click=選択肢画面へ / dbl=キャンセルして idle へ
       // cc-response: 上下=選択肢移動 / dbl=cc-message へ戻る
       onScrollUp: () => {
+        clearG2Notice()  // 一時通知は次の操作で消す
         if (respondInputBlocked()) return  // 応答 POST 中は応答画面の入力を無視
         if (phase === 'rootlist') moveRootCursor(-1)
         else if (phase === 'pending') void confirmAndSend()
@@ -4007,6 +4744,7 @@ async function boot(): Promise<void> {
         else if (phase === 'cc-response') moveRespondCursor(-1)
       },
       onScrollDown: () => {
+        clearG2Notice()  // 一時通知は次の操作で消す
         if (respondInputBlocked()) return  // 応答 POST 中は応答画面の入力を無視
         if (phase === 'rootlist') moveRootCursor(1)
         else if (phase === 'pending') removeLastSentence() // 末尾1文だけ削除。空になれば idle
@@ -4016,11 +4754,13 @@ async function boot(): Promise<void> {
         else if (phase === 'cc-response') moveRespondCursor(1)
       },
       onClick: () => {
+        clearG2Notice()  // 一時通知は次の操作で消す
         if (respondInputBlocked()) return  // 応答 POST 中はタップも無視
         void toggleRecording()
       },
       // 二重クリック: 各 phase での「戻る/キャンセル」操作
       onDoubleClick: () => {
+        clearG2Notice()  // 一時通知は次の操作で消す
         // プラグインへの遷移待ちで固まっている場合は、まずそれを中止する。
         // (接続先が落ちていると Connecting 表示のまま戻れなくなるため)
         // 描画停止だけが残っている状態 (取り込み直前で失敗した等) も同じ口で解く。
@@ -4047,6 +4787,10 @@ async function boot(): Promise<void> {
         }
       },
       onAudio: (pcm) => {
+        // 録音画面にいる間は無条件で音を通す。マイク取得の決着を条件にすると、
+        // ホストが応答を返さない時に届いている音まで捨ててしまう
+        // (PCM の経路は audioControl の応答とは別)。ASR 側は接続前なら
+        // rtSession?.send() が黙って捨てるので、ここで守る必要は無い。
         if (phase !== 'recording') return
         trackPcmFrame(pcm)
         rtSession?.send(pcm)
@@ -4075,20 +4819,34 @@ async function boot(): Promise<void> {
         // 録音中に離脱した場合はここで必ず後始末する。放置するとマイクが開いたまま、
         // 音声認識の WebSocket も開いたままになり、離脱のたびに積み上がる。
         // 録音済みの確定文 (pendingSentences) は abortRecording が保持する。
-        if (phase === 'recording') {
-          log('foreground exit during recording — aborting')
+        // 判断は phase だけでなくマイクの実態でも行う: 取得の途中で畳まれた等で
+        // 「録音画面ではないがマイクは握ったまま」になっている場合もここで解く。
+        if (phase === 'recording' || micIsHeld() || rtSession) {
+          log('foreground exit — 録音/マイクを後始末します')
           void abortRecording()
         }
         // ページが破棄されている可能性に備え、次回入場時に createStartUpPageContainer に戻す
+        resetPageState()
+      },
+      // 異常終了 / OS 側からの終了。foreground exit と同じ後始末をする。
+      // ここを黙殺していたので、落ち方によってはマイクを握ったまま消えていた。
+      onAppExit: (kind) => {
+        diag(`${kind} — foreground exit と同じ後始末をします`)
+        if (phase === 'recording' || micIsHeld() || rtSession) void abortRecording()
+        // 未決着の取得を握ったまま終わらせない (次の起動まで残ることがある)。
+        resetMicState('app-exit')
         resetPageState()
       },
       onLog: (msg) => log(msg),
     })
     reinstallG2EventHandlers = installHandlers
     installHandlers()
+    // イベント購読は初回描画より先に済ませる。描画の後ろに置くと、描画が 1 回
+    // タイムアウトしただけで購読ごと飛ばされ、以後タップも音声も一切届かない
+    // (画面は出ているのに全く反応しないアプリになる)。
+    bridge.onEvenHubEvent(onEvenHubEvent)
     try {
       await sendShowScreen(buildG2Header(), buildG2Content(), buildG2Footer())
-      bridge.onEvenHubEvent(onEvenHubEvent)
     } catch (err) {
       log(`G2 initial render error: ${err}`)
     }

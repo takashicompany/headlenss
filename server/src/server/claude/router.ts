@@ -11,10 +11,10 @@ import { detectLiveOwners } from './live-owner.ts';
 import * as store from './store.ts';
 import { resolveTmuxSessionName } from './tmux-resolver.ts';
 import { captureOutput, sendKey, sendKeys } from '../tmux.ts';
-import { extractChatFromTranscript, extractLastAssistantText, sanitizeChatText } from './transcript.ts';
+import { extractChatFromTranscript, extractLastAssistantText, readTailLines, sanitizeChatText } from './transcript.ts';
 import { extractCodexChatFromTranscript } from '../codex/transcript.ts';
-import { detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
-import { matchUiSubmission } from '../uiSubmissions.ts';
+import { detectAgentPaneTexts, detectCodexSessions, getCodexHookHealth, isCodexPermissionPrompt } from '../codex/status.ts';
+import { confirmDelivery, getDeliveryWarning, startQueuedDeliveryTimer, type DeliveryWarning } from '../uiSubmissions.ts';
 import { detectG2Plugins, tmuxSessionPaths, type G2Plugin } from '../g2-plugins.ts';
 import {
   deleteSessionStatusObservation,
@@ -23,6 +23,7 @@ import {
   pruneSessionStatusObservations,
   resolveTrackedSessionStatus,
 } from '../session-status.ts';
+import { resolveScreenBlocked } from '../screen-block.ts';
 import type { AskQuestion, ChatItem, HookDecision, Pending, RespondInput, SessionStatus } from './types.ts';
 
 const exec = promisify(execFile);
@@ -128,6 +129,9 @@ type HookPayload = {
   tool_name?: string;
   tool_input?: { questions?: AskQuestion[]; [k: string]: unknown };
   source?: string;
+  /** 同一イベントの二重フック (global 設定 + project 設定の両方に入っている等) を
+   *  見分けるためのターン識別子。提供されないエージェントもあるので任意。 */
+  turn_id?: string;
   // Stop / SubagentStop で送られる「今のターンの最終アシスタント本文」。
   // transcript は非同期書き込みでフック発火時にまだ今ターン分を含まないため、
   // 公式ドキュメントはこちらを使うよう指示している。
@@ -208,7 +212,14 @@ claudeRouter.post('/hooks/user-prompt-submit', async (c) => {
   const text = (body.prompt ?? '').trim();
   console.log(`[hook] user-prompt tmux=${tmuxName} len=${text.length}`);
   if (text) {
-    const origin = matchUiSubmission(tmuxName, text) ? 'ui' as const : 'external' as const;
+    // このフックが「エージェントが本文を受理した」唯一の証拠 = 送達の ACK。
+    // origin (UI 由来か外部入力か) の判定も同じ突き合わせで返ってくる。
+    const { origin } = confirmDelivery({
+      tmuxName,
+      text,
+      sessionId: body.session_id,
+      turnId: body.turn_id,
+    });
     store.appendChat(tmuxName, 'user', text, { origin });
   }
   return c.json({});
@@ -245,6 +256,10 @@ claudeRouter.post('/hooks/stop', async (c) => {
       source: 'claude',
     });
   }
+  // Claude が処理中の間に送った本文は入力キューに積まれ、今のターンが終わってから
+  // 受理される。このターンが終わった今が、その送信の ACK を待ち始めるべき時点。
+  // (Codex の Tab キューと同じ扱い。codex/router.ts の stop フックと対になる。)
+  startQueuedDeliveryTimer(tmuxName);
   // 今ターンの本文は payload の last_assistant_message を最優先で使う。
   // transcript は非同期書き込みなので、フック発火時点ではまだ今ターン分が
   // 書かれておらず、読みに行くと「1ターン前の返答」を拾ってしまう。
@@ -261,6 +276,9 @@ claudeRouter.post('/hooks/stop', async (c) => {
   // ターン終了マーカーを立てる: registry の busy が idle に追いつくまでの
   // ラグの間、考え中インジケータをこちらで先に消す。
   store.markStopped(tmuxName);
+  // ターンが終わった = 回答待ちだった用件も決着している可能性が高い契機。
+  // watcher が寿命切れで居なくなった後に TUI で回答されたケースを、ここで拾う。
+  await clearPendingIfAnsweredInTranscript(tmuxName, 'stop');
   return c.json({});
 });
 
@@ -598,6 +616,118 @@ function startTuiAnswerWatcher(tmuxName: string, toolUseId: string, transcriptPa
   tuiWatchers.set(tmuxName, entry);
 }
 
+// ───────── 回答済みなのに残った用件の後片付け ─────────
+//
+// TUI 回答の検出は上の watcher が主役だが、watcher には寿命 (TUI_WATCHER_MAX_MS)
+// がある。それを過ぎてからユーザが TUI で回答すると、pending を消す主体が誰も
+// 居なくなり、画面に「回答待ち」が残り続ける (実際に 23 時間残った例がある)。
+// そこで watcher とは別に、
+//   - ターンが終わった時 (Stop hook)         … 回答が済んだ有力な契機
+//   - 用件を画面に返そうとした時 (GET /pending, GET /chat)
+// の 2 つの契機で「その用件、もう transcript に答えが書かれていないか」を見直す。
+// 判定材料は watcher と同じ「その tool_use に対する tool_result の存在」。
+
+/** 遅延検証で読む transcript の tail 行数。
+ *  tool_result は tool_use の直後に書かれるので、普通は末尾寄りに居る。
+ *  回答後に長い作業が続いて tail から溢れた用件は検出できないが、その場合も
+ *  「表示が残る」だけで実害は無く、次の用件が来れば上書きされる。 */
+const ANSWERED_CHECK_TAIL_LINES = 300;
+/** 閲覧時に遅延検証を掛け始める用件の年齢。
+ *  作られた直後の用件は watcher が見ているので、こちらは手を出さない。 */
+const ANSWERED_CHECK_MIN_AGE_MS = 30_000;
+/** 「まだ未解決だった」という判定を使い回す期間。
+ *  pending 表示中はクライアントが数秒おきにポーリングするので、これが無いと
+ *  毎回 transcript を読みに行くことになる。 */
+const ANSWERED_CHECK_CACHE_MS = 10_000;
+
+type TranscriptTailReader = (filePath: string, minLines: number) => Promise<string[]>;
+let readTranscriptTail: TranscriptTailReader = readTailLines;
+/** テスト用: transcript の tail 読みを差し替える (読み取り回数の計測用)。 */
+export function setTranscriptTailReaderForTest(fn: TranscriptTailReader | null): void {
+  readTranscriptTail = fn ?? readTailLines;
+}
+
+/** pending id → 「未解決」と判定した時刻。解決済みなら消えるので溜まらない。 */
+const unresolvedCheckCache = new Map<string, number>();
+function rememberUnresolved(pendingId: string): void {
+  const now = Date.now();
+  // 期限切れの記録を捨ててから入れる (定期タイマーを持たずに上限を保つ)。
+  for (const [id, at] of unresolvedCheckCache) {
+    if (now - at >= ANSWERED_CHECK_CACHE_MS) unresolvedCheckCache.delete(id);
+  }
+  unresolvedCheckCache.set(pendingId, now);
+}
+
+/** transcript に「その tool_use に対する tool_result」が書かれているか
+ *  (= TUI 側で回答が確定しているか)。読めない場合は false (消さない側に倒す)。 */
+async function transcriptHasToolResult(transcriptPath: string, toolUseId: string): Promise<boolean> {
+  const lines = await readTranscriptTail(transcriptPath, ANSWERED_CHECK_TAIL_LINES).catch(() => []);
+  for (const line of lines) {
+    // 文字列マッチで粗く絞ってから JSON で確認する (watcher と同じ判定)。
+    if (!line.includes(toolUseId)) continue;
+    let obj: { message?: { content?: unknown } };
+    try {
+      obj = JSON.parse(line) as typeof obj;
+    } catch {
+      continue; // 壊れた行 / tail の切れ端
+    }
+    const content = obj.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (
+        block && typeof block === 'object' &&
+        (block as { type?: string }).type === 'tool_result' &&
+        (block as { tool_use_id?: string }).tool_use_id === toolUseId
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * 回答済みなのに残っている AskUserQuestion の用件を消す。
+ *
+ * trigger:
+ *   'stop' … ターン終了時。年齢もキャッシュも見ない (tool_result があるなら決着済み)。
+ *   'view' … 用件を画面に返す直前。ANSWERED_CHECK_MIN_AGE_MS 未満の若い用件は
+ *            watcher に任せ、判定結果は ANSWERED_CHECK_CACHE_MS だけ使い回す。
+ *
+ * transcript の書き込みは非同期なので、TUI で回答した直後の契機ではまだ
+ * tool_result が書かれていないことがある。その場合ここでは何もしない
+ * (= 消えなければ次の契機で再判定する) ことで許容する。
+ */
+async function clearPendingIfAnsweredInTranscript(
+  tmuxName: string,
+  trigger: 'stop' | 'view',
+): Promise<void> {
+  const pending = store.getPending(tmuxName);
+  if (!pending || pending.kind !== 'question') return;
+  if (!pending.toolUseId || !pending.transcriptPath) return;
+  const ageMs = Date.now() - pending.createdAt;
+  if (trigger === 'view') {
+    if (ageMs < ANSWERED_CHECK_MIN_AGE_MS) return;
+    const checkedAt = unresolvedCheckCache.get(pending.id);
+    if (checkedAt !== undefined && Date.now() - checkedAt < ANSWERED_CHECK_CACHE_MS) return;
+  }
+  const answered = await transcriptHasToolResult(pending.transcriptPath, pending.toolUseId);
+  if (!answered) {
+    if (trigger === 'view') rememberUnresolved(pending.id);
+    return;
+  }
+  // 読みに行った当人だけを消す (この await の間に別の用件へ入れ替わりうる)。
+  if (!store.clearPendingIfId(tmuxName, pending.id)) return;
+  unresolvedCheckCache.delete(pending.id);
+  // 自分が決着を見つけた用件を見張っている watcher が居れば止める (孤児にしない)。
+  const watcher = tuiWatchers.get(tmuxName);
+  if (watcher && watcher.toolUseId === pending.toolUseId) watcher.cancel();
+  console.log(
+    `[pending] answered-in-transcript cleared (${trigger}) tmux=${tmuxName} ` +
+    `toolUseId=${pending.toolUseId} ageMs=${ageMs}`,
+  );
+}
+
 claudeRouter.post('/hooks/permission-request', async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as HookPayload;
   const tmuxName = await getTmuxName(c);
@@ -687,10 +817,12 @@ claudeRouter.get('/claude/sessions', async (c) => {
   const trackedAlive = liveTmux ? store.listSessions() : tracked;
 
   // 検出 + live owner (今その画面を握っている本人)。失敗は [] / null に倒して sticky。
-  const [detected, codexDetected, liveOwners] = await Promise.all([
+  const [detected, codexDetected, liveOwners, paneTexts] = await Promise.all([
     detectClaudeSessions().catch(() => []),
     detectCodexSessions().catch(() => []),
     detectLiveOwners().catch(() => null),
+    // 画面ブロック検知用の pane テキスト。codex 検出と同じ走査結果なので tmux 呼び出しは増えない。
+    detectAgentPaneTexts().catch(() => new Map<string, string>()),
   ]);
 
   const merged: Array<{
@@ -705,6 +837,12 @@ claudeRouter.get('/claude/sessions', async (c) => {
     codexHookHealth?: ReturnType<typeof getCodexHookHealth>;
     codexNeedsHookAttention?: boolean;
     lastChat?: string;
+    /** 対話ウィザード等が pane を占有していて、通常の入力欄が画面に見えていない。
+     *  status は据え置きなので、既存クライアントはこのフィールドを無視できる。 */
+    screenBlocked?: true;
+    /** 送ったのに ACK (UserPromptSubmit) が返ってこなかった直近の送信。
+     *  確認できた時点で消える (未確認のときだけ付く)。 */
+    deliveryWarning?: DeliveryWarning;
     /** セッションの作業フォルダ配下で動いている G2 プラグインの dev server */
     g2Plugins?: G2Plugin[];
   }> = [];
@@ -765,6 +903,13 @@ claudeRouter.get('/claude/sessions', async (c) => {
     if (effSource === 'claude') {
       const sc = storeMatched ? st : undefined;
       const { status, statusChangedAt } = resolveTrackedSessionStatus({ ...signals, source: 'claude' });
+      // /api/sessions と同じ共有関数で判定するので、2 つの一覧で答えがズレない。
+      const screenBlocked = resolveScreenBlocked({
+        tmuxSessionName: name,
+        source: 'claude',
+        status,
+        paneText: paneTexts.get(name),
+      });
       merged.push({
         tmuxSessionName: name,
         cwd: sc?.cwd || cd?.cwd || '',
@@ -774,6 +919,8 @@ claudeRouter.get('/claude/sessions', async (c) => {
         lastSeenAt: sc?.lastSeenAt ?? cd?.startedAt ?? 0,
         source: 'claude',
         lastChat,
+        screenBlocked: screenBlocked ? true : undefined,
+        deliveryWarning: getDeliveryWarning(name),
       });
     } else {
       const sx = storeMatched ? st : undefined;
@@ -790,6 +937,7 @@ claudeRouter.get('/claude/sessions', async (c) => {
         codexHookHealth: cwd ? getCodexHookHealth(cwd) : undefined,
         codexNeedsHookAttention: xd?.needsHookAttention,
         lastChat,
+        deliveryWarning: getDeliveryWarning(name),
       });
     }
   }
@@ -816,6 +964,10 @@ claudeRouter.get('/claude/sessions', async (c) => {
 claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   const tmuxName = c.req.param('tmuxName');
   await clearStaleCodexPermissionIfTmuxNoLongerAsking(tmuxName);
+  // 回答済みなのに残っている質問の用件を、返す前に落とす。
+  // ここ (session を読む前) で消すと status も一緒に idle へ戻るので、
+  // pending だけ消えて「(awaiting question…)」が残る不整合にならない。
+  await clearPendingIfAnsweredInTranscript(tmuxName, 'view');
   const session = store.getSession(tmuxName);
 
   // ── Always call (cached) detect for status resolution ──
@@ -826,10 +978,12 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   // (store cwd/ccSessionId preferred, detect as fallback).
   type DetResult = Awaited<ReturnType<typeof detectClaudeSessions>>[number] | undefined;
   type CodexDetResult = Awaited<ReturnType<typeof detectCodexSessions>>[number] | undefined;
-  const [detected, codexDetected, liveOwners] = await Promise.all([
+  const [detected, codexDetected, liveOwners, paneTexts] = await Promise.all([
     detectClaudeSessions().catch(() => []),
     detectCodexSessions().catch(() => []),
     detectLiveOwners().catch(() => null),
+    // 画面ブロック検知用の pane テキスト (走査結果の使い回し。tmux 呼び出しは増えない)。
+    detectAgentPaneTexts().catch(() => new Map<string, string>()),
   ]);
   // live owner (今その画面を握っている本人) を source の権威にする。
   const owner = liveOwners?.get(tmuxName);
@@ -987,9 +1141,20 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
   const codexHookHealth = effSource === 'codex'
     ? (!storeIsStale && session?.cwd ? getCodexHookHealth(session.cwd) : codexDet?.hookHealth)
     : undefined;
+  // 画面ブロック: 一覧と同じ共有関数で判定する (チャット画面の注意文用)。
+  const screenBlocked = resolveScreenBlocked({
+    tmuxSessionName: tmuxName,
+    source: effSource,
+    status,
+    paneText: paneTexts.get(tmuxName),
+  });
+  // 送達警告: 送ったのに ACK が来ていない直近の送信 (確認できたら消える)。
+  const deliveryWarning = getDeliveryWarning(tmuxName);
   return c.json({
     chat: merged,
     status,
+    ...(screenBlocked ? { screenBlocked: true as const } : {}),
+    ...(deliveryWarning ? { deliveryWarning } : {}),
     // stale (別 agent の残骸) の pending は表示しない (store は書き換えない=表示抑止のみ)。
     pending: storeIsStale ? null : (session?.pending ?? null),
     source: effSource,
@@ -1001,6 +1166,9 @@ claudeRouter.get('/claude/sessions/:tmuxName/chat', async (c) => {
 claudeRouter.get('/claude/sessions/:tmuxName/pending', async (c) => {
   const tmuxName = c.req.param('tmuxName');
   await clearStaleCodexPermissionIfTmuxNoLongerAsking(tmuxName);
+  // /chat と同じ遅延検証。ここだけ素通しすると、chat では消えた用件が
+  // pending からだけ降ってきて、クライアントが決着済みの回答画面を開いてしまう。
+  await clearPendingIfAnsweredInTranscript(tmuxName, 'view');
   const session = store.getSession(tmuxName);
   // chat エンドポイントと同じ stale 判定を掛ける。ここだけ素通しすると、chat 側が
   // 「別 agent の残骸なので出さない」と決めた用件が pending だけ降ってきて、
