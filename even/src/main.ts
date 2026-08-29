@@ -77,6 +77,18 @@ import {
   t,
   type Language,
 } from './i18n'
+import { installOneShotTimerGuard } from './timer-guard'
+
+// SDK (0.0.10 以降) の one-shot タイマーは、ホストの __tickShadowTimers と
+// 実タイマーの両方から発火することがある = 1 回のはずの処理が 2 回走る。
+// clearTimeout では防げない (詳細は timer-guard.ts)。ここで包んで「高々 1 回」にする。
+//
+// 呼ぶ位置が重要:
+//   ・SDK の import より後 … SDK は import 時に window.setTimeout を差し替えるので、
+//                            先に包むと上書きされて無意味になる。
+//                            import は本体より先に評価されるのでこの位置なら必ず後。
+//   ・アプリが最初のタイマーを張るより前 … 下の startHistoryRenderTimer() 等より上。
+installOneShotTimerGuard()
 
 // ───────────────────────────────────────────────────────────────────────
 // 利用シーン: G2 をかけてポケットのスマホ (このWebView) で動かす。

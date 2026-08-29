@@ -132,19 +132,33 @@ export function setRendererStallHooks(hooks: BridgeStallHooks): void {
  */
 async function withBridgeTimeout<T>(op: string, p: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
+  // この送信の時間切れを会計に載せたか。1 回の送信は高々 1 本しか未決着にならない。
+  //
+  // なぜフラグが要るか: SDK の one-shot タイマーは ホストの __tickShadowTimers と
+  // 実タイマーの両方から発火しうる (timer-guard.ts 参照)。素直に書くと 1 本の送信で
+  // onTimeout が 2 回呼ばれ、未決着カウントが実際の 2 倍に膨らむ。決着しない送信では
+  // 減ることも無いので、送信 1 本で抑制の閾値 (2 本) に到達し、以後ずっと送信を
+  // 見送り続ける = レンズが更新されなくなる。
+  //
+  // timer-guard.ts で入口を塞いではいるが、あれは読み込み順に依存する対処なので、
+  // 会計が壊れると被害が大きいこの一点だけは自前でも冪等にしておく。
+  let counted = false
   try {
     return await Promise.race([
       p,
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
-          stallHooks.onTimeout(op)
-          // 諦めた本数を後で戻せるよう、元の Promise の決着だけは見届ける。
-          // (never settle なら永久に減らないが、それが実態なので会計としては正しい。
-          //  飢餓しないよう、呼び出し元はバックオフ後に必ず 1 本試す。)
-          p.then(
-            () => stallHooks.onLateSettle(op, true),
-            () => stallHooks.onLateSettle(op, false),
-          )
+          if (!counted) {
+            counted = true
+            stallHooks.onTimeout(op)
+            // 諦めた本数を後で戻せるよう、元の Promise の決着だけは見届ける。
+            // (never settle なら永久に減らないが、それが実態なので会計としては正しい。
+            //  飢餓しないよう、呼び出し元はバックオフ後に必ず 1 本試す。)
+            p.then(
+              () => stallHooks.onLateSettle(op, true),
+              () => stallHooks.onLateSettle(op, false),
+            )
+          }
           reject(new Error(`bridge ${op} timed out after ${BRIDGE_SEND_TIMEOUT_MS}ms`))
         }, BRIDGE_SEND_TIMEOUT_MS)
       }),
