@@ -18,6 +18,11 @@ export default defineConfig({
         changeOrigin: true,
         ws: true,
       },
+      // セッションの成果物 (プレビュータブ) はサーバが配信するので dev でも通す
+      '/preview': {
+        target: 'http://localhost:3000',
+        changeOrigin: true,
+      },
     },
   },
 });

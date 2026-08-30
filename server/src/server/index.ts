@@ -764,7 +764,20 @@ app.post('/api/asr', async (c) => {
 //
 // /api/* のあとで、SPA のフォールバック (下の app.get('/*')) より前に置く。
 // 配信するのは「ファイル型を宣言しているセッション」の作業フォルダだけ (web-preview.ts)。
-app.on(['GET', 'HEAD'], '/preview/*', servePreview);
+//
+// パターン登録 (`app.on(..., '/preview/*')`) ではなくミドルウェアで拾う。
+// Hono のルータは `..` を含むパスをワイルドカードに一致させないので、パターンだけだと
+// そういうリクエストがここを素通りする。実際には HTTP 層 (Request の URL 解決) で
+// `..` は先に潰されるため `/preview/<s>/../../etc/passwd` は `/etc/passwd` という
+// 別のパスとして届く (= SPA のフォールバック行き。他の未知パスと同じ扱い) が、
+// 経路の前提を 1 段減らしておく。エンコードされて生き残る形 (`..%2F` 等) は
+// この先の resolveInside が落とす。
+app.use('/*', async (c, next) => {
+  if (c.req.method !== 'GET' && c.req.method !== 'HEAD') return next();
+  const path = c.req.path;
+  if (path !== '/preview' && !path.startsWith('/preview/')) return next();
+  return servePreview(c);
+});
 
 if (existsSync(WEB_DIST)) {
   const indexHtml = readFileSync(resolve(WEB_DIST, 'index.html'), 'utf-8');

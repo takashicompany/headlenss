@@ -215,8 +215,10 @@ function sendHeaders(absPath: string, size: number): Record<string, string> {
  * ファイル型を 1 件以上宣言しているセッションだけ、その作業フォルダを配信する。
  */
 export async function servePreview(c: Context): Promise<Response> {
-  const url = new URL(c.req.url);
-  const m = /^\/preview\/([^/]+)(\/.*)?$/.exec(url.pathname);
+  // 正規化されていない生のパスで判定する。`new URL(...).pathname` は WHATWG の
+  // 規則で `..` を解決してしまうので、traversal を試したリクエストが別のパスに
+  // 化けてしまう (`/preview/s/../../etc/passwd` → `/etc/passwd`)。
+  const m = /^\/preview\/([^/]+)(\/.*)?$/.exec(c.req.path);
   if (m === null) return c.text('Not Found', 404);
 
   let sessionName: string;
@@ -230,7 +232,7 @@ export async function servePreview(c: Context): Promise<Response> {
   const root = await resolveSessionCwd(sessionName);
   if (!root) return c.text('Not Found', 404);
 
-  return servePreviewFromRoot(c, sessionName, root, m[2], url.search);
+  return servePreviewFromRoot(c, sessionName, root, m[2], new URL(c.req.url).search);
 }
 
 /**

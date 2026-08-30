@@ -372,7 +372,10 @@ button {
    名前はユーザが付けるので長さが読めない。1 つあたりを頭打ちにして、
    帯からはみ出したら帯ごと横スクロールさせる (tmux / chat は必ず見える)。 */
 .mode-toggle {
-  max-width: 60vw;
+  /* 帯の幅はヘッダ基準で決める (スプリットビューの狭い右ペインでもはみ出さない) */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 60%;
   overflow-x: auto;
   scrollbar-width: none;
 }

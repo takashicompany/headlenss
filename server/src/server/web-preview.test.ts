@@ -130,15 +130,25 @@ test('buildWebTabs: セッション名と日本語ファイル名は URL エン�
 
 // ── 配信 (/preview/<session>/<path>) ─────────────────────────────────────
 
-/** servePreviewFromRoot をテスト用の root に固定してリクエストする */
+/**
+ * servePreviewFromRoot をテスト用の root に固定してリクエストする。
+ *
+ * 本番 (index.ts) と同じ形にする: ミドルウェアで拾い、その後ろに SPA の
+ * フォールバックを置く。パターン登録だと Hono のルータが `..` を含むパスを
+ * 一致させず、traversal の試行が SPA まで抜けてしまうため、その回帰も見る。
+ */
 function makeApp(): Hono {
   const app = new Hono();
-  app.on(['GET', 'HEAD'], '/preview/*', (c) => {
-    const path = new URL(c.req.url).pathname;
+  app.use('/*', async (c, next) => {
+    if (c.req.method !== 'GET' && c.req.method !== 'HEAD') return next();
+    const path = c.req.path;
+    if (path !== '/preview' && !path.startsWith('/preview/')) return next();
     const m = /^\/preview\/([^/]+)(\/.*)?$/.exec(path);
     if (m === null) return c.text('Not Found', 404);
     return servePreviewFromRoot(c, m[1], root, m[2]);
   });
+  // SPA のフォールバック (ここに落ちたら preview 側が拾い損ねている)
+  app.get('/*', (c) => c.html('<!doctype html>SPA'));
   return app;
 }
 
@@ -187,18 +197,32 @@ test('配信: パストラバーサル・隠しファイル・symlink 脱出は 
   await writeConf('レポート = report/index.html');
   const app = makeApp();
   const bad = [
-    '/preview/s/../../etc/passwd',
-    '/preview/s/report/../../outside/secret.html',
+    // 素の `..` は fetch の URL 解決で潰れて /preview/ 配下に来ないので、
+    // ここでは「エンコードして生き残る形」を見る (素の形は次のテスト)。
     '/preview/s/..%2F..%2Fetc%2Fpasswd',
+    '/preview/s/report/..%2F..%2Foutside%2Fsecret.html',
+    '/preview/s/%2e%2e/outside/secret.html',
     '/preview/s/.env',
     '/preview/s/.git/config',
     '/preview/s/escape.html',
     '/preview/s/escape-dir/secret.html',
+    '/preview/s/report/style.css%00.html',
   ];
   for (const p of bad) {
     const res = await app.request(p);
     assert.equal(res.status, 404, `通してはいけない: ${p} (status ${res.status})`);
   }
+});
+
+test('配信: 正規化されていない `..` が届いても 404', async () => {
+  // curl --path-as-is のように、生の `..` がそのままサーバまで来た場合。
+  // fetch/Request では URL が正規化されて再現できないので、配信の本体を直接叩く。
+  await writeConf('レポート = report/index.html');
+  const app = new Hono();
+  app.get('/probe', (c) => servePreviewFromRoot(c, 's', root, '/../../etc/passwd'));
+  app.get('/probe2', (c) => servePreviewFromRoot(c, 's', root, '/report/../../outside/secret.html'));
+  assert.equal((await app.request('/probe')).status, 404);
+  assert.equal((await app.request('/probe2')).status, 404);
 });
 
 test('配信: HEAD は本文なしで Content-Length を返す', async () => {
