@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { SessionList } from './pages/SessionList.tsx';
-import { SessionView } from './pages/SessionView.tsx';
-import { ChatView } from './pages/ChatView.tsx';
+import { SessionPane } from './pages/SessionPane.tsx';
+import type { Mode } from './pages/SessionTabs.tsx';
 import { useLanguage } from './i18n.tsx';
 
-type Mode = 'tmux' | 'chat';
+/** localStorage に覚えるのは tmux / chat だけ (preview は開いたタブに依存するため) */
+type StoredMode = 'tmux' | 'chat';
 
 type SystemStatus = {
   cpuPercent: number | null;
@@ -12,14 +13,14 @@ type SystemStatus = {
 };
 type Route =
   | { name: 'list' }
-  | { name: 'session'; sessionName: string; mode: Mode };
+  | { name: 'session'; sessionName: string; mode: Mode; tab: string | null };
 
 // localStorage 上のセッション別モード設定。
 //   { [sessionName]: 'chat'|'tmux', __default?: 'chat'|'tmux' }
 // __default は「過去に何かしらモードを選んだことがあるユーザの新セッション初期値」。
 const MODES_STORAGE_KEY = 'headlenss.modes';
 
-type ModeMap = { __default?: Mode; [sessionName: string]: Mode | undefined };
+type ModeMap = { __default?: StoredMode; [sessionName: string]: StoredMode | undefined };
 
 function readModeMap(): ModeMap {
   try {
@@ -41,10 +42,14 @@ function writeModeMap(map: ModeMap): void {
 
 function readModeFromUrl(): Mode | null {
   const m = new URL(window.location.href).searchParams.get('mode');
-  return m === 'chat' || m === 'tmux' ? m : null;
+  return m === 'chat' || m === 'tmux' || m === 'preview' ? m : null;
 }
 
-function readModeFromStorage(sessionName: string): Mode | null {
+function readTabFromUrl(): string | null {
+  return new URL(window.location.href).searchParams.get('tab');
+}
+
+function readModeFromStorage(sessionName: string): StoredMode | null {
   const map = readModeMap();
   const v = map[sessionName] ?? map.__default;
   return v === 'chat' || v === 'tmux' ? v : null;
@@ -52,7 +57,8 @@ function readModeFromStorage(sessionName: string): Mode | null {
 
 /** URL > localStorage[sessionName] > localStorage.__default > tmux の優先順。
  *  URL に mode が無ければ解決した値を URL に書き戻して以後 URL を真実とする
- *  (ブックマーク・共有を確実にするため)。 */
+ *  (ブックマーク・共有を確実にするため)。
+ *  `mode=preview` のときだけ `tab=<登録名>` が併記される。 */
 function resolveMode(sessionName: string): Mode {
   const fromUrl = readModeFromUrl();
   if (fromUrl) return fromUrl;
@@ -68,23 +74,31 @@ function getRoute(): Route {
   const m = window.location.pathname.match(/^\/sessions\/([^/]+)\/?$/);
   if (m) {
     const sessionName = decodeURIComponent(m[1]);
+    const mode = resolveMode(sessionName);
     return {
       name: 'session',
       sessionName,
-      mode: resolveMode(sessionName),
+      mode,
+      tab: mode === 'preview' ? readTabFromUrl() : null,
     };
   }
   return { name: 'list' };
 }
 
-function setMode(sessionName: string, mode: Mode): void {
-  const map = readModeMap();
-  map[sessionName] = mode;
-  // 新セッションを開いた時のフォールバックとして「最後に明示的に選んだモード」も覚えておく
-  map.__default = mode;
-  writeModeMap(map);
+function setMode(sessionName: string, mode: Mode, tab?: string): void {
+  // preview は localStorage に覚えない。登録タブはセッション固有で消えることもあるため、
+  // 「新しいセッションを開いたら中身の無いプレビューが既定になる」事故を避ける。
+  if (mode !== 'preview') {
+    const map = readModeMap();
+    map[sessionName] = mode;
+    // 新セッションを開いた時のフォールバックとして「最後に明示的に選んだモード」も覚えておく
+    map.__default = mode;
+    writeModeMap(map);
+  }
   const url = new URL(window.location.href);
   url.searchParams.set('mode', mode);
+  if (mode === 'preview' && tab) url.searchParams.set('tab', tab);
+  else url.searchParams.delete('tab');
   window.history.replaceState(null, '', url.toString());
 }
 
@@ -185,9 +199,9 @@ export function App() {
     setRoute(getRoute());
   };
 
-  const switchMode = (mode: Mode) => {
+  const switchMode = (mode: Mode, tab?: string) => {
     if (route.name !== 'session') return;
-    setMode(route.sessionName, mode);
+    setMode(route.sessionName, mode, tab);
     setRoute(getRoute());
   };
 
@@ -315,9 +329,16 @@ export function App() {
   ) : null;
 
   if (isSplitActive) {
-    const rightPane = route.mode === 'chat'
-      ? <ChatView key={route.sessionName} sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
-      : <SessionView key={route.sessionName} sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />;
+    const rightPane = (
+      <SessionPane
+        key={route.sessionName}
+        sessionName={route.sessionName}
+        mode={route.mode}
+        tab={route.tab}
+        onBack={() => navigate('/')}
+        onSwitchMode={switchMode}
+      />
+    );
 
     return (
       <div className="split-container" ref={splitContainerRef}>
@@ -350,10 +371,19 @@ export function App() {
   }
 
   // Classic mode
+  // key を付けて、別セッションへ移った時に画面ごと作り直す
+  // (付けないと開いていたタブやプレビューの iframe が次のセッションへ持ち越される)
   const page = route.name === 'session'
-    ? route.mode === 'chat'
-      ? <ChatView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
-      : <SessionView sessionName={route.sessionName} onBack={() => navigate('/')} onSwitchMode={switchMode} />
+    ? (
+      <SessionPane
+        key={route.sessionName}
+        sessionName={route.sessionName}
+        mode={route.mode}
+        tab={route.tab}
+        onBack={() => navigate('/')}
+        onSwitchMode={switchMode}
+      />
+    )
     : <SessionList onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`)} headerMetrics={metrics as ReactNode} splitToggle={splitToggle} />;
 
   return page;

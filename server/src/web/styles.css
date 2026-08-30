@@ -368,6 +368,121 @@ button {
   color: var(--text);
 }
 
+/* 登録タブ (.headlenss-plugins.conf に書かれた成果物 / dev server)。
+   名前はユーザが付けるので長さが読めない。1 つあたりを頭打ちにして、
+   帯からはみ出したら帯ごと横スクロールさせる (tmux / chat は必ず見える)。 */
+.mode-toggle {
+  max-width: 60vw;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.mode-toggle::-webkit-scrollbar {
+  display: none;
+}
+
+.mode-toggle-btn {
+  flex: none;
+  white-space: nowrap;
+}
+
+.mode-toggle-btn--web {
+  max-width: 9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── プレビュー画面 (登録タブの中身) ── */
+
+/* いま選ばれていないプレビュー画面。iframe は DOM に残したまま隠す
+   (中の状態を失わない = ブラウザのタブと同じ) */
+.preview-view--hidden {
+  display: none;
+}
+
+/* ヘッダの ↻ / ↗。文字だけの小さいボタンなので幅を詰める */
+.preview-action {
+  flex: none;
+  margin-left: auto;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.35rem 0.55rem;
+}
+
+/* ↗ は <a> なので .session-header button の指定が効かない。同じ見た目を書く */
+.preview-action--link {
+  margin-left: 0;
+  display: inline-flex;
+  align-items: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.preview-action--link:hover {
+  border-color: var(--accent);
+}
+
+.preview-action:disabled {
+  opacity: 0.4;
+}
+
+/* タブ帯を除いた残り全部が、開いている成果物 */
+.preview-stage {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background: #000;
+}
+
+.preview-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+/* 開いたことがあるだけで、いまは選ばれていないタブ */
+.preview-frame--off {
+  display: none;
+}
+
+/* 出せない時の説明 (mixed content / 宣言が消えた) */
+.preview-notice {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 0.6rem;
+  padding: 1.2rem;
+  background: var(--bg);
+  color: var(--text);
+  overflow-y: auto;
+}
+
+.preview-notice__title {
+  font-weight: 600;
+}
+
+.preview-notice__body {
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.preview-notice__link {
+  color: var(--accent);
+}
+
+.preview-notice__url {
+  font-size: 0.8rem;
+  color: var(--muted);
+  word-break: break-all;
+}
+
 /* チャットモード */
 .chat-view {
   background: var(--bg);

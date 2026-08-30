@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
@@ -9,7 +9,6 @@ import {
 import { extractImagesFromClipboard, filterImageFiles, uploadImage } from '../uploads.ts';
 import { useLanguage } from '../i18n.tsx';
 
-type Mode = 'tmux' | 'chat';
 type ChatMessage = { role: 'user' | 'assistant'; text: string; ts: number; synthetic?: boolean; origin?: 'ui' | 'external'; agent?: 'claude' | 'codex' };
 type SessionStatus = 'idle' | 'busy' | 'waiting-permission' | 'waiting-question';
 const INITIAL_VISIBLE_MESSAGES = 20;
@@ -149,11 +148,12 @@ const ChatMessageItem = React.memo(function ChatMessageItem({
 export function ChatView({
   sessionName,
   onBack,
-  onSwitchMode,
+  modeTabs,
 }: {
   sessionName: string;
   onBack: () => void;
-  onSwitchMode: (m: Mode) => void;
+  /** ヘッダに置くタブ帯 (`tmux | chat | 登録タブ…`)。SessionPane が組み立てる */
+  modeTabs: ReactNode;
 }) {
   const { t, language } = useLanguage();
   // サーバから返ってくる確定 chat
@@ -643,23 +643,7 @@ export function ChatView({
       <header className="session-header">
         <button onClick={onBack} aria-label={t('back')}>{t('back')}</button>
         <span className="session-title">{sessionName}</span>
-        <div className="mode-toggle" role="group" aria-label={t('viewMode')}>
-          <button
-            type="button"
-            className="mode-toggle-btn"
-            onClick={() => onSwitchMode('tmux')}
-            aria-pressed={false}
-          >
-            tmux
-          </button>
-          <button
-            type="button"
-            className="mode-toggle-btn active"
-            aria-pressed={true}
-          >
-            chat
-          </button>
-        </div>
+        {modeTabs}
       </header>
       <div
         ref={scrollerRef}

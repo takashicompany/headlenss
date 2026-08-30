@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
@@ -17,16 +17,15 @@ type ServerMsg =
   | { type: 'attached'; cols: number; rows: number }
   | { type: 'exit'; code: number };
 
-type Mode = 'tmux' | 'chat';
-
 export function SessionView({
   sessionName,
   onBack,
-  onSwitchMode,
+  modeTabs,
 }: {
   sessionName: string;
   onBack: () => void;
-  onSwitchMode: (m: Mode) => void;
+  /** ヘッダに置くタブ帯 (`tmux | chat | 登録タブ…`)。SessionPane が組み立てる */
+  modeTabs: ReactNode;
 }) {
   const { t } = useLanguage();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -365,23 +364,7 @@ export function SessionView({
         >
           ⟳ fit
         </button>
-        <div className="mode-toggle" role="group" aria-label={t('viewMode')}>
-          <button
-            type="button"
-            className="mode-toggle-btn active"
-            aria-pressed={true}
-          >
-            tmux
-          </button>
-          <button
-            type="button"
-            className="mode-toggle-btn"
-            onClick={() => onSwitchMode('chat')}
-            aria-pressed={false}
-          >
-            chat
-          </button>
-        </div>
+        {modeTabs}
       </header>
       <div ref={containerRef} className="terminal-container" />
       {sessionMissing && (
