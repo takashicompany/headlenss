@@ -29,6 +29,7 @@ import {
 } from './session-status.ts';
 import { pruneScreenBlockObservations, resolveScreenBlocked } from './screen-block.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
+import { handleWebTabs, servePreview } from './web-preview.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIST = resolve(__dirname, '../../dist/web');
@@ -583,6 +584,13 @@ app.post('/api/sessions/:name/input', async (c) => {
   }
 });
 
+// ───────── Web UI のプレビュータブ ─────────
+//
+// セッションの作業フォルダの .headlenss-plugins.conf に宣言された「開けるもの」を
+// Web UI 用に返す (URL 型 = dev server / PWA、ファイル型 = 作業フォルダの中の HTML)。
+// G2 の一覧 (/api/claude/sessions の g2Plugins) は URL 型だけなので、そちらとは別口。
+app.get('/api/sessions/:name/webtabs', handleWebTabs);
+
 app.route('/api', claudeRouter);
 app.route('/api', codexRouter);
 
@@ -751,6 +759,12 @@ app.post('/api/asr', async (c) => {
     return c.json({ error: (e as Error).message }, 500);
   }
 });
+
+// ───────── 成果物の静的配信 (/preview/<session>/<path>) ─────────
+//
+// /api/* のあとで、SPA のフォールバック (下の app.get('/*')) より前に置く。
+// 配信するのは「ファイル型を宣言しているセッション」の作業フォルダだけ (web-preview.ts)。
+app.on(['GET', 'HEAD'], '/preview/*', servePreview);
 
 if (existsSync(WEB_DIST)) {
   const indexHtml = readFileSync(resolve(WEB_DIST, 'index.html'), 'utf-8');
