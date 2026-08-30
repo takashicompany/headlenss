@@ -389,6 +389,13 @@ export default defineConfig({
 | 書式が効かない | サーバのログに `[g2-plugins]` の警告が出る。行番号と理由が書かれている |
 | そもそも機能が無い | グラス側アプリが 2.5.0 未満。更新する |
 
+## 関連
+
+- 同じ宣言ファイル (`.headlenss-plugins.conf`) は headlenss の Web UI (PC / スマホ) の
+  プレビュータブにも使われる。URL 型の宣言はグラスと Web の両方に出る。作った HTML を
+  相対パスで宣言して Web だけに出す方法は `headlenss-preview-tabs` スキルへ。
+- dev server の立て方 (ポートの選び方・HTTPS 化) は `headlenss-dev-server` スキルへ。
+
 ## 前提
 
 - headlenss app 2.5.0 以降

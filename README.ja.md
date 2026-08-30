@@ -51,7 +51,7 @@ PC
 headlenss/
 ├── server/   # PCで動くサーバー (tmux管理API + Web UI + ASR)
 ├── even/     # Even G2用アプリ (スマホWebView上で動くTS Webアプリ)
-└── plugin/   # Claude Code / Codex のフック (lifecycle hooks → server) + 同梱スキル
+└── plugin/   # Claude Code / Codex のフック (lifecycle hooks → server) + 同梱スキル (Claude/Codex 両対応)
 ```
 
 ## できること
@@ -127,19 +127,21 @@ npm run hooks:install   # Claude Code と Codex 両方のフックを ~/.claude�
 > Claude 側は `~/.claude/settings.json` に、Codex 側は `~/.codex/hooks.json` に直接書き込む方式。
 > **マーケットプレイス版 (`/plugin install headlenss@headlenss`) と併用すると hook が二重発火する**ので、どちらか一方にすること。詳細は [plugin/README.md](./plugin/README.md) を参照。
 
-### 4. (任意) 同梱の Claude Code スキルを入れる
+### 4. (任意) 同梱のエージェントスキルを入れる
 
-Claude Code に headlenss 自体の操作方法を教えるスキル。
+Claude Code と Codex に headlenss 自体の操作方法を教えるスキル。
 
 - `headlenss-new-session` — API で新しい tmux セッション(エージェント作業場)を作る。
 - `headlenss-g2-plugin` — 開発中の G2 プラグインをセッション一覧に出し、グラスから開く。
 - `headlenss-dev-server` — headlenss のポートを奪わずに dev server を立てて tailnet に公開する。
+- `headlenss-preview-tabs` — 作った HTML や dev server を Web UI のセッション画面のタブに出し、スマホ/PC から 1 タップで確認できるようにする。
 
 ```bash
 cd server
-npm run skills:install   # plugin/skills/* を ~/.claude/skills/ にコピーする
+npm run skills:install   # plugin/skills/* を ~/.claude/skills/ と $CODEX_HOME/skills/ にコピーする
 ```
 
+- 配置先は `~/.claude/skills/` (Claude Code) と `$CODEX_HOME/skills/` (Codex。未設定なら `~/.codex/skills/`) の両方。どちらのエージェントで作業していても同じ手順書が使える。
 - シンボリックリンクではなくコピーなので、リポジトリを移動・削除しても動く。`git pull` 後に再実行すれば更新される。外すときは `npm run skills:uninstall`。
 - サーバが `http://127.0.0.1:3000` 以外なら `HEADLENSS_SERVER_URL=http://<host>:3000 npm run skills:install`。差し替わるのは `headlenss-new-session` スキルのみ (他のスキルは headlenss が動くマシン上で使う前提のため、ループバック表記のまま残る)。
 

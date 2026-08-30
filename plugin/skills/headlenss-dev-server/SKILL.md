@@ -153,3 +153,5 @@ dev server プロセスは各ツールの手順で止める (Ctrl-C / npm script
 ## 関連
 
 - 立てた dev server を G2 のプラグイン一覧に出したい場合は `headlenss-g2-plugin` スキルへ。
+- 立てた dev server を headlenss の Web UI (PC / スマホ) のタブに出したい場合は
+  `headlenss-preview-tabs` スキルへ。作った HTML をそのまま出す場合 (dev server 不要) も同じ。
