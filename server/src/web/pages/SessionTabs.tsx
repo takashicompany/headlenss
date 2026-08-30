@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLanguage } from '../i18n.tsx';
 
-// セッション画面のタブ帯。`tmux | chat | <登録タブ...>` を 1 本に並べる。
+// セッション画面のヘッダに置く tmux / chat の切り替えと、
+// チャット画面の下に並べる「登録タブ」の一覧取得。
 //
 // 登録タブは、セッションの作業フォルダの .headlenss-plugins.conf に書かれたもの
 // (サーバ側 web-preview.ts が /api/sessions/<name>/webtabs で返す)。
-// 見た目は従来のモード切替トグル (.mode-toggle) をそのまま伸ばしたもので、
-// 登録が 0 件なら以前と同じ 2 ボタンの帯になる。
+// ヘッダのモード切替とは同格ではなく、チャットの中のタブとして並ぶ (PreviewStage.tsx)。
 
-export type Mode = 'tmux' | 'chat' | 'preview';
+export type Mode = 'tmux' | 'chat';
 
 export type WebTab = {
   /** 宣言ファイルに書かれた表示名。タブの見出しであり URL の `tab=` の値でもある */
@@ -68,18 +68,13 @@ export function useWebTabs(sessionName: string): WebTabsState {
   return { tabs, loaded, refresh: fetchTabs };
 }
 
-export function SessionTabs({
+/** ヘッダの tmux / chat 切り替え。SessionView と ChatView が同じものを使う。 */
+export function ModeToggle({
   mode,
-  activeTab,
-  tabs,
   onSwitchMode,
-  onSwitchTab,
 }: {
   mode: Mode;
-  activeTab: string | null;
-  tabs: WebTab[];
   onSwitchMode: (m: Mode) => void;
-  onSwitchTab: (name: string) => void;
 }) {
   const { t } = useLanguage();
   return (
@@ -87,7 +82,7 @@ export function SessionTabs({
       <button
         type="button"
         className={`mode-toggle-btn${mode === 'tmux' ? ' active' : ''}`}
-        onClick={() => onSwitchMode('tmux')}
+        onClick={mode === 'tmux' ? undefined : () => onSwitchMode('tmux')}
         aria-pressed={mode === 'tmux'}
       >
         tmux
@@ -95,26 +90,11 @@ export function SessionTabs({
       <button
         type="button"
         className={`mode-toggle-btn${mode === 'chat' ? ' active' : ''}`}
-        onClick={() => onSwitchMode('chat')}
+        onClick={mode === 'chat' ? undefined : () => onSwitchMode('chat')}
         aria-pressed={mode === 'chat'}
       >
         chat
       </button>
-      {tabs.map((tab) => {
-        const on = mode === 'preview' && activeTab === tab.name;
-        return (
-          <button
-            key={tab.name}
-            type="button"
-            className={`mode-toggle-btn mode-toggle-btn--web${on ? ' active' : ''}`}
-            onClick={() => onSwitchTab(tab.name)}
-            aria-pressed={on}
-            title={tab.name}
-          >
-            {tab.name}
-          </button>
-        );
-      })}
     </div>
   );
 }

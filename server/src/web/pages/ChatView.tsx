@@ -8,6 +8,8 @@ import {
 } from 'react-ios-keyboard-viewport';
 import { extractImagesFromClipboard, filterImageFiles, uploadImage } from '../uploads.ts';
 import { useLanguage } from '../i18n.tsx';
+import { useWebTabs } from './SessionTabs.tsx';
+import { PreviewActions, PreviewStage, Tabstrip, useFrameReload } from './PreviewStage.tsx';
 
 type ChatMessage = { role: 'user' | 'assistant'; text: string; ts: number; synthetic?: boolean; origin?: 'ui' | 'external'; agent?: 'claude' | 'codex' };
 type SessionStatus = 'idle' | 'busy' | 'waiting-permission' | 'waiting-question';
@@ -149,11 +151,16 @@ export function ChatView({
   sessionName,
   onBack,
   modeTabs,
+  tab,
+  onSwitchTab,
 }: {
   sessionName: string;
   onBack: () => void;
-  /** ヘッダに置くタブ帯 (`tmux | chat | 登録タブ…`)。SessionPane が組み立てる */
+  /** ヘッダに置く tmux / chat の切り替え。SessionPane が組み立てる */
   modeTabs: ReactNode;
+  /** 開いている登録タブの名前 (URL の `tab=`)。null = チャットのタブ */
+  tab: string | null;
+  onSwitchTab: (name: string | null) => void;
 }) {
   const { t, language } = useLanguage();
   // サーバから返ってくる確定 chat
@@ -638,416 +645,483 @@ export function ChatView({
     }
   }, [input]);
 
+  // ── チャットの中のタブ (登録した成果物 / dev server) ──
+  // ヘッダの tmux / chat とは同格ではなく、チャット画面の下に帯として並ぶ。
+  // 登録が 0 件のセッションでは帯そのものを出さない (従来のチャット画面と同じ見た目)。
+  const { tabs: webTabs, loaded: webTabsLoaded, refresh: refreshWebTabs } = useWebTabs(sessionName);
+  const { reloadKeys, bumpReload } = useFrameReload();
+  const activeWebTab = webTabs.find((tb) => tb.name === tab) ?? null;
+  // 一度でも開いたタブ。iframe を残す対象 (ブラウザのタブと同じ扱い)
+  const [openedTabs, setOpenedTabs] = useState<string[]>([]);
+  useEffect(() => {
+    if (tab === null) return;
+    setOpenedTabs((prev) => (prev.includes(tab) ? prev : [...prev, tab]));
+  }, [tab]);
+
+  // タブ帯の実高さ。「一番下へ」ボタンは入力欄の上に出したいので、帯のぶんも持ち上げる。
+  // (キーボードが出ている間は入力欄が visualViewport の下端へ移り、帯はその裏に隠れるので
+  //  帯のぶんは足さない。)
+  const tabstripRef = useRef<HTMLDivElement>(null);
+  const [tabstripHeight, setTabstripHeight] = useState(0);
+  useEffect(() => {
+    const el = tabstripRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') {
+      setTabstripHeight(el?.offsetHeight ?? 0);
+      return;
+    }
+    const ro = new ResizeObserver(() => setTabstripHeight(el.offsetHeight));
+    ro.observe(el);
+    setTabstripHeight(el.offsetHeight);
+    return () => ro.disconnect();
+  }, [webTabs.length]);
+
+  const reloadActiveTab = useCallback(() => {
+    if (tab !== null) bumpReload(tab);
+    // 一覧も取り直す。ファイル型は ?v=<mtime> が変わるので、直した内容が確実に載る。
+    void refreshWebTabs();
+  }, [tab, bumpReload, refreshWebTabs]);
+
   return (
-    <div className="page-session chat-view">
+    <div className={`page-session chat-view${webTabs.length > 0 ? ' chat-view--tabbed' : ''}`}>
       <header className="session-header">
         <button onClick={onBack} aria-label={t('back')}>{t('back')}</button>
         <span className="session-title">{sessionName}</span>
+        {activeWebTab !== null && (
+          <PreviewActions active={activeWebTab} onReload={reloadActiveTab} />
+        )}
         {modeTabs}
       </header>
-      <div
-        ref={scrollerRef}
-        onScroll={onScroll}
-        className="chat-scroller"
-        style={scrollerPaddingBottom ? { paddingBottom: scrollerPaddingBottom } : undefined}
-      >
-        {screenBlocked && (
-          <div className="chat-diagnostic chat-diagnostic-blocked">
-            <div className="chat-diagnostic-title">⚠ {t('screenBlockedTitle')}</div>
-            <div className="chat-diagnostic-body">{t('screenBlockedBody')}</div>
-          </div>
-        )}
-
-        {source === 'codex' && codexHookHealth && (codexHookHealth.status !== 'ok' || codexNeedsHookAttention) && (
-          <div className="chat-diagnostic">
-            <div className="chat-diagnostic-title">
-              {codexHookHealth.status === 'missing'
-                ? t('codexHooksMissingTitle')
-                : codexHookHealth.status === 'incomplete'
-                ? t('codexHooksIncompleteTitle')
-                : t('codexHooksNeedTrustTitle')}
+      {/* 会話 (チャットのタブ)。プレビューのタブを開いている間は隠すだけで
+          アンマウントしない — 会話の読み込み・入力途中・スクロール位置を保つ。
+          display: contents なので、隠していない間のレイアウトは従来と同じ。 */}
+      <div className={`chat-body${tab !== null ? ' chat-body--hidden' : ''}`}>
+        <div
+          ref={scrollerRef}
+          onScroll={onScroll}
+          className="chat-scroller"
+          style={scrollerPaddingBottom ? { paddingBottom: scrollerPaddingBottom } : undefined}
+        >
+          {screenBlocked && (
+            <div className="chat-diagnostic chat-diagnostic-blocked">
+              <div className="chat-diagnostic-title">⚠ {t('screenBlockedTitle')}</div>
+              <div className="chat-diagnostic-body">{t('screenBlockedBody')}</div>
             </div>
-            <div className="chat-diagnostic-body">
-              {codexHookHealth.notes[0] ?? t('codexHooksNeedTrustBody')}
-              {codexHookHealth.missingEvents.length > 0 && (
-                <div>{t('codexHooksMissingEvents')}: {codexHookHealth.missingEvents.join(', ')}</div>
+          )}
+
+          {source === 'codex' && codexHookHealth && (codexHookHealth.status !== 'ok' || codexNeedsHookAttention) && (
+            <div className="chat-diagnostic">
+              <div className="chat-diagnostic-title">
+                {codexHookHealth.status === 'missing'
+                  ? t('codexHooksMissingTitle')
+                  : codexHookHealth.status === 'incomplete'
+                  ? t('codexHooksIncompleteTitle')
+                  : t('codexHooksNeedTrustTitle')}
+              </div>
+              <div className="chat-diagnostic-body">
+                {codexHookHealth.notes[0] ?? t('codexHooksNeedTrustBody')}
+                {codexHookHealth.missingEvents.length > 0 && (
+                  <div>{t('codexHooksMissingEvents')}: {codexHookHealth.missingEvents.join(', ')}</div>
+                )}
+              </div>
+              <code className="chat-diagnostic-command">{codexHookHealth.setupCommand}</code>
+            </div>
+          )}
+
+          {displayChat.length === 0 ? (
+            <div className="chat-empty">{t('chatEmpty')}</div>
+          ) : (
+            <>
+              {hasOlderChat && (
+                <button
+                  type="button"
+                  className="chat-show-older"
+                  onClick={() => setVisibleLimit((limit) => limit + VISIBLE_MESSAGES_STEP)}
+                >
+                  {t('showOlderMessages')}
+                  <span>{visibleStart} {t('hiddenMessagesCount')}</span>
+                </button>
               )}
+              {visibleChat.map((m, i) => {
+                const globalIndex = visibleStart + i;
+                const isPending = globalIndex >= filteredServerCount;
+                return (
+                  <ChatMessageItem
+                    key={m.role + ':' + m.ts + ':' + globalIndex + ':' + m.text.slice(0, 32)}
+                    message={m}
+                    isPending={isPending}
+                    t={t}
+                  />
+                );
+              })}
+            </>
+          )}
+          {status !== 'idle' && (
+            <div className={`chat-status chat-status-${status}`}>
+              <span className="chat-status-dot" aria-hidden="true" />
+              <span className="chat-status-text">
+                {status === 'busy' && t('statusBusy')}
+                {status === 'waiting-permission' && t('statusWaitingPermission')}
+                {status === 'waiting-question' && t('statusWaitingQuestion')}
+              </span>
             </div>
-            <code className="chat-diagnostic-command">{codexHookHealth.setupCommand}</code>
-          </div>
-        )}
+          )}
 
-        {displayChat.length === 0 ? (
-          <div className="chat-empty">{t('chatEmpty')}</div>
-        ) : (
-          <>
-            {hasOlderChat && (
-              <button
-                type="button"
-                className="chat-show-older"
-                onClick={() => setVisibleLimit((limit) => limit + VISIBLE_MESSAGES_STEP)}
-              >
-                {t('showOlderMessages')}
-                <span>{visibleStart} {t('hiddenMessagesCount')}</span>
-              </button>
-            )}
-            {visibleChat.map((m, i) => {
-              const globalIndex = visibleStart + i;
-              const isPending = globalIndex >= filteredServerCount;
+          {pendingInter?.kind === 'question' && pendingInter.questions && pendingInter.questions.length > 0 && (() => {
+            const totalQ = pendingInter.questions.length;
+            const idx = Math.max(0, Math.min(currentQIdx, totalQ));
+            // 各質問が回答済みか
+            const isAnswered = (i: number): boolean => {
+              const k = qKind[i] ?? 'predefined';
+              if (k === 'chat-about-this') return true;
+              if (k === 'type-something') return (qFreeText[i] ?? '').trim().length > 0;
+              // predefined: multi-select は配列に 1 件以上、single-select は label がある
+              const q = pendingInter.questions?.[i];
+              if (q?.multiSelect) return (qSelectionsMulti[i] ?? []).length > 0;
+              return typeof qSelections[i] === 'string' && (qSelections[i] as string).length > 0;
+            };
+            const allAnswered = pendingInter.questions.every((_q, i) => isAnswered(i));
+            const hasChatAbout = pendingInter.questions.some((_q, i) => qKind[i] === 'chat-about-this');
+
+            // 確認&送信画面
+            if (idx === totalQ) {
               return (
-                <ChatMessageItem
-                  key={m.role + ':' + m.ts + ':' + globalIndex + ':' + m.text.slice(0, 32)}
-                  message={m}
-                  isPending={isPending}
-                  t={t}
-                />
+                <div className="chat-pending">
+                  <div className="chat-pending-title">
+                    {hasChatAbout ? t('confirmCancelTitle') : t('confirmAnswersTitle')}
+                  </div>
+                  {pendingInter.questions.map((q, qi) => {
+                    const k = qKind[qi] ?? 'predefined';
+                    return (
+                      <div key={qi} className="chat-pending-summary">
+                        <div className="chat-pending-summary-q">
+                          Q{qi + 1}. {q.question}
+                        </div>
+                        <div className="chat-pending-summary-a">
+                          {k === 'chat-about-this' && t('summaryChatAbout')}
+                          {k === 'type-something' && (
+                            <>→ <span style={{ fontStyle: 'italic' }}>{t('freeTextParen')}</span> {qFreeText[qi] ?? ''}</>
+                          )}
+                          {k === 'predefined' && (() => {
+                            const isMulti = !!q.multiSelect;
+                            if (isMulti) {
+                              const arr = qSelectionsMulti[qi] ?? [];
+                              if (arr.length === 0) return <em>{t('unanswered')}</em>;
+                              return <>→ {arr.join(', ')}</>;
+                            }
+                            if (!qSelections[qi]) return <em>{t('unanswered')}</em>;
+                            return (
+                              <>
+                                → {qSelections[qi]}
+                                {qNotes[qi]?.trim() && (
+                                  <span className="chat-pending-summary-note">{t('notePrefix')}{qNotes[qi]}</span>
+                                )}
+                              </>
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div className="chat-pending-actions">
+                    <button
+                      type="button"
+                      className="chat-pending-back"
+                      onClick={() => setCurrentQIdx(totalQ - 1)}
+                      disabled={respondingPending}
+                    >
+                      {t('back')}
+                    </button>
+                    <button
+                      type="button"
+                      className="chat-pending-submit"
+                      onClick={submitQuestion}
+                      disabled={respondingPending || (!allAnswered && !hasChatAbout)}
+                    >
+                      {respondingPending
+                        ? t('sendingEllipsis')
+                        : hasChatAbout
+                        ? t('sendCancellation')
+                        : allAnswered
+                        ? t('send')
+                        : t('unansweredRemain')}
+                    </button>
+                  </div>
+                </div>
               );
-            })}
-          </>
-        )}
-        {status !== 'idle' && (
-          <div className={`chat-status chat-status-${status}`}>
-            <span className="chat-status-dot" aria-hidden="true" />
-            <span className="chat-status-text">
-              {status === 'busy' && t('statusBusy')}
-              {status === 'waiting-permission' && t('statusWaitingPermission')}
-              {status === 'waiting-question' && t('statusWaitingQuestion')}
-            </span>
-          </div>
-        )}
+            }
 
-        {pendingInter?.kind === 'question' && pendingInter.questions && pendingInter.questions.length > 0 && (() => {
-          const totalQ = pendingInter.questions.length;
-          const idx = Math.max(0, Math.min(currentQIdx, totalQ));
-          // 各質問が回答済みか
-          const isAnswered = (i: number): boolean => {
-            const k = qKind[i] ?? 'predefined';
-            if (k === 'chat-about-this') return true;
-            if (k === 'type-something') return (qFreeText[i] ?? '').trim().length > 0;
-            // predefined: multi-select は配列に 1 件以上、single-select は label がある
-            const q = pendingInter.questions?.[i];
-            if (q?.multiSelect) return (qSelectionsMulti[i] ?? []).length > 0;
-            return typeof qSelections[i] === 'string' && (qSelections[i] as string).length > 0;
-          };
-          const allAnswered = pendingInter.questions.every((_q, i) => isAnswered(i));
-          const hasChatAbout = pendingInter.questions.some((_q, i) => qKind[i] === 'chat-about-this');
-
-          // 確認&送信画面
-          if (idx === totalQ) {
+            const q = pendingInter.questions[idx];
+            const kind = qKind[idx] ?? 'predefined';
+            const selected = qSelections[idx];
+            const isMulti = !!q.multiSelect;
+            const multiArr = qSelectionsMulti[idx] ?? [];
             return (
               <div className="chat-pending">
                 <div className="chat-pending-title">
-                  {hasChatAbout ? t('confirmCancelTitle') : t('confirmAnswersTitle')}
+                  {t('questionFromClaude')} ({idx + 1} / {totalQ}){isMulti && <span className="chat-pending-multi-badge">{t('multiSelectBadge')}</span>}
                 </div>
-                {pendingInter.questions.map((q, qi) => {
-                  const k = qKind[qi] ?? 'predefined';
-                  return (
-                    <div key={qi} className="chat-pending-summary">
-                      <div className="chat-pending-summary-q">
-                        Q{qi + 1}. {q.question}
-                      </div>
-                      <div className="chat-pending-summary-a">
-                        {k === 'chat-about-this' && t('summaryChatAbout')}
-                        {k === 'type-something' && (
-                          <>→ <span style={{ fontStyle: 'italic' }}>{t('freeTextParen')}</span> {qFreeText[qi] ?? ''}</>
-                        )}
-                        {k === 'predefined' && (() => {
-                          const isMulti = !!q.multiSelect;
-                          if (isMulti) {
-                            const arr = qSelectionsMulti[qi] ?? [];
-                            if (arr.length === 0) return <em>{t('unanswered')}</em>;
-                            return <>→ {arr.join(', ')}</>;
-                          }
-                          if (!qSelections[qi]) return <em>{t('unanswered')}</em>;
-                          return (
-                            <>
-                              → {qSelections[qi]}
-                              {qNotes[qi]?.trim() && (
-                                <span className="chat-pending-summary-note">{t('notePrefix')}{qNotes[qi]}</span>
-                              )}
-                            </>
-                          );
-                        })()}
-                      </div>
+                <div className="chat-pending-q">
+                  {q.header && <div className="chat-pending-header">{q.header}</div>}
+                  <div className="chat-pending-qtext">{q.question}</div>
+
+                  {/* predefined 選択肢: multi-select はチェックボックス相当 / single-select は radio 相当 */}
+                  <div className="chat-pending-options">
+                    {(q.options ?? []).map((opt, oi) => {
+                      const active = kind === 'predefined' && (
+                        isMulti ? multiArr.includes(opt.label) : selected === opt.label
+                      );
+                      return (
+                        <button
+                          key={oi}
+                          type="button"
+                          className={`chat-pending-option${active ? ' active' : ''}${isMulti ? ' multi' : ''}`}
+                          onClick={() => {
+                            setQKind((k) => ({ ...k, [idx]: 'predefined' }));
+                            if (isMulti) {
+                              // toggle
+                              setQSelectionsMulti((s) => {
+                                const cur = s[idx] ?? [];
+                                const next = cur.includes(opt.label)
+                                  ? cur.filter((l) => l !== opt.label)
+                                  : [...cur, opt.label];
+                                return { ...s, [idx]: next };
+                              });
+                              // multi-select は手動で「次へ」を押してもらう(自動進行しない)
+                            } else {
+                              setQSelections((s) => ({ ...s, [idx]: opt.label }));
+                              if (!(qNotes[idx] ?? '').trim()) {
+                                setCurrentQIdx(idx + 1);
+                              }
+                            }
+                          }}
+                          disabled={respondingPending || kind === 'type-something'}
+                        >
+                          <span className="chat-pending-option-check">
+                            {isMulti ? (active ? '☑' : '☐') : (active ? '●' : '○')}
+                          </span>
+                          <span className="chat-pending-option-body">
+                            <div className="chat-pending-option-label">{opt.label}</div>
+                            {opt.description && (
+                              <div className="chat-pending-option-desc">{opt.description}</div>
+                            )}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {/* 補足メモ (single-select の predefined option を選んだときに添えて送れる) */}
+                  {kind !== 'type-something' && !isMulti && (
+                    <textarea
+                      className="chat-pending-notes"
+                      placeholder={t('notesPlaceholder')}
+                      rows={1}
+                      value={qNotes[idx] ?? ''}
+                      onChange={(e) => setQNotes((n) => ({ ...n, [idx]: e.target.value }))}
+                      disabled={respondingPending}
+                    />
+                  )}
+
+                  {/* Type something */}
+                  {kind !== 'type-something' ? (
+                    <button
+                      type="button"
+                      className="chat-pending-extra"
+                      onClick={() => setQKind((k) => ({ ...k, [idx]: 'type-something' }))}
+                      disabled={respondingPending}
+                    >
+                      {t('typeSomethingBtn')}
+                    </button>
+                  ) : (
+                    <div className="chat-pending-typesomething">
+                      <div className="chat-pending-typesomething-label">{t('freeTextLabel')}</div>
+                      <textarea
+                        className="chat-pending-notes"
+                        placeholder={t('freeTextPlaceholder')}
+                        rows={2}
+                        value={qFreeText[idx] ?? ''}
+                        onChange={(e) => setQFreeText((n) => ({ ...n, [idx]: e.target.value }))}
+                        autoFocus
+                      />
+                      <button
+                        type="button"
+                        className="chat-pending-cancel-type"
+                        onClick={() => {
+                          setQKind((k) => { const { [idx]: _, ...rest } = k; return rest; });
+                          setQFreeText((n) => { const { [idx]: _, ...rest } = n; return rest; });
+                        }}
+                      >
+                        {t('cancelFreeText')}
+                      </button>
                     </div>
-                  );
-                })}
+                  )}
+
+                  {/* Chat about this */}
+                  <button
+                    type="button"
+                    className="chat-pending-chat-about"
+                    onClick={() => {
+                      if (window.confirm(t('chatAboutConfirm'))) {
+                        setQKind((k) => ({ ...k, [idx]: 'chat-about-this' }));
+                        setCurrentQIdx(totalQ); // 直接確認画面へ
+                      }
+                    }}
+                    disabled={respondingPending}
+                  >
+                    {t('chatAboutBtn')}
+                  </button>
+                </div>
                 <div className="chat-pending-actions">
                   <button
                     type="button"
                     className="chat-pending-back"
-                    onClick={() => setCurrentQIdx(totalQ - 1)}
-                    disabled={respondingPending}
+                    onClick={() => setCurrentQIdx(idx - 1)}
+                    disabled={idx === 0 || respondingPending}
                   >
                     {t('back')}
                   </button>
-                  <button
-                    type="button"
-                    className="chat-pending-submit"
-                    onClick={submitQuestion}
-                    disabled={respondingPending || (!allAnswered && !hasChatAbout)}
-                  >
-                    {respondingPending
-                      ? t('sendingEllipsis')
-                      : hasChatAbout
-                      ? t('sendCancellation')
-                      : allAnswered
-                      ? t('send')
-                      : t('unansweredRemain')}
-                  </button>
+                  {isAnswered(idx) && (
+                    <button
+                      type="button"
+                      className="chat-pending-next"
+                      onClick={() => setCurrentQIdx(idx + 1)}
+                      disabled={respondingPending}
+                    >
+                      {idx + 1 === totalQ ? t('toReview') : t('next')}
+                    </button>
+                  )}
                 </div>
               </div>
             );
-          }
+          })()}
 
-          const q = pendingInter.questions[idx];
-          const kind = qKind[idx] ?? 'predefined';
-          const selected = qSelections[idx];
-          const isMulti = !!q.multiSelect;
-          const multiArr = qSelectionsMulti[idx] ?? [];
-          return (
+          {pendingInter?.kind === 'permission' && (
             <div className="chat-pending">
-              <div className="chat-pending-title">
-                {t('questionFromClaude')} ({idx + 1} / {totalQ}){isMulti && <span className="chat-pending-multi-badge">{t('multiSelectBadge')}</span>}
-              </div>
-              <div className="chat-pending-q">
-                {q.header && <div className="chat-pending-header">{q.header}</div>}
-                <div className="chat-pending-qtext">{q.question}</div>
-
-                {/* predefined 選択肢: multi-select はチェックボックス相当 / single-select は radio 相当 */}
-                <div className="chat-pending-options">
-                  {(q.options ?? []).map((opt, oi) => {
-                    const active = kind === 'predefined' && (
-                      isMulti ? multiArr.includes(opt.label) : selected === opt.label
-                    );
-                    return (
-                      <button
-                        key={oi}
-                        type="button"
-                        className={`chat-pending-option${active ? ' active' : ''}${isMulti ? ' multi' : ''}`}
-                        onClick={() => {
-                          setQKind((k) => ({ ...k, [idx]: 'predefined' }));
-                          if (isMulti) {
-                            // toggle
-                            setQSelectionsMulti((s) => {
-                              const cur = s[idx] ?? [];
-                              const next = cur.includes(opt.label)
-                                ? cur.filter((l) => l !== opt.label)
-                                : [...cur, opt.label];
-                              return { ...s, [idx]: next };
-                            });
-                            // multi-select は手動で「次へ」を押してもらう(自動進行しない)
-                          } else {
-                            setQSelections((s) => ({ ...s, [idx]: opt.label }));
-                            if (!(qNotes[idx] ?? '').trim()) {
-                              setCurrentQIdx(idx + 1);
-                            }
-                          }
-                        }}
-                        disabled={respondingPending || kind === 'type-something'}
-                      >
-                        <span className="chat-pending-option-check">
-                          {isMulti ? (active ? '☑' : '☐') : (active ? '●' : '○')}
-                        </span>
-                        <span className="chat-pending-option-body">
-                          <div className="chat-pending-option-label">{opt.label}</div>
-                          {opt.description && (
-                            <div className="chat-pending-option-desc">{opt.description}</div>
-                          )}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-                {/* 補足メモ (single-select の predefined option を選んだときに添えて送れる) */}
-                {kind !== 'type-something' && !isMulti && (
-                  <textarea
-                    className="chat-pending-notes"
-                    placeholder={t('notesPlaceholder')}
-                    rows={1}
-                    value={qNotes[idx] ?? ''}
-                    onChange={(e) => setQNotes((n) => ({ ...n, [idx]: e.target.value }))}
-                    disabled={respondingPending}
-                  />
-                )}
-
-                {/* Type something */}
-                {kind !== 'type-something' ? (
-                  <button
-                    type="button"
-                    className="chat-pending-extra"
-                    onClick={() => setQKind((k) => ({ ...k, [idx]: 'type-something' }))}
-                    disabled={respondingPending}
-                  >
-                    {t('typeSomethingBtn')}
-                  </button>
-                ) : (
-                  <div className="chat-pending-typesomething">
-                    <div className="chat-pending-typesomething-label">{t('freeTextLabel')}</div>
-                    <textarea
-                      className="chat-pending-notes"
-                      placeholder={t('freeTextPlaceholder')}
-                      rows={2}
-                      value={qFreeText[idx] ?? ''}
-                      onChange={(e) => setQFreeText((n) => ({ ...n, [idx]: e.target.value }))}
-                      autoFocus
-                    />
-                    <button
-                      type="button"
-                      className="chat-pending-cancel-type"
-                      onClick={() => {
-                        setQKind((k) => { const { [idx]: _, ...rest } = k; return rest; });
-                        setQFreeText((n) => { const { [idx]: _, ...rest } = n; return rest; });
-                      }}
-                    >
-                      {t('cancelFreeText')}
-                    </button>
-                  </div>
-                )}
-
-                {/* Chat about this */}
-                <button
-                  type="button"
-                  className="chat-pending-chat-about"
-                  onClick={() => {
-                    if (window.confirm(t('chatAboutConfirm'))) {
-                      setQKind((k) => ({ ...k, [idx]: 'chat-about-this' }));
-                      setCurrentQIdx(totalQ); // 直接確認画面へ
-                    }
-                  }}
-                  disabled={respondingPending}
-                >
-                  {t('chatAboutBtn')}
-                </button>
-              </div>
+              <div className="chat-pending-title">{t('permRequestTitle')}</div>
+              <div className="chat-pending-tool">tool: <code>{pendingInter.toolName}</code></div>
+              <pre className="chat-pending-toolinput">
+                {(() => {
+                  try { return JSON.stringify(pendingInter.toolInput, null, 2); }
+                  catch { return String(pendingInter.toolInput); }
+                })()}
+              </pre>
+              <textarea
+                className="chat-pending-notes"
+                placeholder={t('permMessagePlaceholder')}
+                rows={1}
+                value={permMessage}
+                onChange={(e) => setPermMessage(e.target.value)}
+              />
               <div className="chat-pending-actions">
                 <button
                   type="button"
-                  className="chat-pending-back"
-                  onClick={() => setCurrentQIdx(idx - 1)}
-                  disabled={idx === 0 || respondingPending}
+                  className="chat-pending-submit allow"
+                  onClick={() => submitPermission('allow')}
+                  disabled={respondingPending}
                 >
-                  {t('back')}
+                  {t('allow')}
                 </button>
-                {isAnswered(idx) && (
-                  <button
-                    type="button"
-                    className="chat-pending-next"
-                    onClick={() => setCurrentQIdx(idx + 1)}
-                    disabled={respondingPending}
-                  >
-                    {idx + 1 === totalQ ? t('toReview') : t('next')}
-                  </button>
-                )}
+                <button
+                  type="button"
+                  className="chat-pending-submit deny"
+                  onClick={() => submitPermission('deny')}
+                  disabled={respondingPending}
+                >
+                  {t('deny')}
+                </button>
               </div>
             </div>
-          );
-        })()}
-
-        {pendingInter?.kind === 'permission' && (
-          <div className="chat-pending">
-            <div className="chat-pending-title">{t('permRequestTitle')}</div>
-            <div className="chat-pending-tool">tool: <code>{pendingInter.toolName}</code></div>
-            <pre className="chat-pending-toolinput">
-              {(() => {
-                try { return JSON.stringify(pendingInter.toolInput, null, 2); }
-                catch { return String(pendingInter.toolInput); }
-              })()}
-            </pre>
-            <textarea
-              className="chat-pending-notes"
-              placeholder={t('permMessagePlaceholder')}
-              rows={1}
-              value={permMessage}
-              onChange={(e) => setPermMessage(e.target.value)}
-            />
-            <div className="chat-pending-actions">
-              <button
-                type="button"
-                className="chat-pending-submit allow"
-                onClick={() => submitPermission('allow')}
-                disabled={respondingPending}
-              >
-                {t('allow')}
-              </button>
-              <button
-                type="button"
-                className="chat-pending-submit deny"
-                onClick={() => submitPermission('deny')}
-                disabled={respondingPending}
-              >
-                {t('deny')}
-              </button>
-            </div>
-          </div>
+          )}
+        </div>
+        {showScrollToBottom && (
+          <button
+            type="button"
+            className="chat-floating-bottom"
+            onClick={scrollToBottom}
+            aria-label={t('scrollToBottom')}
+            title={t('scrollToBottom')}
+            style={{
+              bottom: `${
+                keyboardHeight > 0
+                  ? keyboardHeight + chatInputHeight + 12
+                  : chatInputHeight + tabstripHeight + 12
+              }px`,
+            }}
+          >
+            <span aria-hidden="true">↓</span>
+            {t('scrollToBottom')}
+          </button>
         )}
+        {error && <div className="chat-error">{t('sendErrorPrefix')}: {error}</div>}
+        {/* 送達未確認の注意は入力欄のすぐ上に出す (次に送るかどうかの判断材料なので)。
+            画面ブロックの注意が出ている時は原因が同じなので、そちらに任せて重ねない。 */}
+        {deliveryWarning && !screenBlocked && (
+          <div className="chat-delivery-warning">⚠ {t('deliveryUnconfirmed')}</div>
+        )}
+        <form
+          ref={chatInputRef}
+          className="chat-input"
+          onSubmit={(e) => { e.preventDefault(); void send(); }}
+          style={
+            keyboardHeight > 0
+              ? { ...chatInputKeyboardStyle, left: 0, right: 0 }
+              : undefined
+          }
+        >
+          <button
+            type="button"
+            className="chat-attach"
+            onClick={() => fileInputRef.current?.click()}
+            aria-label={t('attachImage')}
+            title={t('attachImageTitlePaste')}
+            disabled={uploading}
+          >
+            📎
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              if (e.target.files) {
+                void handleImageFiles(filterImageFiles(e.target.files));
+              }
+              e.target.value = '';
+            }}
+          />
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={onKeyDown}
+            onPaste={onPaste}
+            placeholder={uploading ? t('uploadingEllipsis') : t('messageInputPlaceholder')}
+            rows={1}
+            disabled={sending}
+          />
+          <button type="submit" disabled={sending || !input.trim()}>
+            {sending ? '...' : t('send')}
+          </button>
+        </form>
       </div>
-      {showScrollToBottom && (
-        <button
-          type="button"
-          className="chat-floating-bottom"
-          onClick={scrollToBottom}
-          aria-label={t('scrollToBottom')}
-          title={t('scrollToBottom')}
-          style={{ bottom: `${(keyboardHeight > 0 ? keyboardHeight : 0) + chatInputHeight + 12}px` }}
-        >
-          <span aria-hidden="true">↓</span>
-          {t('scrollToBottom')}
-        </button>
-      )}
-      {error && <div className="chat-error">{t('sendErrorPrefix')}: {error}</div>}
-      {/* 送達未確認の注意は入力欄のすぐ上に出す (次に送るかどうかの判断材料なので)。
-          画面ブロックの注意が出ている時は原因が同じなので、そちらに任せて重ねない。 */}
-      {deliveryWarning && !screenBlocked && (
-        <div className="chat-delivery-warning">⚠ {t('deliveryUnconfirmed')}</div>
-      )}
-      <form
-        ref={chatInputRef}
-        className="chat-input"
-        onSubmit={(e) => { e.preventDefault(); void send(); }}
-        style={
-          keyboardHeight > 0
-            ? { ...chatInputKeyboardStyle, left: 0, right: 0 }
-            : undefined
-        }
-      >
-        <button
-          type="button"
-          className="chat-attach"
-          onClick={() => fileInputRef.current?.click()}
-          aria-label={t('attachImage')}
-          title={t('attachImageTitlePaste')}
-          disabled={uploading}
-        >
-          📎
-        </button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/*"
-          multiple
-          style={{ display: 'none' }}
-          onChange={(e) => {
-            if (e.target.files) {
-              void handleImageFiles(filterImageFiles(e.target.files));
-            }
-            e.target.value = '';
-          }}
+
+      {/* 開いたことのある成果物。チャットに戻っている間も DOM に残す */}
+      {openedTabs.length > 0 && (
+        <PreviewStage
+          tabs={webTabs}
+          activeTab={tab}
+          opened={openedTabs}
+          loaded={webTabsLoaded}
+          hidden={tab === null}
+          reloadKeys={reloadKeys}
         />
-        <textarea
-          ref={inputRef}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={onKeyDown}
-          onPaste={onPaste}
-          placeholder={uploading ? t('uploadingEllipsis') : t('messageInputPlaceholder')}
-          rows={1}
-          disabled={sending}
-        />
-        <button type="submit" disabled={sending || !input.trim()}>
-          {sending ? '...' : t('send')}
-        </button>
-      </form>
+      )}
+
+      {/* タブ帯は画面のいちばん下 (親指で届く位置)。登録が無ければ出さない */}
+      {webTabs.length > 0 && (
+        <Tabstrip tabs={webTabs} activeTab={tab} onSelect={onSwitchTab} stripRef={tabstripRef} />
+      )}
     </div>
   );
 }

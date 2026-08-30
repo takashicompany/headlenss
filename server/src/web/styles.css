@@ -368,76 +368,93 @@ button {
   color: var(--text);
 }
 
-/* 登録タブ (.headlenss-plugins.conf に書かれた成果物 / dev server)。
-   名前はユーザが付けるので長さが読めない。1 つあたりを頭打ちにして、
-   帯からはみ出したら帯ごと横スクロールさせる (tmux / chat は必ず見える)。 */
-.mode-toggle {
-  /* 帯の幅はヘッダ基準で決める (スプリットビューの狭い右ペインでもはみ出さない) */
-  flex: 0 1 auto;
+/* ── チャット画面の中のタブ (.headlenss-plugins.conf に書かれた成果物 / dev server) ──
+   ヘッダの tmux / chat とは同格ではない。チャットの中の切り替えなので、帯は画面の
+   いちばん下 (親指で届く位置) に置き、登録が 0 件なら帯そのものを出さない。 */
+
+/* 会話 (チャットのタブ) 一式。display: contents なので、隠していない間は
+   この div が無かった時とまったく同じレイアウトになる。 */
+.chat-body {
+  display: contents;
+}
+
+/* プレビューのタブを開いている間。会話はアンマウントせず隠すだけ */
+.chat-body--hidden {
+  display: none;
+}
+
+/* タブ帯。タブは下向きに生えて、上にある中身とつながって見える */
+.tabstrip {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.25rem;
+  flex: none;
   min-width: 0;
-  max-width: 60%;
+  padding: 0 0.375rem;
+  /* viewport-fit=cover で画面下端まで伸びるので、帯が下端の安全域を持つ
+     (帯がある間は .chat-input 側の安全域を外して二重に空けない) */
+  padding-bottom: env(safe-area-inset-bottom);
+  background: var(--bg);
+  border-top: 1px solid var(--border);
   overflow-x: auto;
   scrollbar-width: none;
 }
 
-.mode-toggle::-webkit-scrollbar {
+.tabstrip::-webkit-scrollbar {
   display: none;
 }
 
-.mode-toggle-btn {
+/* 帯が出ている間は、下端の安全域は帯が持つ */
+.chat-view--tabbed .chat-input {
+  padding-bottom: 0.6rem;
+}
+
+.tab {
+  appearance: none;
   flex: none;
-  white-space: nowrap;
-}
-
-.mode-toggle-btn--web {
-  max-width: 9rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* ── プレビュー画面 (登録タブの中身) ── */
-
-/* いま選ばれていないプレビュー画面。iframe は DOM に残したまま隠す
-   (中の状態を失わない = ブラウザのタブと同じ) */
-.preview-view--hidden {
-  display: none;
-}
-
-/* ヘッダの ↻ / ↗。文字だけの小さいボタンなので幅を詰める */
-.preview-action {
-  flex: none;
-  margin-left: auto;
-  font-size: 1rem;
-  line-height: 1;
-  padding: 0.35rem 0.55rem;
-}
-
-/* ↗ は <a> なので .session-header button の指定が効かない。同じ見た目を書く */
-.preview-action--link {
-  margin-left: 0;
   display: inline-flex;
   align-items: center;
+  max-width: 11rem;
+  padding: 0.35rem 0.7rem;
+  margin-top: -1px;
   background: transparent;
-  border: 1px solid var(--border);
-  border-radius: 4px;
+  color: var(--muted);
+  border: 1px solid transparent;
+  border-top: 0;
+  border-radius: 0 0 0.5rem 0.5rem;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* 選択中のタブだけ、上の中身とつながって見えるようにする */
+.tab--on {
+  background: var(--panel);
   color: var(--text);
-  text-decoration: none;
+  border-color: var(--border);
+  font-weight: 600;
 }
 
-.preview-action--link:hover {
-  border-color: var(--accent);
+.tab:not(.tab--on):hover {
+  color: var(--text);
 }
 
-.preview-action:disabled {
-  opacity: 0.4;
-}
+/* ── 開いている成果物 ── */
 
-/* タブ帯を除いた残り全部が、開いている成果物 */
+/* 帯を除いた残り全部。チャットのタブに戻っている間は隠すだけで、
+   iframe は DOM に残す (中の状態を失わない = ブラウザのタブと同じ) */
 .preview-stage {
   flex: 1;
   min-height: 0;
   position: relative;
   background: #000;
+}
+
+.preview-stage--hidden {
+  display: none;
 }
 
 .preview-frame {
@@ -450,6 +467,29 @@ button {
 /* 開いたことがあるだけで、いまは選ばれていないタブ */
 .preview-frame--off {
   display: none;
+}
+
+/* ヘッダの ↻ / ↗。プレビューのタブを開いている間だけ出る */
+.preview-action {
+  flex: none;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.35rem 0.55rem;
+}
+
+/* ↗ は <a> なので .session-header button の指定が効かない。同じ見た目を書く */
+.preview-action--link {
+  display: inline-flex;
+  align-items: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.preview-action--link:hover {
+  border-color: var(--accent);
 }
 
 /* 出せない時の説明 (mixed content / 宣言が消えた) */

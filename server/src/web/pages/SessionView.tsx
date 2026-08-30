@@ -24,7 +24,7 @@ export function SessionView({
 }: {
   sessionName: string;
   onBack: () => void;
-  /** ヘッダに置くタブ帯 (`tmux | chat | 登録タブ…`)。SessionPane が組み立てる */
+  /** ヘッダに置く tmux / chat の切り替え。SessionPane が組み立てる */
   modeTabs: ReactNode;
 }) {
   const { t } = useLanguage();

@@ -1,17 +1,11 @@
-import { useEffect, useState } from 'react';
 import { SessionView } from './SessionView.tsx';
 import { ChatView } from './ChatView.tsx';
-import { PreviewView } from './PreviewView.tsx';
-import { SessionTabs, useWebTabs, type Mode } from './SessionTabs.tsx';
+import { ModeToggle, type Mode } from './SessionTabs.tsx';
 
-// 1 セッションぶんの画面。tmux / chat / 登録タブ (プレビュー) を切り替える。
+// 1 セッションぶんの画面。ヘッダの tmux / chat でどちらを出すかを決める。
 //
-// tmux と chat は従来どおり排他でマウントする (WebSocket と xterm を二重に持たない)。
-// プレビューだけは一度開いたら DOM に残し、display:none で隠す — iframe の中身
-// (スクロール位置・入力途中・PWA の状態) を失わないため。
-//
-// タブ一覧の取得はこの層に 1 つだけ持つ。ヘッダのタブ帯は 3 つの画面が同じものを
-// 共有するので、画面を切り替えても取り直しにならない。
+// 登録タブ (成果物 / dev server) はチャットの中のタブなので、この層では扱わない
+// (ChatView が画面下のタブ帯として持つ)。tmux の画面にはタブ帯を出さない。
 
 export function SessionPane({
   sessionName,
@@ -22,53 +16,23 @@ export function SessionPane({
 }: {
   sessionName: string;
   mode: Mode;
-  /** URL の `tab=` (mode が preview のときだけ意味を持つ) */
+  /** URL の `tab=` (mode が chat のときだけ意味を持つ)。null = チャットのタブ */
   tab: string | null;
   onBack: () => void;
-  onSwitchMode: (mode: Mode, tab?: string) => void;
+  onSwitchMode: (mode: Mode, tab?: string | null) => void;
 }) {
-  const { tabs, loaded, refresh } = useWebTabs(sessionName);
-  // 一度でも開いたタブ。iframe を残す対象 (ブラウザのタブと同じ扱い)
-  const [opened, setOpened] = useState<string[]>([]);
+  const modeTabs = <ModeToggle mode={mode} onSwitchMode={(m) => onSwitchMode(m)} />;
 
-  const activeTab = mode === 'preview' ? tab : null;
-
-  useEffect(() => {
-    if (activeTab === null) return;
-    setOpened((prev) => (prev.includes(activeTab) ? prev : [...prev, activeTab]));
-  }, [activeTab]);
-
-  const modeTabs = (
-    <SessionTabs
-      mode={mode}
-      activeTab={activeTab}
-      tabs={tabs}
-      onSwitchMode={(m) => onSwitchMode(m)}
-      onSwitchTab={(name) => onSwitchMode('preview', name)}
-    />
-  );
-
-  return (
-    <>
-      {mode === 'tmux' && (
-        <SessionView sessionName={sessionName} onBack={onBack} modeTabs={modeTabs} />
-      )}
-      {mode === 'chat' && (
-        <ChatView sessionName={sessionName} onBack={onBack} modeTabs={modeTabs} />
-      )}
-      {(mode === 'preview' || opened.length > 0) && (
-        <PreviewView
-          sessionName={sessionName}
-          tabs={tabs}
-          activeTab={activeTab}
-          opened={opened}
-          loaded={loaded}
-          hidden={mode !== 'preview'}
-          onBack={onBack}
-          onRefresh={refresh}
-          modeTabs={modeTabs}
-        />
-      )}
-    </>
-  );
+  if (mode === 'chat') {
+    return (
+      <ChatView
+        sessionName={sessionName}
+        onBack={onBack}
+        modeTabs={modeTabs}
+        tab={tab}
+        onSwitchTab={(name) => onSwitchMode('chat', name)}
+      />
+    );
+  }
+  return <SessionView sessionName={sessionName} onBack={onBack} modeTabs={modeTabs} />;
 }

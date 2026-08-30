@@ -4,8 +4,6 @@ import { SessionPane } from './pages/SessionPane.tsx';
 import type { Mode } from './pages/SessionTabs.tsx';
 import { useLanguage } from './i18n.tsx';
 
-/** localStorage に覚えるのは tmux / chat だけ (preview は開いたタブに依存するため) */
-type StoredMode = 'tmux' | 'chat';
 
 type SystemStatus = {
   cpuPercent: number | null;
@@ -20,7 +18,7 @@ type Route =
 // __default は「過去に何かしらモードを選んだことがあるユーザの新セッション初期値」。
 const MODES_STORAGE_KEY = 'headlenss.modes';
 
-type ModeMap = { __default?: StoredMode; [sessionName: string]: StoredMode | undefined };
+type ModeMap = { __default?: Mode; [sessionName: string]: Mode | undefined };
 
 function readModeMap(): ModeMap {
   try {
@@ -42,14 +40,15 @@ function writeModeMap(map: ModeMap): void {
 
 function readModeFromUrl(): Mode | null {
   const m = new URL(window.location.href).searchParams.get('mode');
-  return m === 'chat' || m === 'tmux' || m === 'preview' ? m : null;
+  return m === 'chat' || m === 'tmux' ? m : null;
 }
 
+/** チャット画面の中で開いている登録タブ。無ければ null = チャットのタブ。 */
 function readTabFromUrl(): string | null {
   return new URL(window.location.href).searchParams.get('tab');
 }
 
-function readModeFromStorage(sessionName: string): StoredMode | null {
+function readModeFromStorage(sessionName: string): Mode | null {
   const map = readModeMap();
   const v = map[sessionName] ?? map.__default;
   return v === 'chat' || v === 'tmux' ? v : null;
@@ -58,7 +57,7 @@ function readModeFromStorage(sessionName: string): StoredMode | null {
 /** URL > localStorage[sessionName] > localStorage.__default > tmux の優先順。
  *  URL に mode が無ければ解決した値を URL に書き戻して以後 URL を真実とする
  *  (ブックマーク・共有を確実にするため)。
- *  `mode=preview` のときだけ `tab=<登録名>` が併記される。 */
+ *  `mode=chat` のときだけ `tab=<登録名>` が併記される (チャット内のタブ)。 */
 function resolveMode(sessionName: string): Mode {
   const fromUrl = readModeFromUrl();
   if (fromUrl) return fromUrl;
@@ -79,25 +78,23 @@ function getRoute(): Route {
       name: 'session',
       sessionName,
       mode,
-      tab: mode === 'preview' ? readTabFromUrl() : null,
+      tab: mode === 'chat' ? readTabFromUrl() : null,
     };
   }
   return { name: 'list' };
 }
 
-function setMode(sessionName: string, mode: Mode, tab?: string): void {
-  // preview は localStorage に覚えない。登録タブはセッション固有で消えることもあるため、
-  // 「新しいセッションを開いたら中身の無いプレビューが既定になる」事故を避ける。
-  if (mode !== 'preview') {
-    const map = readModeMap();
-    map[sessionName] = mode;
-    // 新セッションを開いた時のフォールバックとして「最後に明示的に選んだモード」も覚えておく
-    map.__default = mode;
-    writeModeMap(map);
-  }
+/** 覚えるのは tmux / chat だけ。開いている登録タブ (`tab`) は URL にしか置かない
+ *  (セッション固有で消えることもあるので、新しいセッションの既定値にはしない)。 */
+function setMode(sessionName: string, mode: Mode, tab?: string | null): void {
+  const map = readModeMap();
+  map[sessionName] = mode;
+  // 新セッションを開いた時のフォールバックとして「最後に明示的に選んだモード」も覚えておく
+  map.__default = mode;
+  writeModeMap(map);
   const url = new URL(window.location.href);
   url.searchParams.set('mode', mode);
-  if (mode === 'preview' && tab) url.searchParams.set('tab', tab);
+  if (mode === 'chat' && tab) url.searchParams.set('tab', tab);
   else url.searchParams.delete('tab');
   window.history.replaceState(null, '', url.toString());
 }
@@ -199,7 +196,7 @@ export function App() {
     setRoute(getRoute());
   };
 
-  const switchMode = (mode: Mode, tab?: string) => {
+  const switchMode = (mode: Mode, tab?: string | null) => {
     if (route.name !== 'session') return;
     setMode(route.sessionName, mode, tab);
     setRoute(getRoute());

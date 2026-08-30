@@ -7,6 +7,8 @@
 //   ファイル型 (`名前 = report/index.html`) … セッションの作業フォルダの中の HTML。
 //                                            headlenss サーバ自身が配信する
 //
+// タブはチャット画面の下の帯に並ぶ (ヘッダの tmux / chat とは別の切り替え)。
+//
 // 配信 URL は `/preview/<セッション名>/<相対パス>`。ルートはそのセッションの作業フォルダで、
 // **ファイル型を 1 件以上宣言しているセッションだけ**配信を有効にする。宣言していない
 // セッションのフォルダは 1 バイトも出さない (全セッションの cwd を無条件で公開しない)。
@@ -33,7 +35,7 @@ import { getSessionCwd } from './tmux.ts';
 /** tmux.ts の validateName と同じ規則 (セッション名はそのまま URL に載る) */
 const SESSION_NAME_RE = /^[a-zA-Z0-9_-]{1,40}$/;
 
-/** 配信 URL の接頭辞。web 側 (SessionPane) と揃えること。 */
+/** 配信 URL の接頭辞。web 側 (PreviewStage の iframe) と揃えること。 */
 export const PREVIEW_PREFIX = '/preview';
 
 const MIME: Record<string, string> = {

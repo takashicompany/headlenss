@@ -41,7 +41,8 @@ const STRINGS = {
   moveUp:                 { en: 'Move up', ja: '上へ移動' },
   moveDown:               { en: 'Move down', ja: '下へ移動' },
 
-  // ── セッション画面のプレビュータブ (.headlenss-plugins.conf 由来) ──
+  // ── チャット画面の中のタブ (.headlenss-plugins.conf 由来) ──
+  previewChatTab:         { en: 'Chat', ja: 'チャット' },
   previewReload:          { en: 'Reload this tab', ja: 'このタブを再読込' },
   previewOpenExternal:    { en: 'Open in a new tab', ja: '別タブで開く' },
   previewTabMissingTitle: { en: 'This tab is not available',
