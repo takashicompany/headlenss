@@ -157,5 +157,5 @@ dev server プロセスは各ツールの手順で止める (Ctrl-C / npm script
   `headlenss-preview-tabs` スキルへ。作った HTML をそのまま出す場合 (dev server 不要) も同じ。
 - どちらも宣言ファイルは `.headlenss-plugins.conf` の 1 枚を共有する。出す先は URL の
   後ろのトークンで決める (`web` = ブラウザだけ / `g2` = グラスだけ / `web g2` = 両方)。
-  **ブラウザで確認するためだけの dev server には `web` を明示する** — グラスの一覧に
-  紛れ込まない。
+  **無指定の既定は両方**なので、**ブラウザで確認するためだけの dev server には
+  行末に `web` を必ず付ける** — 付けないとグラスの一覧にも並んでしまう。

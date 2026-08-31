@@ -192,92 +192,82 @@ test('showsOnWeb: g2 だけを明示したものだけ Web から外れる', () 
   assert.equal(showsOnWeb({ name: 'a', kind: 'file', relPath: 'x.html' }), true);
 });
 
-// ── detectG2Plugins (自動判定つき) ────────────────────────────────────────
+// ── detectG2Plugins (対象指定つき) ────────────────────────────────────────
 //
-// 判定は「実際に GET して返ってきた HTML を見る」ものなので、実サーバで確かめる。
+// 「応答があるものだけ出す」は従来どおりなので、実サーバで確かめる。
 
-/** シム注入済み (Plugin Loader プロキシ相当) の HTML を返すスタブ */
-const SHIM_HTML =
-  '<!DOCTYPE html><html><head><script>window.__EVEN_LOADER_FROM_PROXY=1</script>' +
-  '<script src="/__even-loader/shim.js"></script></head><body>plugin</body></html>';
-/** シムの入っていない普通の HTML を返すスタブ */
-const PLAIN_HTML = '<!DOCTYPE html><html><head><title>plain</title></head><body>page</body></html>';
+const STUB_HTML = '<!DOCTYPE html><html><head><title>stub</title></head><body>stub</body></html>';
 
-function listen(html: string): Promise<{ server: Server; url: string; hits: string[] }> {
-  const hits: string[] = [];
+function listen(): Promise<{ server: Server; url: string }> {
   return new Promise((ok) => {
-    const server = createServer((req, res) => {
-      hits.push(req.url ?? '');
+    const server = createServer((_req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(html);
+      res.end(STUB_HTML);
     });
     server.listen(0, '127.0.0.1', () => {
       const addr = server.address();
       const port = typeof addr === 'object' && addr !== null ? addr.port : 0;
-      ok({ server, url: `http://127.0.0.1:${port}`, hits });
+      ok({ server, url: `http://127.0.0.1:${port}` });
     });
   });
 }
 
-test('自動判定: シム注入ありはグラスに出る / 無しは出ない / 届かないものは出ない', async () => {
-  const shim = await listen(SHIM_HTML);
-  const plain = await listen(PLAIN_HTML);
-  const dead = await listen(PLAIN_HTML);
-  const deadUrl = dead.url;
-  await new Promise<void>((ok) => dead.server.close(() => ok()));
-
+async function withConf<T>(text: string, fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), 'headlenss-g2-'));
   try {
-    await writeFile(
-      join(dir, '.headlenss-plugins.conf'),
-      [`shim = ${shim.url}`, `plain = ${plain.url}`, `dead = ${deadUrl}`].join('\n'),
-    );
+    await writeFile(join(dir, '.headlenss-plugins.conf'), text);
     resetG2PluginCache();
-    assert.deepEqual(await detectG2Plugins(dir), [{ name: 'shim', url: shim.url }]);
-    // 判定の GET には ?even_loader=1 が付く (シムが戻る動作を有効にするのと同じ形)
-    assert.ok(plain.hits.some((u) => u.includes('even_loader=1')), `hits: ${plain.hits.join(',')}`);
+    return await fn(dir);
   } finally {
     rmSync(dir, { recursive: true, force: true });
-    shim.server.close();
-    plain.server.close();
     resetG2PluginCache();
+  }
+}
+
+test('対象指定なしの URL は既定でグラスに出る (従来どおりの挙動)', async () => {
+  const a = await listen();
+  const b = await listen();
+  try {
+    await withConf([`A = ${a.url}`, `B = ${b.url}/x`].join('\n'), async (dir) => {
+      assert.deepEqual(await detectG2Plugins(dir), [
+        { name: 'A', url: a.url },
+        { name: 'B', url: `${b.url}/x` },
+      ]);
+    });
+  } finally {
+    a.server.close();
+    b.server.close();
   }
 });
 
-test('明示指定は自動判定より優先される (g2 はシムが無くても出る / web は出ない)', async () => {
-  const shim = await listen(SHIM_HTML);
-  const plain = await listen(PLAIN_HTML);
-  const dir = mkdtempSync(join(tmpdir(), 'headlenss-g2-'));
+test('明示指定でグラスに出す先を絞れる (web は出ない / g2 と web g2 は出る)', async () => {
+  const a = await listen();
   try {
-    await writeFile(
-      join(dir, '.headlenss-plugins.conf'),
-      [
-        `plainG2 = ${plain.url} g2`, // シムは無いが明示したので出る
-        `shimWeb = ${shim.url} web`, // シムはあるが Web 専用なので出ない
-        `both    = ${shim.url}/x web g2`,
-      ].join('\n'),
+    await withConf(
+      [`W = ${a.url}/w web`, `G = ${a.url}/g g2`, `B = ${a.url}/b web g2`].join('\n'),
+      async (dir) => {
+        assert.deepEqual(await detectG2Plugins(dir), [
+          { name: 'G', url: `${a.url}/g` },
+          { name: 'B', url: `${a.url}/b` },
+        ]);
+      },
     );
-    resetG2PluginCache();
-    assert.deepEqual(await detectG2Plugins(dir), [
-      { name: 'plainG2', url: plain.url },
-      { name: 'both', url: `${shim.url}/x` },
-    ]);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
-    shim.server.close();
-    plain.server.close();
-    resetG2PluginCache();
+    a.server.close();
   }
+});
+
+test('応答しない URL は対象指定に関わらず出ない', async () => {
+  const dead = await listen();
+  const deadUrl = dead.url;
+  await new Promise<void>((ok) => dead.server.close(() => ok()));
+  await withConf([`A = ${deadUrl}`, `B = ${deadUrl}/x g2`].join('\n'), async (dir) => {
+    assert.deepEqual(await detectG2Plugins(dir), []);
+  });
 });
 
 test('ファイル型はグラスに出ない (対象指定を書いても同じ)', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'headlenss-g2-'));
-  try {
-    await writeFile(join(dir, '.headlenss-plugins.conf'), 'R = report/index.html g2');
-    resetG2PluginCache();
+  await withConf('R = report/index.html g2', async (dir) => {
     assert.deepEqual(await detectG2Plugins(dir), []);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-    resetG2PluginCache();
-  }
+  });
 });

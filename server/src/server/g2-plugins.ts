@@ -6,8 +6,8 @@
 // 形式:     1 行 1 件の `名前 = 値`。`#` 以降と空行は無視する。
 //
 //   # dev server (URL 型)
-//   Greensky       = http://ubook.mogera-fir.ts.net:5173
-//   Greensky proxy = http://ubook.mogera-fir.ts.net:6173 g2   ← 出す先を明示
+//   Greensky   = http://ubook.mogera-fir.ts.net:5173        ← 既定: グラス + Web
+//   ブラウザ確認 = http://ubook.mogera-fir.ts.net:4174 web    ← Web のタブだけ
 //
 //   # 出来上がった HTML (ファイル型) — Web のプレビュータブ専用
 //   レポート = report/index.html
@@ -32,23 +32,17 @@
 //     名前 = <URL> web       … Web のタブだけ (ブラウザ専用のプレビュー)
 //     名前 = <URL> g2        … グラスの一覧だけ
 //     名前 = <URL> web g2    … 両方
-//     名前 = <URL>           … 無指定 → 下の自動判定に委ねる
+//     名前 = <URL>           … 無指定。既定は **グラス + Web の両方**
 //
 //   URL に空白は書けないので、後ろのトークンと取り違える心配はない
-//   (対象指定を足す前に書かれた宣言はそのまま無指定として読まれる)。
+//   (対象指定を足す前に書かれた宣言はそのまま無指定 = 両方として読まれる)。
 //
-// 無指定の URL 型は「グラス用に立てたものか」を自動で判定する。判定材料は
-// **シム注入の有無**。グラスから開いたプラグインがダブルタップで headlenss へ
-// 戻れるのは、遷移先の HTML に even-loader のシムが入っているからで、
-// これが入っているページは実質「グラス向けに用意されたもの」と言える。
+// **自動判定はしない。** 「この URL はグラス用か / ブラウザ用か」をサーバ側から
+// 見分ける手掛かり (シム注入の有無、SDK ブリッジの有無) はどれも実測で当てにならず、
+// 誤判定でグラスの一覧からエントリが消える方が害が大きい。**書いた人が決める。**
 //
-//   疎通確認の GET に `?even_loader=1` を付け、返ってきた HTML に
-//   シム注入のマーカー (SHIM_MARKERS) があれば **グラス + Web**、
-//   無ければ **Web 専用** と見なす。
-//
-// この判定を通らないのに**グラスに出したい**場合 (プロキシも Vite プラグインも
-// 使わず、素の dev server の URL を直接書いている場合) は、対象指定 `g2` を
-// 明示的に書く。明示指定は自動判定より優先される。
+// そのため、**ブラウザで確認するためだけの URL には `web` を明示する**のが規約。
+// 付けなければ既定どおりグラスの一覧にも出る (この機能を足す前と同じ挙動)。
 //
 // URL 型はグラスの一覧に出す前に、サーバから実際に接続して応答を確認する。
 // 「一覧に出た = 必ず開ける」を保証するのが目的で、書きっぱなしで古くなった
@@ -69,7 +63,7 @@ export type G2Plugin = {
 };
 
 /**
- * URL 型の「出す先」の明示指定。`null` は無指定 (= 自動判定に委ねる)。
+ * URL 型の「出す先」の明示指定。`null` は無指定 (= 既定のグラス + Web 両方)。
  * 両方 false になる書き方は無い (トークンが 1 つでもあればどちらかが立つ)。
  */
 export type PluginTargets = { web: boolean; g2: boolean };
@@ -80,7 +74,7 @@ export type PluginEntry =
       name: string;
       kind: 'url';
       url: string;
-      /** 値の後ろに書かれた `web` / `g2`。書かれていなければ null (自動判定) */
+      /** 値の後ろに書かれた `web` / `g2`。書かれていなければ null (= 両方) */
       targets: PluginTargets | null;
     }
   | {
@@ -111,8 +105,8 @@ const TARGET_TOKENS: readonly string[] = ['web', 'g2'];
 /**
  * 対象指定トークンの並びを解釈する。知らないトークンが 1 つでも混ざれば null。
  *
- * 書き間違い (`wev` 等) を黙って「無指定」に落とすと、意図と違う側に出たまま
- * 気づけない。呼び出し側は null を受けたら行ごと捨てて warn に理由を出す。
+ * 書き間違い (`wev` 等) を黙って「無指定 = 両方」に落とすと、出したくない側に
+ * 出たまま気づけない。呼び出し側は null を受けたら行ごと捨てて warn に理由を出す。
  */
 function parseTargetTokens(tokens: string[]): PluginTargets | null {
   const t: PluginTargets = { web: false, g2: false };
@@ -295,111 +289,40 @@ export async function readDeclarations(sessionCwd: string): Promise<PluginEntry[
 }
 
 /**
- * 「グラス向けに用意されたページか」の判定に使う、シム注入のマーカー。
- * Plugin Loader のプロキシ (proxy/server.ts) が HTML の `<head>` 直後に差し込む
- * 実物の文字列で、even 側の isProxyInjected (plugin-takeover.ts) と同じもの。
- */
-const SHIM_MARKERS = ['__EVEN_LOADER_FROM_PROXY=1', '/__even-loader/shim.js'];
-
-/**
- * 自動判定のために読む HTML の上限。マーカーは `<head>` 直後に入るので、
- * 先頭だけ読めば足りる (大きな成果物ページを丸ごとメモリに載せない)。
- */
-const PROBE_BODY_LIMIT = 256 * 1024;
-
-/** 遷移時に headlenss が付けるのと同じクエリ。シムはこれを見て戻る動作を有効にする。 */
-const LOADER_PARAM = 'even_loader';
-
-/** 疎通確認の結果。 */
-type Probe = {
-  /** 応答があったか (ステータスコードは問わない) */
-  ok: boolean;
-  /** シム注入のマーカーが見つかったか (= グラス向けと見なす) */
-  shim: boolean;
-};
-
-/** 疎通確認の URL に `?even_loader=1` を付ける (シム注入の有無を実地に見るため)。 */
-function withLoaderParam(url: string): string {
-  try {
-    const u = new URL(url);
-    u.searchParams.set(LOADER_PARAM, '1');
-    return u.toString();
-  } catch {
-    return url;
-  }
-}
-
-/** 応答本文の先頭だけを読む。途中で切れてもそこまでで判定する。 */
-async function readBodyHead(res: Response, limit: number): Promise<string> {
-  if (!res.body) return '';
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let out = '';
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value) out += decoder.decode(value, { stream: true });
-      if (out.length >= limit) break;
-    }
-  } catch {
-    // 途中で切れた場合もここまでの内容で判定する
-  } finally {
-    // 残りを捨てて接続を解放する (放置すると GC まで保持される)
-    await reader.cancel().catch(() => {});
-  }
-  return out;
-}
-
-/**
- * URL に実際に繋いで、(1) 応答があるか (2) シムが注入されているか を確かめる。
- *
+ * URL に実際に繋いで応答があるか確かめる。
  * ステータスコードは問わない (404 でも「サーバは生きている」ので開ける)。
- * リダイレクトは追わない — 従来どおり「応答があれば届く」の判定を保ちたいだけで、
- * 追跡すると宣言と違うページを見て判定してしまう。
- * (リダイレクトを返すページは本文が無いので、自動判定では Web 専用になる。
- *  グラスに出したければ対象指定 `g2` を明示する。)
  */
-async function probe(url: string): Promise<Probe> {
+async function isReachable(url: string): Promise<boolean> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), REACH_TIMEOUT_MS);
   try {
-    const res = await fetch(withLoaderParam(url), {
-      method: 'GET',
-      signal: ctrl.signal,
-      redirect: 'manual',
-    });
-    const ct = (res.headers.get('content-type') ?? '').toLowerCase();
-    if (!ct.includes('text/html')) {
-      await res.body?.cancel().catch(() => {});
-      return { ok: true, shim: false };
-    }
-    const head = await readBodyHead(res, PROBE_BODY_LIMIT);
-    return { ok: true, shim: SHIM_MARKERS.some((m) => head.includes(m)) };
+    const res = await fetch(url, { method: 'GET', signal: ctrl.signal, redirect: 'manual' });
+    // body を破棄して接続を解放する (放置すると GC まで保持される)
+    await res.body?.cancel().catch(() => {});
+    return true;
   } catch {
-    return { ok: false, shim: false };
+    return false;
   } finally {
     clearTimeout(timer);
   }
 }
 
-const probeCache = new Map<string, { at: number; result: Probe }>();
+const reachCache = new Map<string, { at: number; ok: boolean }>();
 
-async function probeCached(url: string): Promise<Probe> {
+async function isReachableCached(url: string): Promise<boolean> {
   const now = Date.now();
-  const hit = probeCache.get(url);
-  if (hit && now - hit.at < CACHE_TTL_MS) return hit.result;
-  const result = await probe(url);
-  probeCache.set(url, { at: Date.now(), result });
-  return result;
+  const hit = reachCache.get(url);
+  if (hit && now - hit.at < CACHE_TTL_MS) return hit.ok;
+  const ok = await isReachable(url);
+  reachCache.set(url, { at: Date.now(), ok });
+  return ok;
 }
 
 /**
  * その宣言を Web UI のプレビュータブに出すか。
  *
- * ファイル型は常に出す。URL 型は明示指定が無ければ出す (自動判定は「グラスにも
- * 出すか」だけを決めるもので、Web からは常に見られる)。`g2` だけを明示した
- * ものだけが Web から外れる。
+ * ファイル型は常に出す。URL 型は無指定なら出す (既定は両方)。
+ * `g2` だけを明示したものだけが Web から外れる。
  */
 export function showsOnWeb(entry: PluginEntry): boolean {
   if (entry.kind !== 'url') return true;
@@ -411,7 +334,7 @@ export function showsOnWeb(entry: PluginEntry): boolean {
  * 宣言ファイルが無ければ空 (この機能を使っていないセッション)。
  *
  * ファイル型は headlenss サーバが配信するローカルのファイルで、グラスからは開けない。
- * URL 型のうち「グラス対象」のものだけを出す (対象指定が無ければシム注入で自動判定)。
+ * URL 型のうち「グラス対象」のものだけを出す (対象指定が無ければ既定で対象)。
  */
 export async function detectG2Plugins(sessionCwd: string): Promise<G2Plugin[]> {
   if (!sessionCwd) return [];
@@ -421,13 +344,7 @@ export async function detectG2Plugins(sessionCwd: string): Promise<G2Plugin[]> {
   );
   if (declared.length === 0) return [];
   const checked = await Promise.all(
-    declared.map(async (d) => {
-      const p = await probeCached(d.url);
-      if (!p.ok) return null;
-      // 無指定はシム注入の有無で決める。明示の `g2` は注入が無くても出す。
-      if (d.targets === null && !p.shim) return null;
-      return { name: d.name, url: d.url };
-    }),
+    declared.map(async (d) => ((await isReachableCached(d.url)) ? { name: d.name, url: d.url } : null)),
   );
   return checked.filter((d): d is G2Plugin => d !== null);
 }
@@ -467,7 +384,7 @@ export async function tmuxSessionPaths(): Promise<Map<string, string>> {
 
 /** テスト用: キャッシュを捨てる */
 export function resetG2PluginCache(): void {
-  probeCache.clear();
+  reachCache.clear();
   confCache.clear();
   pathCache = null;
 }

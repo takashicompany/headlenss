@@ -70,7 +70,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3000/api/health
 # 名前 = 値       名前がそのままタブの見出しになる (日本語・空白 OK)
 
 レポート     = report/index.html            ← ファイル型 (作業フォルダからの相対パス)
-画面プレビュー = http://<host>:<port>/ web   ← URL 型 (dev server / PWA)。ブラウザ用は web を明示
+画面プレビュー = http://<host>:<port>/ web   ← URL 型 (dev server / PWA)。ブラウザ用は web 必須
 ```
 
 値の書き方で 2 つの型に分かれる。
@@ -78,7 +78,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3000/api/health
 | 型 | 書き方 | 何が起きるか | どこに出るか |
 |---|---|---|---|
 | **ファイル型** | `report/index.html` のような**相対パス** | headlenss サーバがそのファイルを配信し、iframe に出す | Web のタブのみ (常に) |
-| **URL 型** | `http://…` / `https://…` の**完全な URL** | その URL をそのまま iframe に出す | 後ろに書いた対象しだい (下記) |
+| **URL 型** | `http://…` / `https://…` の**完全な URL** | その URL をそのまま iframe に出す | 行末のトークンしだい。無指定は Web + グラス両方 (下記) |
 
 ファイル型で**受け付けられない書き方** (書いても黙って無視される):
 
@@ -91,29 +91,30 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3000/api/health
 URL 型は**完全な形** (scheme + host + port) で書く。ポート番号だけを書いてホストを
 補わせる形式は無い。
 
-### ブラウザ用の URL には `web` を明示する
+### 【必須】ブラウザ確認用の URL には行末に `web` を付ける
 
 この宣言ファイルは **Web のタブ** とグラス (G2) の **プラグイン一覧** で共有されている。
-URL の後ろに空白区切りで対象を書くと、どちらに出すかを指定できる。
+**URL 型の既定は「両方に出る」。** つまり `web` を付け忘れると、ブラウザで見るためだけの
+プレビューが**グラスのセッション一覧にも並んでしまう**。グラスは画面が狭く、掛けたまま
+使うものなので、ブラウザ用の項目が混ざるのは邪魔になる。
+
+**このスキルで宣言する URL 型には、必ず行末に `web` を付けること。**
 
 ```
-ブラウザ用 = http://<host>:<port>/ web      ← Web のタブだけ (推奨)
-両方       = http://<host>:<port>/ web g2   ← Web のタブ + グラスの一覧
+ブラウザ用 = http://<host>:<port>/ web      ← 必ずこう書く (Web のタブだけ)
+両方       = http://<host>:<port>/ web g2   ← グラスからも開きたい時だけ
 グラス専用 = http://<host>:<port>/ g2       ← グラスの一覧だけ (Web のタブには出ない)
-無指定     = http://<host>:<port>/          ← 自動判定に任せる
+無指定     = http://<host>:<port>/          ← 既定 = 両方に出る (= 付け忘れの形)
 ```
 
-- **ブラウザで見るためのプレビューには `web` を書く。** グラスの一覧に紛れ込まない
-  ことが宣言だけで確定する
-- トークンは `web` と `g2` の 2 つだけ。打ち間違い (`wev` 等) を書くと**その行ごと
-  無視される** (サーバのログに `[g2-plugins]` の警告が出る)
-- **ファイル型に書いても意味がない。** ファイル型は常に Web のタブ専用で、書いた対象は
-  警告付きで無視される (パスは壊れない)
+- トークンは `web` と `g2` の 2 つだけ。大文字小文字は問わない。打ち間違い (`wev` 等) を
+  書くと**その行ごと無視される** (サーバのログに `[g2-plugins]` の警告が出る)
+- **ファイル型に書く必要はない。** ファイル型 (相対パス) は常に Web のタブ専用で、
+  グラスには最初から出ない。書いた対象は警告付きで無視される (パスは壊れない)
 
-無指定のときは、headlenss が疎通確認のときに `?even_loader=1` を付けて GET し、
-返ってきた HTML に **even-loader のシムが注入されているか**で判断する。
-注入されていれば「グラス向け」と見なしてグラスの一覧にも出し、無ければ **Web のタブ専用**
-にする。ブラウザ用の普通の HTML を返す dev server なら、無指定でもグラスには出ない。
+**サーバは URL の中身から出す先を推測しない。** 「ブラウザ用か / グラス用か」を
+サーバ側から見分ける手掛かり (シム注入の有無など) は実測で当てにならなかったので、
+自動判定は入れていない。**書いた人が `web` / `g2` で決める。**
 
 ## 2. 静的な HTML を出す (ファイル型)
 
@@ -142,10 +143,10 @@ Service Worker、`localStorage`、getUserMedia などが要るもの、あるい
 1. **`headlenss-dev-server` スキルの手順に従う。** ポートを選び (headlenss の
    占有ポートを避ける)、`0.0.0.0` にバインドして起動する。secure context が要るなら
    `tailscale serve --https=<port>` で HTTPS 化する。
-2. できた URL をそのまま宣言する。
+2. できた URL を宣言する。**行末の `web` を忘れない** (付けないとグラスの一覧にも出る)。
 
 ```bash
-printf '画面プレビュー = https://<host>.<tailnet>.ts.net:<port>/\n' >> .headlenss-plugins.conf
+printf '画面プレビュー = https://<host>.<tailnet>.ts.net:<port>/ web\n' >> .headlenss-plugins.conf
 ```
 
 URL 型は別 origin として通常の iframe に載るので、Service Worker も localStorage も
@@ -156,12 +157,7 @@ URL 型は別 origin として通常の iframe に載るので、Service Worker 
 > URL が `http://` だと、ブラウザがフレーム内表示を止める。その場合はタブに理由が
 > 表示されるので、`tailscale serve --https=<port>` で HTTPS 化するか、↗ で別タブに開く。
 
-```bash
-# ブラウザ専用なら web を明示する
-printf '画面プレビュー = https://<host>.<tailnet>.ts.net:<port>/ web\n' >> .headlenss-plugins.conf
-```
-
-グラスからも開きたい場合は `web g2` と書き、`headlenss-g2-plugin` スキルを見ること
+グラスからも開きたい場合だけ `web g2` と書き、`headlenss-g2-plugin` スキルを見ること
 (戻れるようにするシムの話がある)。
 
 ## 4. 出たことを確認する
@@ -188,6 +184,15 @@ curl -s -o /dev/null -w "%{http_code}\n" \
   "http://127.0.0.1:3000/preview/$(tmux display-message -p '#S')/report/index.html"
 ```
 
+URL 型を宣言したら、**グラスの一覧に漏れていないか**も見る (`web` の付け忘れ検出)。
+
+```bash
+curl -s http://127.0.0.1:3000/api/claude/sessions \
+  | python3 -c "import json,sys; [print(s['tmuxSessionName'], s.get('g2Plugins')) for s in json.load(sys.stdin)['sessions'] if s.get('g2Plugins')]"
+```
+
+このセッションの名前が出てきたら `web` が付いていない。宣言を直す。
+
 最後に、ユーザーには**セッションのチャット画面を開いて、下のタブ帯のタブ名を押せばよい**
 ことだけ伝える (URL を書くなら headlenss の Web UI の `/sessions/<session>?mode=chat` )。
 
@@ -198,7 +203,7 @@ curl -s -o /dev/null -w "%{http_code}\n" \
 | `tabs` が空 | 宣言ファイルの置き場所が違う。**tmux セッションの作業フォルダ直下**か確認する (`pwd` と `tmux display-message -p '#S'` を突き合わせる) |
 | ファイル型の行だけ出ない | 書き方が受け付けられていない (手順 1 の禁止リスト)。または指したファイルが存在しない。`ls <相対パス>` で確認 |
 | **URL 型の行だけ出ない** | 対象に `g2` だけを書いている (グラス専用)。Web にも出すなら `web g2` にする |
-| **ブラウザ用のはずがグラスの一覧にも出る** | 対象が無指定で、返した HTML にシムが入っている (プロキシ経由の URL 等)。`web` を明示する |
+| **ブラウザ用のはずがグラスの一覧にも出る** | 行末の `web` を付け忘れている (無指定の既定は両方)。`web` を足す |
 | 行が丸ごと無視される | サーバのログに `[g2-plugins]` の警告が行番号と理由付きで出る |
 | タブは出るが真っ白 | ファイル型なら `curl` で配信を確認 (上記)。URL 型なら dev server が `0.0.0.0` で listen しているか (`ss -tlnp`) |
 | タブは出るが「ページ内に表示できません」 | mixed content (https の画面に http:// の URL)。HTTPS 化するか ↗ で別タブに開く |
