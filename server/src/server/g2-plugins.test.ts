@@ -1,6 +1,17 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { normalizeConfRelPath, parsePluginConf } from './g2-plugins.ts';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
+import { createServer, type Server } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  detectG2Plugins,
+  normalizeConfRelPath,
+  parsePluginConf,
+  resetG2PluginCache,
+  showsOnWeb,
+} from './g2-plugins.ts';
 
 test('名前 = URL を読む (URL 型)', () => {
   const got = parsePluginConf([
@@ -8,8 +19,8 @@ test('名前 = URL を読む (URL 型)', () => {
     'Greensky proxy = http://ubook.mogera-fir.ts.net:6173',
   ].join('\n'));
   assert.deepEqual(got, [
-    { name: 'Greensky', kind: 'url', url: 'http://ubook.mogera-fir.ts.net:5173' },
-    { name: 'Greensky proxy', kind: 'url', url: 'http://ubook.mogera-fir.ts.net:6173' },
+    { name: 'Greensky', kind: 'url', url: 'http://ubook.mogera-fir.ts.net:5173', targets: null },
+    { name: 'Greensky proxy', kind: 'url', url: 'http://ubook.mogera-fir.ts.net:6173', targets: null },
   ]);
 });
 
@@ -20,7 +31,7 @@ test('コメントと空行を無視し、行末コメントも落とす', () =>
     '   ',
     'A = http://h:1  # 行末コメント',
   ].join('\n'));
-  assert.deepEqual(got, [{ name: 'A', kind: 'url', url: 'http://h:1' }]);
+  assert.deepEqual(got, [{ name: 'A', kind: 'url', url: 'http://h:1', targets: null }]);
 });
 
 test('壊れた行は捨てる: 区切り無し / 名前空 / 値空 / URL不正 / 非http', () => {
@@ -32,12 +43,12 @@ test('壊れた行は捨てる: 区切り無し / 名前空 / 値空 / URL不正
     'D = ftp://h/x',
     'E = https://h:2',
   ].join('\n'));
-  assert.deepEqual(got, [{ name: 'E', kind: 'url', url: 'https://h:2' }]);
+  assert.deepEqual(got, [{ name: 'E', kind: 'url', url: 'https://h:2', targets: null }]);
 });
 
 test('名前が重複したら先勝ち (型が違っても同じ)', () => {
   assert.deepEqual(parsePluginConf('A = http://h:1\nA = http://h:2'), [
-    { name: 'A', kind: 'url', url: 'http://h:1' },
+    { name: 'A', kind: 'url', url: 'http://h:1', targets: null },
   ]);
   assert.deepEqual(parsePluginConf('A = report/index.html\nA = http://h:2'), [
     { name: 'A', kind: 'file', relPath: 'report/index.html' },
@@ -46,7 +57,7 @@ test('名前が重複したら先勝ち (型が違っても同じ)', () => {
 
 test('URL 内の = は壊さない (最初の = だけを区切りにする)', () => {
   const got = parsePluginConf('A = http://h:1/?x=1&y=2');
-  assert.deepEqual(got, [{ name: 'A', kind: 'url', url: 'http://h:1/?x=1&y=2' }]);
+  assert.deepEqual(got, [{ name: 'A', kind: 'url', url: 'http://h:1/?x=1&y=2', targets: null }]);
 });
 
 // ── ファイル型 (Web のプレビュータブ専用) ────────────────────────────────
@@ -70,7 +81,7 @@ test('URL 型とファイル型は同じファイルに混在できる', () => {
     'report = report/index.html',
   ].join('\n'));
   assert.deepEqual(got, [
-    { name: 'dev', kind: 'url', url: 'http://h:5173' },
+    { name: 'dev', kind: 'url', url: 'http://h:5173', targets: null },
     { name: 'report', kind: 'file', relPath: 'report/index.html' },
   ]);
 });
@@ -104,4 +115,169 @@ test('先頭の ./ と途中の . は取り除く', () => {
 
 test('日本語や空白を含むファイル名も受け付ける', () => {
   assert.equal(normalizeConfRelPath('成果物/レポート 1.html'), '成果物/レポート 1.html');
+});
+
+
+// ── 対象指定トークン (web / g2) ───────────────────────────────────────────
+
+test('URL の後ろに web / g2 を書くと出す先を明示できる', () => {
+  const got = parsePluginConf([
+    'W  = http://h:1 web',
+    'G  = http://h:2 g2',
+    'WG = http://h:3 web g2',
+    'GW = http://h:4 g2 web',
+  ].join('\n'));
+  assert.deepEqual(got, [
+    { name: 'W', kind: 'url', url: 'http://h:1', targets: { web: true, g2: false } },
+    { name: 'G', kind: 'url', url: 'http://h:2', targets: { web: false, g2: true } },
+    { name: 'WG', kind: 'url', url: 'http://h:3', targets: { web: true, g2: true } },
+    { name: 'GW', kind: 'url', url: 'http://h:4', targets: { web: true, g2: true } },
+  ]);
+});
+
+test('対象指定は大文字小文字を問わない / 空白の量も問わない', () => {
+  assert.deepEqual(parsePluginConf('A = http://h:1   WEB\tG2'), [
+    { name: 'A', kind: 'url', url: 'http://h:1', targets: { web: true, g2: true } },
+  ]);
+});
+
+test('知らないトークンが混ざった行は捨てる (黙って無指定に落とさない)', () => {
+  const got = parsePluginConf([
+    'typo  = http://h:1 wev',
+    'mixed = http://h:2 web wev',
+    'ok    = http://h:3 web',
+  ].join('\n'));
+  assert.deepEqual(got, [
+    { name: 'ok', kind: 'url', url: 'http://h:3', targets: { web: true, g2: false } },
+  ]);
+});
+
+test('ファイル型に対象指定を書いても無視され、パスは壊れない', () => {
+  const got = parsePluginConf([
+    'R = report/index.html g2',
+    'S = report/index.html web g2',
+  ].join('\n'));
+  assert.deepEqual(got, [
+    { name: 'R', kind: 'file', relPath: 'report/index.html' },
+    { name: 'S', kind: 'file', relPath: 'report/index.html' },
+  ]);
+});
+
+test('空白を含むファイル名は対象指定と取り違えない', () => {
+  assert.deepEqual(parsePluginConf('R = 成果物/レポート 1.html'), [
+    { name: 'R', kind: 'file', relPath: '成果物/レポート 1.html' },
+  ]);
+  // 末尾が既知のトークンでなければ 1 文字も剥がさない
+  assert.deepEqual(parsePluginConf('R = a/b web.html'), [
+    { name: 'R', kind: 'file', relPath: 'a/b web.html' },
+  ]);
+});
+
+// ── showsOnWeb (Web のタブに出すか) ───────────────────────────────────────
+
+test('showsOnWeb: g2 だけを明示したものだけ Web から外れる', () => {
+  assert.equal(showsOnWeb({ name: 'a', kind: 'url', url: 'http://h:1', targets: null }), true);
+  assert.equal(
+    showsOnWeb({ name: 'a', kind: 'url', url: 'http://h:1', targets: { web: true, g2: false } }),
+    true,
+  );
+  assert.equal(
+    showsOnWeb({ name: 'a', kind: 'url', url: 'http://h:1', targets: { web: true, g2: true } }),
+    true,
+  );
+  assert.equal(
+    showsOnWeb({ name: 'a', kind: 'url', url: 'http://h:1', targets: { web: false, g2: true } }),
+    false,
+  );
+  assert.equal(showsOnWeb({ name: 'a', kind: 'file', relPath: 'x.html' }), true);
+});
+
+// ── detectG2Plugins (自動判定つき) ────────────────────────────────────────
+//
+// 判定は「実際に GET して返ってきた HTML を見る」ものなので、実サーバで確かめる。
+
+/** シム注入済み (Plugin Loader プロキシ相当) の HTML を返すスタブ */
+const SHIM_HTML =
+  '<!DOCTYPE html><html><head><script>window.__EVEN_LOADER_FROM_PROXY=1</script>' +
+  '<script src="/__even-loader/shim.js"></script></head><body>plugin</body></html>';
+/** シムの入っていない普通の HTML を返すスタブ */
+const PLAIN_HTML = '<!DOCTYPE html><html><head><title>plain</title></head><body>page</body></html>';
+
+function listen(html: string): Promise<{ server: Server; url: string; hits: string[] }> {
+  const hits: string[] = [];
+  return new Promise((ok) => {
+    const server = createServer((req, res) => {
+      hits.push(req.url ?? '');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+    });
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      const port = typeof addr === 'object' && addr !== null ? addr.port : 0;
+      ok({ server, url: `http://127.0.0.1:${port}`, hits });
+    });
+  });
+}
+
+test('自動判定: シム注入ありはグラスに出る / 無しは出ない / 届かないものは出ない', async () => {
+  const shim = await listen(SHIM_HTML);
+  const plain = await listen(PLAIN_HTML);
+  const dead = await listen(PLAIN_HTML);
+  const deadUrl = dead.url;
+  await new Promise<void>((ok) => dead.server.close(() => ok()));
+
+  const dir = mkdtempSync(join(tmpdir(), 'headlenss-g2-'));
+  try {
+    await writeFile(
+      join(dir, '.headlenss-plugins.conf'),
+      [`shim = ${shim.url}`, `plain = ${plain.url}`, `dead = ${deadUrl}`].join('\n'),
+    );
+    resetG2PluginCache();
+    assert.deepEqual(await detectG2Plugins(dir), [{ name: 'shim', url: shim.url }]);
+    // 判定の GET には ?even_loader=1 が付く (シムが戻る動作を有効にするのと同じ形)
+    assert.ok(plain.hits.some((u) => u.includes('even_loader=1')), `hits: ${plain.hits.join(',')}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    shim.server.close();
+    plain.server.close();
+    resetG2PluginCache();
+  }
+});
+
+test('明示指定は自動判定より優先される (g2 はシムが無くても出る / web は出ない)', async () => {
+  const shim = await listen(SHIM_HTML);
+  const plain = await listen(PLAIN_HTML);
+  const dir = mkdtempSync(join(tmpdir(), 'headlenss-g2-'));
+  try {
+    await writeFile(
+      join(dir, '.headlenss-plugins.conf'),
+      [
+        `plainG2 = ${plain.url} g2`, // シムは無いが明示したので出る
+        `shimWeb = ${shim.url} web`, // シムはあるが Web 専用なので出ない
+        `both    = ${shim.url}/x web g2`,
+      ].join('\n'),
+    );
+    resetG2PluginCache();
+    assert.deepEqual(await detectG2Plugins(dir), [
+      { name: 'plainG2', url: plain.url },
+      { name: 'both', url: `${shim.url}/x` },
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    shim.server.close();
+    plain.server.close();
+    resetG2PluginCache();
+  }
+});
+
+test('ファイル型はグラスに出ない (対象指定を書いても同じ)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'headlenss-g2-'));
+  try {
+    await writeFile(join(dir, '.headlenss-plugins.conf'), 'R = report/index.html g2');
+    resetG2PluginCache();
+    assert.deepEqual(await detectG2Plugins(dir), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    resetG2PluginCache();
+  }
 });

@@ -588,7 +588,7 @@ app.post('/api/sessions/:name/input', async (c) => {
 //
 // セッションの作業フォルダの .headlenss-plugins.conf に宣言された「開けるもの」を
 // Web UI 用に返す (URL 型 = dev server / PWA、ファイル型 = 作業フォルダの中の HTML)。
-// G2 の一覧 (/api/claude/sessions の g2Plugins) は URL 型だけなので、そちらとは別口。
+// G2 の一覧 (/api/claude/sessions の g2Plugins) はグラス対象の URL 型だけなので、そちらとは別口。
 app.get('/api/sessions/:name/webtabs', handleWebTabs);
 
 app.route('/api', claudeRouter);

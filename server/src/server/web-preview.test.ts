@@ -100,6 +100,20 @@ test('buildWebTabs: URL 型はそのまま、ファイル型は /preview の URL
   assert.match(tabs[1].url, /^\/preview\/mysession\/report\/index\.html\?v=\d+$/);
 });
 
+test('buildWebTabs: g2 だけを明示した URL は出さない (グラス専用)', async () => {
+  await writeConf([
+    'onlyG2 = http://h:5173 g2',
+    'both   = http://h:5174 web g2',
+    'onlyWeb = http://h:5175 web',
+    'auto   = http://h:5176',
+  ].join('\n'));
+  assert.deepEqual(await buildWebTabs('mysession', root), [
+    { name: 'both', kind: 'url', url: 'http://h:5174' },
+    { name: 'onlyWeb', kind: 'url', url: 'http://h:5175' },
+    { name: 'auto', kind: 'url', url: 'http://h:5176' },
+  ]);
+});
+
 test('buildWebTabs: 存在しないファイルの宣言は出さない', async () => {
   await writeConf('無い = report/missing.html');
   assert.deepEqual(await buildWebTabs('mysession', root), []);

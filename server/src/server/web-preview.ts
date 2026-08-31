@@ -7,6 +7,9 @@
 //   ファイル型 (`名前 = report/index.html`) … セッションの作業フォルダの中の HTML。
 //                                            headlenss サーバ自身が配信する
 //
+// タブに出すのは、URL 型で `g2` だけを明示したもの (= グラス専用) を除く全部。
+// ファイル型はそもそもグラスから開けないので常にここに出る。
+//
 // タブはチャット画面の下の帯に並ぶ (ヘッダの tmux / chat とは別の切り替え)。
 //
 // 配信 URL は `/preview/<セッション名>/<相対パス>`。ルートはそのセッションの作業フォルダで、
@@ -29,7 +32,7 @@ import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import type { Context } from 'hono';
-import { readDeclarations, tmuxSessionPaths } from './g2-plugins.ts';
+import { readDeclarations, showsOnWeb, tmuxSessionPaths } from './g2-plugins.ts';
 import { getSessionCwd } from './tmux.ts';
 
 /** tmux.ts の validateName と同じ規則 (セッション名はそのまま URL に載る) */
@@ -145,6 +148,7 @@ function encodeRelPath(relPath: string): string {
 /**
  * 作業フォルダの宣言から Web UI のタブ一覧を組み立てる。
  *
+ * - `g2` だけを明示した宣言 (= グラス専用) は出さない。
  * - URL 型は宣言のまま出す。疎通確認はしない (dev server の再起動中にタブが消えると、
  *   iframe の載せ替え先が無くなって「押せない」状態になる。Web 側には再読込ボタンが
  *   あるので、届かないことは開いてみれば分かる。グラス側の「一覧に出た = 必ず開ける」
@@ -156,6 +160,7 @@ export async function buildWebTabs(sessionName: string, sessionCwd: string): Pro
   const entries = await readDeclarations(sessionCwd);
   const tabs: WebTab[] = [];
   for (const e of entries) {
+    if (!showsOnWeb(e)) continue;
     if (e.kind === 'url') {
       tabs.push({ name: e.name, kind: 'url', url: e.url });
       continue;

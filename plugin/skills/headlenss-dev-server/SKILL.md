@@ -155,3 +155,7 @@ dev server プロセスは各ツールの手順で止める (Ctrl-C / npm script
 - 立てた dev server を G2 のプラグイン一覧に出したい場合は `headlenss-g2-plugin` スキルへ。
 - 立てた dev server を headlenss の Web UI (PC / スマホ) のタブに出したい場合は
   `headlenss-preview-tabs` スキルへ。作った HTML をそのまま出す場合 (dev server 不要) も同じ。
+- どちらも宣言ファイルは `.headlenss-plugins.conf` の 1 枚を共有する。出す先は URL の
+  後ろのトークンで決める (`web` = ブラウザだけ / `g2` = グラスだけ / `web g2` = 両方)。
+  **ブラウザで確認するためだけの dev server には `web` を明示する** — グラスの一覧に
+  紛れ込まない。

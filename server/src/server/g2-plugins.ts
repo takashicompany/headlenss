@@ -5,9 +5,9 @@
 // 置き場所: <セッションの作業フォルダ>/.headlenss-plugins.conf
 // 形式:     1 行 1 件の `名前 = 値`。`#` 以降と空行は無視する。
 //
-//   # dev server (URL 型) — グラスからも Web からも開ける
+//   # dev server (URL 型)
 //   Greensky       = http://ubook.mogera-fir.ts.net:5173
-//   Greensky proxy = http://ubook.mogera-fir.ts.net:6173
+//   Greensky proxy = http://ubook.mogera-fir.ts.net:6173 g2   ← 出す先を明示
 //
 //   # 出来上がった HTML (ファイル型) — Web のプレビュータブ専用
 //   レポート = report/index.html
@@ -23,14 +23,34 @@
 //   読む。`/` 始まり・`~` 始まり・`..`・`.` 始まりのセグメント (隠しファイル)・
 //   `\` `:` `?` `#` を含むものは受け付けない (パースの時点で落とす)。
 //
-// 型ごとに出す先が違う。
+// 出す先 (グラス / ブラウザ) は型と「対象指定」で決まる。
 //
-// - G2 のプラグイン一覧 (`detectG2Plugins`) には **URL 型だけ**を出す。グラスは
-//   WebView ごと URL へ遷移するので、ローカルのファイルパスは意味を持たない。
-// - Web UI のプレビュータブ (web-preview.ts) は両方を出す。ファイル型は
-//   `/preview/<セッション名>/<相対パス>` として headlenss サーバ自身が配信する。
+// - **ファイル型は常に Web のプレビュータブだけ**。グラスは WebView ごと URL へ
+//   遷移するので、ローカルのファイルパスは意味を持たない。
+// - **URL 型は対象指定で決まる**。値の後ろに空白区切りで `web` / `g2` を書く。
 //
-// URL 型は一覧に出す前に、サーバから実際に接続して応答を確認する。
+//     名前 = <URL> web       … Web のタブだけ (ブラウザ専用のプレビュー)
+//     名前 = <URL> g2        … グラスの一覧だけ
+//     名前 = <URL> web g2    … 両方
+//     名前 = <URL>           … 無指定 → 下の自動判定に委ねる
+//
+//   URL に空白は書けないので、後ろのトークンと取り違える心配はない
+//   (対象指定を足す前に書かれた宣言はそのまま無指定として読まれる)。
+//
+// 無指定の URL 型は「グラス用に立てたものか」を自動で判定する。判定材料は
+// **シム注入の有無**。グラスから開いたプラグインがダブルタップで headlenss へ
+// 戻れるのは、遷移先の HTML に even-loader のシムが入っているからで、
+// これが入っているページは実質「グラス向けに用意されたもの」と言える。
+//
+//   疎通確認の GET に `?even_loader=1` を付け、返ってきた HTML に
+//   シム注入のマーカー (SHIM_MARKERS) があれば **グラス + Web**、
+//   無ければ **Web 専用** と見なす。
+//
+// この判定を通らないのに**グラスに出したい**場合 (プロキシも Vite プラグインも
+// 使わず、素の dev server の URL を直接書いている場合) は、対象指定 `g2` を
+// 明示的に書く。明示指定は自動判定より優先される。
+//
+// URL 型はグラスの一覧に出す前に、サーバから実際に接続して応答を確認する。
 // 「一覧に出た = 必ず開ける」を保証するのが目的で、書きっぱなしで古くなった
 // エントリや、まだ dev server を起動していないエントリは自動的に落ちる。
 // (ファイル型の「実在確認」は web-preview.ts 側で行う。)
@@ -48,9 +68,21 @@ export type G2Plugin = {
   url: string;
 };
 
+/**
+ * URL 型の「出す先」の明示指定。`null` は無指定 (= 自動判定に委ねる)。
+ * 両方 false になる書き方は無い (トークンが 1 つでもあればどちらかが立つ)。
+ */
+export type PluginTargets = { web: boolean; g2: boolean };
+
 /** 宣言 1 件。URL 型かファイル型かで持つものが違う。 */
 export type PluginEntry =
-  | { name: string; kind: 'url'; url: string }
+  | {
+      name: string;
+      kind: 'url';
+      url: string;
+      /** 値の後ろに書かれた `web` / `g2`。書かれていなければ null (自動判定) */
+      targets: PluginTargets | null;
+    }
   | {
       name: string;
       kind: 'file';
@@ -72,6 +104,46 @@ const SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
  * `?` `#` を弾くのは配信 URL に付けるクエリ (`?v=<mtime>`) と混ざらないようにするため。
  */
 const FILE_SEGMENT_RE = /^[^\0/\\:?#]+$/;
+
+/** 対象指定に書けるトークン。値の後ろに空白区切りで並べる。 */
+const TARGET_TOKENS: readonly string[] = ['web', 'g2'];
+
+/**
+ * 対象指定トークンの並びを解釈する。知らないトークンが 1 つでも混ざれば null。
+ *
+ * 書き間違い (`wev` 等) を黙って「無指定」に落とすと、意図と違う側に出たまま
+ * 気づけない。呼び出し側は null を受けたら行ごと捨てて warn に理由を出す。
+ */
+function parseTargetTokens(tokens: string[]): PluginTargets | null {
+  const t: PluginTargets = { web: false, g2: false };
+  for (const raw of tokens) {
+    const tok = raw.toLowerCase();
+    if (tok === 'web') t.web = true;
+    else if (tok === 'g2') t.g2 = true;
+    else return null;
+  }
+  return t;
+}
+
+/**
+ * ファイル型の値から、後ろに付いた対象指定トークンだけを切り離す。
+ *
+ * ファイル名には空白を書けるので (`成果物/レポート 1.html`)、URL 型のように
+ * 「最初の空白より後ろは全部トークン」とは読めない。**末尾から続く既知の
+ * トークンだけ**を剥がし、それ以外は値の一部として残す。
+ */
+function stripTrailingTargetTokens(value: string): { head: string; tokens: string[] } {
+  let head = value;
+  const tokens: string[] = [];
+  for (;;) {
+    const m = /^(.*\S)\s+(\S+)$/.exec(head);
+    if (m === null) break;
+    if (!TARGET_TOKENS.includes(m[2].toLowerCase())) break;
+    tokens.unshift(m[2]);
+    head = m[1];
+  }
+  return { head, tokens };
+}
 
 /**
  * 宣言ファイルに書かれたファイル型の値を、作業フォルダからの相対パスに正規化する。
@@ -128,17 +200,32 @@ export function parsePluginConf(text: string, where = ''): PluginEntry[] {
     const dup = seen.has(name);
 
     if (SCHEME_RE.test(value)) {
-      // `scheme:` で始まる = URL 型のつもり。http/https 以外はここで落とす
+      // `scheme:` で始まる = URL 型のつもり。値は「URL + 対象指定トークン」。
+      // URL に空白は書けないので、最初の空白より後ろは対象指定として読む。
+      const sp = value.search(/\s/);
+      const urlText = sp < 0 ? value : value.slice(0, sp);
+      const tokens = sp < 0 ? [] : value.slice(sp).trim().split(/\s+/);
+      let targets: PluginTargets | null = null;
+      if (tokens.length > 0) {
+        targets = parseTargetTokens(tokens);
+        if (targets === null) {
+          console.warn(
+            `[g2-plugins] ${where}:${i + 1} URL の後ろに書けるのは web / g2 だけです: ${tokens.join(' ')}`,
+          );
+          continue;
+        }
+      }
+      // http/https 以外はここで落とす
       // (ファイル型として読み直すと、書き間違いが黙って別物として通ってしまう)。
       let parsed: URL;
       try {
-        parsed = new URL(value);
+        parsed = new URL(urlText);
       } catch {
-        console.warn(`[g2-plugins] ${where}:${i + 1} URL として解釈できません: ${value}`);
+        console.warn(`[g2-plugins] ${where}:${i + 1} URL として解釈できません: ${urlText}`);
         continue;
       }
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-        console.warn(`[g2-plugins] ${where}:${i + 1} http/https 以外は扱えません: ${value}`);
+        console.warn(`[g2-plugins] ${where}:${i + 1} http/https 以外は扱えません: ${urlText}`);
         continue;
       }
       if (dup) {
@@ -146,14 +233,22 @@ export function parsePluginConf(text: string, where = ''): PluginEntry[] {
         continue;
       }
       seen.add(name);
-      out.push({ name, kind: 'url', url: value });
+      out.push({ name, kind: 'url', url: urlText, targets });
       continue;
     }
 
-    const relPath = normalizeConfRelPath(value);
+    // ファイル型は常に Web のタブ専用なので、対象指定を書く意味が無い。
+    // 書かれていたら (とくに `g2`) 黙って通さず、無視することを伝える。
+    const { head, tokens: fileTokens } = stripTrailingTargetTokens(value);
+    if (fileTokens.length > 0) {
+      console.warn(
+        `[g2-plugins] ${where}:${i + 1} ファイル型は Web のタブ専用です。対象指定は無視します: ${fileTokens.join(' ')}`,
+      );
+    }
+    const relPath = normalizeConfRelPath(head);
     if (relPath === null) {
       console.warn(
-        `[g2-plugins] ${where}:${i + 1} URL でも作業フォルダ内の相対パスでもありません: ${value}`,
+        `[g2-plugins] ${where}:${i + 1} URL でも作業フォルダ内の相対パスでもありません: ${head}`,
       );
       continue;
     }
@@ -200,47 +295,139 @@ export async function readDeclarations(sessionCwd: string): Promise<PluginEntry[
 }
 
 /**
- * URL に実際に繋いで応答があるか確かめる。
- * ステータスコードは問わない (404 でも「サーバは生きている」ので開ける)。
+ * 「グラス向けに用意されたページか」の判定に使う、シム注入のマーカー。
+ * Plugin Loader のプロキシ (proxy/server.ts) が HTML の `<head>` 直後に差し込む
+ * 実物の文字列で、even 側の isProxyInjected (plugin-takeover.ts) と同じもの。
  */
-async function isReachable(url: string): Promise<boolean> {
+const SHIM_MARKERS = ['__EVEN_LOADER_FROM_PROXY=1', '/__even-loader/shim.js'];
+
+/**
+ * 自動判定のために読む HTML の上限。マーカーは `<head>` 直後に入るので、
+ * 先頭だけ読めば足りる (大きな成果物ページを丸ごとメモリに載せない)。
+ */
+const PROBE_BODY_LIMIT = 256 * 1024;
+
+/** 遷移時に headlenss が付けるのと同じクエリ。シムはこれを見て戻る動作を有効にする。 */
+const LOADER_PARAM = 'even_loader';
+
+/** 疎通確認の結果。 */
+type Probe = {
+  /** 応答があったか (ステータスコードは問わない) */
+  ok: boolean;
+  /** シム注入のマーカーが見つかったか (= グラス向けと見なす) */
+  shim: boolean;
+};
+
+/** 疎通確認の URL に `?even_loader=1` を付ける (シム注入の有無を実地に見るため)。 */
+function withLoaderParam(url: string): string {
+  try {
+    const u = new URL(url);
+    u.searchParams.set(LOADER_PARAM, '1');
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+/** 応答本文の先頭だけを読む。途中で切れてもそこまでで判定する。 */
+async function readBodyHead(res: Response, limit: number): Promise<string> {
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let out = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) out += decoder.decode(value, { stream: true });
+      if (out.length >= limit) break;
+    }
+  } catch {
+    // 途中で切れた場合もここまでの内容で判定する
+  } finally {
+    // 残りを捨てて接続を解放する (放置すると GC まで保持される)
+    await reader.cancel().catch(() => {});
+  }
+  return out;
+}
+
+/**
+ * URL に実際に繋いで、(1) 応答があるか (2) シムが注入されているか を確かめる。
+ *
+ * ステータスコードは問わない (404 でも「サーバは生きている」ので開ける)。
+ * リダイレクトは追わない — 従来どおり「応答があれば届く」の判定を保ちたいだけで、
+ * 追跡すると宣言と違うページを見て判定してしまう。
+ * (リダイレクトを返すページは本文が無いので、自動判定では Web 専用になる。
+ *  グラスに出したければ対象指定 `g2` を明示する。)
+ */
+async function probe(url: string): Promise<Probe> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), REACH_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { method: 'GET', signal: ctrl.signal, redirect: 'manual' });
-    // body を破棄して接続を解放する (放置すると GC まで保持される)
-    await res.body?.cancel().catch(() => {});
-    return true;
+    const res = await fetch(withLoaderParam(url), {
+      method: 'GET',
+      signal: ctrl.signal,
+      redirect: 'manual',
+    });
+    const ct = (res.headers.get('content-type') ?? '').toLowerCase();
+    if (!ct.includes('text/html')) {
+      await res.body?.cancel().catch(() => {});
+      return { ok: true, shim: false };
+    }
+    const head = await readBodyHead(res, PROBE_BODY_LIMIT);
+    return { ok: true, shim: SHIM_MARKERS.some((m) => head.includes(m)) };
   } catch {
-    return false;
+    return { ok: false, shim: false };
   } finally {
     clearTimeout(timer);
   }
 }
 
-const reachCache = new Map<string, { at: number; ok: boolean }>();
+const probeCache = new Map<string, { at: number; result: Probe }>();
 
-async function isReachableCached(url: string): Promise<boolean> {
+async function probeCached(url: string): Promise<Probe> {
   const now = Date.now();
-  const hit = reachCache.get(url);
-  if (hit && now - hit.at < CACHE_TTL_MS) return hit.ok;
-  const ok = await isReachable(url);
-  reachCache.set(url, { at: Date.now(), ok });
-  return ok;
+  const hit = probeCache.get(url);
+  if (hit && now - hit.at < CACHE_TTL_MS) return hit.result;
+  const result = await probe(url);
+  probeCache.set(url, { at: Date.now(), result });
+  return result;
+}
+
+/**
+ * その宣言を Web UI のプレビュータブに出すか。
+ *
+ * ファイル型は常に出す。URL 型は明示指定が無ければ出す (自動判定は「グラスにも
+ * 出すか」だけを決めるもので、Web からは常に見られる)。`g2` だけを明示した
+ * ものだけが Web から外れる。
+ */
+export function showsOnWeb(entry: PluginEntry): boolean {
+  if (entry.kind !== 'url') return true;
+  return entry.targets === null || entry.targets.web;
 }
 
 /**
  * セッションのフォルダに宣言された G2 プラグインのうち、いま実際に応答するものを返す。
  * 宣言ファイルが無ければ空 (この機能を使っていないセッション)。
+ *
+ * ファイル型は headlenss サーバが配信するローカルのファイルで、グラスからは開けない。
+ * URL 型のうち「グラス対象」のものだけを出す (対象指定が無ければシム注入で自動判定)。
  */
 export async function detectG2Plugins(sessionCwd: string): Promise<G2Plugin[]> {
   if (!sessionCwd) return [];
-  // ファイル型は headlenss サーバが配信するローカルのファイルで、グラスからは開けない。
-  // G2 の一覧には URL 型だけを出す (この機能を足す前と同じ挙動)。
-  const declared = (await readDeclarations(sessionCwd)).filter((d) => d.kind === 'url');
+  const declared = (await readDeclarations(sessionCwd)).filter(
+    (d): d is Extract<PluginEntry, { kind: 'url' }> =>
+      d.kind === 'url' && (d.targets === null || d.targets.g2),
+  );
   if (declared.length === 0) return [];
   const checked = await Promise.all(
-    declared.map(async (d) => ((await isReachableCached(d.url)) ? { name: d.name, url: d.url } : null)),
+    declared.map(async (d) => {
+      const p = await probeCached(d.url);
+      if (!p.ok) return null;
+      // 無指定はシム注入の有無で決める。明示の `g2` は注入が無くても出す。
+      if (d.targets === null && !p.shim) return null;
+      return { name: d.name, url: d.url };
+    }),
   );
   return checked.filter((d): d is G2Plugin => d !== null);
 }
@@ -280,7 +467,7 @@ export async function tmuxSessionPaths(): Promise<Map<string, string>> {
 
 /** テスト用: キャッシュを捨てる */
 export function resetG2PluginCache(): void {
-  reachCache.clear();
+  probeCache.clear();
   confCache.clear();
   pathCache = null;
 }
