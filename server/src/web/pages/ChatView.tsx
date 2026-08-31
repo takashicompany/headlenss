@@ -470,6 +470,13 @@ export function ChatView({
   // 例外はあるが、送信ボタンが常にあるので機能的には支障なし。
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key !== 'Enter' || e.shiftKey || e.nativeEvent.isComposing) return;
+    // Cmd+Enter / Ctrl+Enter は端末種別に関わらず常に送信 (iPad + 外付けキーボード
+    // は pointer: coarse のままなので、素の Enter 判定だけだと送信手段がボタンしかない)。
+    if (e.metaKey || e.ctrlKey) {
+      e.preventDefault();
+      void send();
+      return;
+    }
     const isTouch =
       typeof window !== 'undefined' &&
       window.matchMedia?.('(pointer: coarse)').matches;
