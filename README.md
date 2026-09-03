@@ -51,7 +51,7 @@ Browser (smartphone / PC, web UI)
 headlenss/
 ├── server/   # Server running on the PC (tmux management API + Web UI + ASR)
 ├── even/     # Even G2 app (TS web app running inside the smartphone WebView)
-└── plugin/   # Claude Code / Codex hooks (forwarded to the server) + bundled Claude Code skills
+└── plugin/   # Claude Code / Codex hooks (forwarded to the server) + bundled agent skills
 ```
 
 ## What It Can Do
@@ -148,19 +148,21 @@ npm run hooks:install   # writes both Claude Code and Codex hooks into ~/.claude
 > This writes hooks directly into `~/.claude/settings.json` (Claude) and `~/.codex/hooks.json` (Codex).
 > **Do NOT also install the marketplace plugin (`/plugin install headlenss@headlenss`)** — running both double-fires the hooks. Pick one. See [plugin/README.md](./plugin/README.md) for details.
 
-### 4. (Optional) Install the bundled Claude Code skills
+### 4. (Optional) Install the bundled agent skills
 
-Teaches Claude Code how to drive HeadLenss itself:
+Teaches Claude Code and Codex how to drive HeadLenss itself:
 
 - `headlenss-new-session` — create a new tmux session (an agent workspace) through the API.
 - `headlenss-g2-plugin` — surface a G2 plugin you are developing in the session list and open it from the glasses.
 - `headlenss-dev-server` — run a dev server on the HeadLenss machine and expose it over the tailnet without stealing HeadLenss's ports.
+- `headlenss-preview-tabs` — put an HTML file or a dev server on a tab in the web UI's session screen, so you can check the agent's work with one tap from your phone or PC.
 
 ```bash
 cd server
-npm run skills:install   # copies plugin/skills/* into ~/.claude/skills/
+npm run skills:install   # copies plugin/skills/* into ~/.claude/skills/ and $CODEX_HOME/skills/
 ```
 
+- Installed to both `~/.claude/skills/` (Claude Code) and `$CODEX_HOME/skills/` (Codex; `~/.codex/skills/` when unset), so the same instructions are available whichever agent you are running.
 - Copies (not symlinks), so the skills keep working even if you move the repo. Re-run it after `git pull` to update; remove with `npm run skills:uninstall`.
 - If your server is not `http://127.0.0.1:3000`: `HEADLENSS_SERVER_URL=http://<host>:3000 npm run skills:install`. This only rewrites the `headlenss-new-session` skill (the other skills assume they run on the machine hosting headlenss, so their loopback URLs are kept as-is).
 

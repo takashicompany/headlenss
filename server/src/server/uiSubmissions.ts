@@ -28,7 +28,9 @@
  *   送信がこれに当たる (Codex は Tab で積む / Claude Code は Enter で積まれる)。
  *
  * 正規化: trim + 連続空白 (改行含む) を単一スペースに圧縮。
- * マッチング: 正規化後の厳密一致のみ (prefix 一致は偽陽性を生むため行わない)。
+ * マッチング: 正規化後の ACK 本文の中で、送った本文が「語の切れ目で丸ごと現れるか」を見る。
+ * 入力欄に先客の書きかけが残っていたり、複数の送信が 1 つのプロンプトにまとめて受理されたりすると、
+ * ACK 本文は送った本文より長くなる。詳しくは matchDeliveries のコメント。
  *
  * 元は「UI 送信かどうか (origin=ui/external) の判別」だけを行うモジュールだったので、
  * その役目 (confirmDelivery の origin) も引き続きここが持つ。
@@ -198,6 +200,56 @@ export function startQueuedDeliveryTimer(tmuxName: string, now: number = Date.no
   }
 }
 
+/**
+ * 正規化済みの ACK 本文 `hay` の中で、`needle` が「語の切れ目」に現れる位置を探す。
+ * 前後は文字列の端か空白 1 つ (正規化後なので連続空白は無い) でなければならない。
+ * 単なる部分一致を許すと、短い本文が無関係なプロンプトの一部に当たって偽陽性になる。
+ */
+function findSegment(hay: string, needle: string, from: number): number {
+  let idx = hay.indexOf(needle, from);
+  while (idx >= 0) {
+    const leftOk = idx === 0 || hay[idx - 1] === ' ';
+    const end = idx + needle.length;
+    const rightOk = end === hay.length || hay[end] === ' ';
+    if (leftOk && rightOk) return idx;
+    idx = hay.indexOf(needle, idx + 1);
+  }
+  return -1;
+}
+
+/**
+ * ACK 本文と送達の照合。
+ *
+ * なぜ完全一致だけでは足りないか:
+ *   HeadLenss の送信は「エージェントの入力欄 (composer) に本文を追記して Enter」。
+ *   入力欄は HeadLenss の持ち物ではないので、送る瞬間に既に他の本文が入っていることがある:
+ *     - 前回の Enter が TUI の貼り付け判定に巻き込まれ、本文と改行が入力欄に残った
+ *     - ユーザが tmux を直接触って書きかけを残していた / 履歴を呼び戻していた
+ *     - 処理中に積んだ複数の送信をエージェントが 1 つのプロンプトにまとめて受理した
+ *   このときフックが運んでくる本文は「入力欄全体」= 送った本文を含むもっと長い文字列になる。
+ *   完全一致だけで見ると、届いているのに「届いていない」と誤報する。
+ *
+ * どう照合するか:
+ *   送達を古い順に見ながら、ACK 本文を左から右へ 1 回だけなぞって「語の切れ目に現れるか」を
+ *   見る。見つかった領域は消費して次の送達はその後ろから探すので、
+ *     - 注入は送信順に入力欄に並ぶ (順序を守る)
+ *     - 同じ文面を 2 通送ったのに ACK に 1 回しか現れなければ 1 通しか確認しない
+ *   という性質が自然に出る。単一の完全一致はこの規則の特殊ケース。
+ *
+ * 届いていない送信は引き続き検出できる: 入力欄に入らなかった本文は ACK のどこにも現れない。
+ */
+function matchDeliveries(candidates: Delivery[], ackText: string): Delivery[] {
+  const matched: Delivery[] = [];
+  let cursor = 0;
+  for (const d of candidates) {
+    const at = findSegment(ackText, d.normalizedText, cursor);
+    if (at < 0) continue;
+    matched.push(d);
+    cursor = at + d.normalizedText.length;
+  }
+  return matched;
+}
+
 export type ConfirmResult = {
   /** その本文が HeadLenss の UI 由来か (chat 表示のタグ付けに使う従来の用途)。 */
   origin: 'ui' | 'external';
@@ -211,7 +263,8 @@ export type ConfirmResult = {
 
 /**
  * UserPromptSubmit フックの受信時に呼ぶ。エージェントが本文を受理した証拠なので、
- * 一致する送達を confirmed にする。
+ * 一致する送達を confirmed にする。1 つの ACK が複数の送達をまとめて含むことがあるため
+ * (入力欄に溜まった本文がまとめて受理されるケース)、一致したものは全部確定させる。
  *
  * sessionId / turnId は二重フックの冪等化に使う。どちらも取れない時は冪等化しない
  * (「同じ文面を送り直した」と区別が付かないため。二重フックを素通ししても、
@@ -243,24 +296,22 @@ export function confirmDelivery(
 
   const buf = evaluate(tmuxName, now);
   let result: ConfirmResult = { origin: 'external', duplicate: false };
-  // まだ確認待ちのもの (古い順) を優先して確定させる。
-  const pendingIdx = buf.findIndex((d) => !isTerminal(d.state) && d.normalizedText === normalized);
-  if (pendingIdx >= 0) {
-    const d = buf[pendingIdx];
+  // まだ確認待ちのものを優先して確定させる。見つからなければ、期限切れ後に遅れて
+  // 届いたケースとして confirmed_late を見る (この優先順は変えない)。
+  const matched = matchDeliveries(buf.filter((d) => !isTerminal(d.state)), normalized);
+  const late = matched.length === 0
+    ? matchDeliveries(buf.filter((d) => d.state === 'unconfirmed' || d.state === 'injection_failed'), normalized)
+    : [];
+  for (const d of matched) {
     d.state = 'confirmed';
     d.confirmedAt = now;
-    result = { origin: 'ui', deliveryId: d.id, duplicate: false, state: d.state };
-  } else {
-    // 期限切れ後に遅れて届いたケース。新しい方から拾って confirmed_late にする。
-    for (let i = buf.length - 1; i >= 0; i--) {
-      const d = buf[i];
-      if (d.state !== 'unconfirmed' || d.normalizedText !== normalized) continue;
-      d.state = 'confirmed_late';
-      d.confirmedAt = now;
-      result = { origin: 'ui', deliveryId: d.id, duplicate: false, state: d.state };
-      break;
-    }
   }
+  for (const d of late) {
+    d.state = 'confirmed_late';
+    d.confirmedAt = now;
+  }
+  const head = matched[0] ?? late[0];
+  if (head) result = { origin: 'ui', deliveryId: head.id, duplicate: false, state: head.state };
 
   if (hasIdentity) {
     let seen = seenHooks.get(tmuxName);

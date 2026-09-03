@@ -1,5 +1,10 @@
 #!/usr/bin/env node
-// HeadLenss 同梱の Claude Code スキルを ~/.claude/skills/<name>/ にインストールする。
+// HeadLenss 同梱のスキルを、エージェントが読む場所へインストールする。
+//
+// 配置先は 2 つ。同じ内容を両方に置く (どちらのエージェントで作業していても同じ手順書が使える)。
+//   - Claude Code: ~/.claude/skills/<name>/
+//   - Codex:       $CODEX_HOME/skills/<name>/  (未設定なら ~/.codex/skills/<name>/)
+// 2 つが同じフォルダを指す環境では 1 回だけ処理する。
 // リポジトリを消しても壊れないよう、シンボリックリンクではなく「コピー」する
 // (cc-hooks/install.mjs, codex-hooks/install.mjs と対称のセットアップスクリプト)。
 //
@@ -31,9 +36,31 @@ import { MARKER_NAME, isHeadlenssSkill } from './marker.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const sourceRoot = __dirname;
-const skillsDir = resolve(homedir(), '.claude', 'skills');
-// 退避先は skills/ の外に置く (中に置くと Claude Code が重複スキルとして読み込んでしまう)。
-const backupRoot = resolve(homedir(), '.claude', 'skills-backup');
+
+/**
+ * 配置先の一覧。退避先 (backupRoot) は skills/ の外に置く
+ * (中に置くとエージェントが重複スキルとして読み込んでしまう)。
+ */
+function skillTargets() {
+  const codexHome = (process.env.CODEX_HOME || '').trim() || resolve(homedir(), '.codex');
+  const all = [
+    {
+      label: 'Claude Code',
+      skillsDir: resolve(homedir(), '.claude', 'skills'),
+      backupRoot: resolve(homedir(), '.claude', 'skills-backup'),
+    },
+    {
+      label: 'Codex',
+      skillsDir: resolve(codexHome, 'skills'),
+      backupRoot: resolve(codexHome, 'skills-backup'),
+    },
+  ];
+  // CODEX_HOME を ~/.claude に向けている等、同じ場所を 2 回処理しないようにする。
+  const seen = new Set();
+  return all.filter((t) => (seen.has(t.skillsDir) ? false : (seen.add(t.skillsDir), true)));
+}
+
+const TARGETS = skillTargets();
 
 const DEFAULT_BASES = ['http://127.0.0.1:3000', 'http://localhost:3000'];
 // URL 差し替えの対象スキル。
@@ -136,58 +163,68 @@ function install() {
 
   // 第 1 段階: 全スキルを読んで差し替えまで済ませてから書き込みに入る。
   // 1 ファイルも書かないうちに落とすことで、途中まで適用された状態を残さない。
-  const plans = names.map((name) => {
+  // ソースは 1 スキルにつき 1 回だけ読み、すべての配置先で同じ結果を使う。
+  const sources = names.map((name) => {
     const sourceDir = join(sourceRoot, name);
-    const destDir = join(skillsDir, name);
     const rewrite = URL_REWRITE_SKILLS.has(name);
-
-    if (existsSync(destDir) && !statSync(destDir).isDirectory()) {
-      throw new Error(`${destDir} exists but is not a directory; move it away and retry.`);
-    }
-
-    // ソースは 1 スキルにつき 1 回だけ読む (比較にも書き込みにも同じ結果を使う)。
-    return { name, sourceDir, destDir, rewrite, want: collectFiles(sourceDir, rewrite) };
+    return { name, sourceDir, rewrite, want: collectFiles(sourceDir, rewrite) };
   });
 
-  // 第 2 段階: 書き込み。
-  mkdirSync(skillsDir, { recursive: true });
-  let changed = 0;
-
-  for (const { name, sourceDir, destDir, rewrite, want } of plans) {
-    const mine = isHeadlenssSkill(destDir);
-
-    // 安いマーカー確認を先に済ませてから、内容比較を行う。
-    if (mine && sameContent(want, destDir)) {
-      console.log(`HeadLenss skill "${name}" is already installed in ${destDir}`);
-      continue;
-    }
-
-    if (existsSync(destDir)) {
-      if (mine) {
-        console.log(`Updating existing HeadLenss skill at ${destDir}`);
-      } else {
-        // 自分が入れたと確認できないものは、すべてユーザーの資産として扱う
-        // (マーカーが無いもの・壊れているもの・他ツールのものを含む)。消す前に必ず退避する。
-        const backupPath = join(backupRoot, `${name}.bak.${Date.now()}`);
-        mkdirSync(backupRoot, { recursive: true });
-        cpSync(destDir, backupPath, { recursive: true });
-        console.log(`Backed up existing skill to ${backupPath}`);
+  // 置けない配置先 (同名のファイルがある等) も、書き込みを始める前に全部見ておく。
+  for (const target of TARGETS) {
+    for (const { name } of sources) {
+      const destDir = join(target.skillsDir, name);
+      if (existsSync(destDir) && !statSync(destDir).isDirectory()) {
+        throw new Error(`${destDir} exists but is not a directory; move it away and retry.`);
       }
     }
-
-    copySkill(want, sourceDir, destDir, name, rewrite);
-    console.log(`Installed HeadLenss skill "${name}" to ${destDir}`);
-    changed += 1;
   }
 
+  // 第 2 段階: 書き込み。
+  let changed = 0;
+
+  for (const target of TARGETS) {
+    mkdirSync(target.skillsDir, { recursive: true });
+
+    for (const { name, sourceDir, rewrite, want } of sources) {
+      const destDir = join(target.skillsDir, name);
+      const mine = isHeadlenssSkill(destDir);
+
+      // 安いマーカー確認を先に済ませてから、内容比較を行う。
+      if (mine && sameContent(want, destDir)) {
+        console.log(`HeadLenss skill "${name}" is already installed in ${destDir}`);
+        continue;
+      }
+
+      if (existsSync(destDir)) {
+        if (mine) {
+          console.log(`Updating existing HeadLenss skill at ${destDir}`);
+        } else {
+          // 自分が入れたと確認できないものは、すべてユーザーの資産として扱う
+          // (マーカーが無いもの・壊れているもの・他ツールのものを含む)。消す前に必ず退避する。
+          const backupPath = join(target.backupRoot, `${name}.bak.${Date.now()}`);
+          mkdirSync(target.backupRoot, { recursive: true });
+          cpSync(destDir, backupPath, { recursive: true });
+          console.log(`Backed up existing skill to ${backupPath}`);
+        }
+      }
+
+      copySkill(want, sourceDir, destDir, name, rewrite);
+      console.log(`Installed HeadLenss skill "${name}" to ${destDir}`);
+      changed += 1;
+    }
+  }
+
+  const dirs = TARGETS.map((t) => `${t.label}: ${t.skillsDir}`).join(', ');
   if (changed === 0) {
-    console.log(`All HeadLenss skills are up to date in ${skillsDir}`);
+    console.log(`All HeadLenss skills are up to date (${dirs})`);
     return;
   }
   if (serverUrl) {
     console.log(`Server URL was set to ${serverUrl} in: ${[...URL_REWRITE_SKILLS].join(', ')}`);
   }
-  console.log('Restart Claude Code (or run /doctor) so the new skills are picked up.');
+  console.log(`Installed to ${dirs}`);
+  console.log('Restart Claude Code / Codex (or run /doctor) so the new skills are picked up.');
 }
 
 install();

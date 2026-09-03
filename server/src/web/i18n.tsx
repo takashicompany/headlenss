@@ -41,6 +41,19 @@ const STRINGS = {
   moveUp:                 { en: 'Move up', ja: '上へ移動' },
   moveDown:               { en: 'Move down', ja: '下へ移動' },
 
+  // ── チャット画面の中のタブ (.headlenss-plugins.conf 由来) ──
+  previewChatTab:         { en: 'Chat', ja: 'チャット' },
+  previewReload:          { en: 'Reload this tab', ja: 'このタブを再読込' },
+  previewOpenExternal:    { en: 'Open in a new tab', ja: '別タブで開く' },
+  previewTabMissingTitle: { en: 'This tab is not available',
+                            ja: 'このタブは表示できません' },
+  previewTabMissingBody:  { en: 'It is no longer declared in .headlenss-plugins.conf in the session folder, or the file it points to is gone.',
+                            ja: 'セッションのフォルダの .headlenss-plugins.conf から宣言が消えたか、指しているファイルが無くなっています。' },
+  previewMixedTitle:      { en: 'This tab cannot be shown inside the page',
+                            ja: 'このタブはページ内に表示できません' },
+  previewMixedBody:       { en: 'This page is served over HTTPS, but the tab points to an http:// URL. Browsers block that combination inside a frame, so open it in a new tab instead.',
+                            ja: 'この画面は HTTPS で開かれていますが、タブの URL は http:// です。ブラウザはこの組み合わせをフレーム内に表示しないので、別タブで開いてください。' },
+
   // ── ChatView: origin / agent labels ──
   originExternal:         { en: 'EXTERNAL', ja: '外部入力' },
 

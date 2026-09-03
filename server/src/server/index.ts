@@ -29,6 +29,7 @@ import {
 } from './session-status.ts';
 import { pruneScreenBlockObservations, resolveScreenBlocked } from './screen-block.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
+import { handleWebTabs, servePreview } from './web-preview.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIST = resolve(__dirname, '../../dist/web');
@@ -583,6 +584,13 @@ app.post('/api/sessions/:name/input', async (c) => {
   }
 });
 
+// ───────── Web UI のプレビュータブ ─────────
+//
+// セッションの作業フォルダの .headlenss-plugins.conf に宣言された「開けるもの」を
+// Web UI 用に返す (URL 型 = dev server / PWA、ファイル型 = 作業フォルダの中の HTML)。
+// G2 の一覧 (/api/claude/sessions の g2Plugins) はグラス対象の URL 型だけなので、そちらとは別口。
+app.get('/api/sessions/:name/webtabs', handleWebTabs);
+
 app.route('/api', claudeRouter);
 app.route('/api', codexRouter);
 
@@ -750,6 +758,25 @@ app.post('/api/asr', async (c) => {
   } catch (e) {
     return c.json({ error: (e as Error).message }, 500);
   }
+});
+
+// ───────── 成果物の静的配信 (/preview/<session>/<path>) ─────────
+//
+// /api/* のあとで、SPA のフォールバック (下の app.get('/*')) より前に置く。
+// 配信するのは「ファイル型を宣言しているセッション」の作業フォルダだけ (web-preview.ts)。
+//
+// パターン登録 (`app.on(..., '/preview/*')`) ではなくミドルウェアで拾う。
+// Hono のルータは `..` を含むパスをワイルドカードに一致させないので、パターンだけだと
+// そういうリクエストがここを素通りする。実際には HTTP 層 (Request の URL 解決) で
+// `..` は先に潰されるため `/preview/<s>/../../etc/passwd` は `/etc/passwd` という
+// 別のパスとして届く (= SPA のフォールバック行き。他の未知パスと同じ扱い) が、
+// 経路の前提を 1 段減らしておく。エンコードされて生き残る形 (`..%2F` 等) は
+// この先の resolveInside が落とす。
+app.use('/*', async (c, next) => {
+  if (c.req.method !== 'GET' && c.req.method !== 'HEAD') return next();
+  const path = c.req.path;
+  if (path !== '/preview' && !path.startsWith('/preview/')) return next();
+  return servePreview(c);
 });
 
 if (existsSync(WEB_DIST)) {
