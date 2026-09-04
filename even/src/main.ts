@@ -11,6 +11,7 @@ import {
   trackPcmFrame,
 } from './audio'
 import { onEvenHubEvent, setEventHandlers, setScrollCooldownMs } from './events'
+import { loadFavorites, saveFavorites } from './favorites'
 import {
   HEADER_INNER_WIDTH,
   initRenderer,
@@ -341,6 +342,23 @@ function isUnread(s: ClaudeSessionInfo): boolean {
   return s.lastSeenAt > last
 }
 
+// お気に入り (★) のセッション名。グラス内だけの状態でサーバへは送らない。
+// 起動時に loadFavorites で復元し、変更のたびに saveFavorites で書き戻す。
+let favoriteSessions = new Set<string>()
+
+/** レンズ一覧で ★ の先頭に出す印。'★' (U+2605) は G2 のフォントに実体があり、
+ *  pretext の getTextWidth で 20px (全角 1 枠) と出る。欠字は 4px (notdef) になるので
+ *  幅で見分けられる。'⚠'/'⏸' が 4px = 欠字だったのに対し ★/☆ は実グリフ。 */
+const FAVORITE_MARK = '★'
+/** ★ が付いていない行で ★ 列を空けるための詰め物。全角スペース (U+3000) は
+ *  ★ と同じ 20px なので、★ 有無で名前の開始位置がずれない。 */
+const FAVORITE_PAD = '\u3000'
+
+/** そのセッションに ★ が付いているか。 */
+function isFavoriteSession(s: ClaudeSessionInfo): boolean {
+  return favoriteSessions.has(s.tmuxSessionName)
+}
+
 // Claude Code hook 連携
 let claudeSessions: ClaudeSessionInfo[] = []     // 起動中Claude Codeを持つtmuxセッション一覧
 let claudeChat: ChatItem[] = []                  // 現在選択中セッションのチャット履歴
@@ -641,15 +659,23 @@ function rootRowKey(row: RootRow): string {
 function rootRowSignature(): string {
   return rootRows()
     .map((r) => (r.kind === 'session'
-      ? `${rootRowKey(r)}|${r.session.status}|${r.session.screenBlocked === true}|${r.session.source ?? ''}|${r.session.lastChat ?? ''}|${isUnread(r.session)}`
+      ? `${rootRowKey(r)}|${r.session.status}|${r.session.screenBlocked === true}|${r.session.source ?? ''}|${r.session.lastChat ?? ''}|${isUnread(r.session)}|${isFavoriteSession(r.session)}`
       : `${rootRowKey(r)}|${r.plugin.name}`))
     .join('\n')
 }
 
-/** セッション一覧を、プラグインをぶら下げた行配列に展開する。 */
+/**
+ * セッション一覧を、プラグインをぶら下げた行配列に展開する。
+ * ★ 付きのセッションは先頭にまとめる (Web UI の並びと同じ原則)。★ 群・通常群の
+ * それぞれの中ではサーバから返った順をそのまま保つ = 安定な分割なので、★ の
+ * 付け外し以外で並びが動くことはない。プラグイン行は親セッションに従属したまま動く。
+ */
 function rootRows(): RootRow[] {
+  const ordered = favoriteSessions.size === 0
+    ? claudeSessions
+    : [...claudeSessions.filter(isFavoriteSession), ...claudeSessions.filter((s) => !isFavoriteSession(s))]
   const rows: RootRow[] = []
-  for (const session of claudeSessions) {
+  for (const session of ordered) {
     rows.push({ kind: 'session', session })
     for (const plugin of session.g2Plugins ?? []) rows.push({ kind: 'plugin', session, plugin })
   }
@@ -862,13 +888,19 @@ function buildRootListView(): string {
   // セッション数が ROOT_LIST_VISIBLE 以下、もしくは末尾近辺で start が範囲を超えそうな時のクリップ
   rootListStart = Math.max(0, Math.min(rootListStart, Math.max(0, total - ROOT_LIST_VISIBLE)))
 
+  // ★ 列は「★ が 1 つでも付いている時」だけ確保する。★ は全角 1 枠 (20px) なので、
+  // 誰も使っていないうちから常時空けておくと、名前とプレビューをそのぶん押し出す。
+  const starColumn = favoriteSessions.size > 0
+  const starCell = (on: boolean): string => (starColumn ? (on ? FAVORITE_MARK : FAVORITE_PAD) : '')
+
   const lines: string[] = []
   for (let i = rootListStart; i < Math.min(rootListStart + ROOT_LIST_VISIBLE, total); i++) {
     const row = items[i]
     const cursor = i === rootCursor ? '▶ ' : '  '
     if (row.kind === 'plugin') {
       // セッション行の下にぶら下げる。字下げで従属関係を示す。
-      lines.push(`${cursor}  └ ${row.plugin.name}`)
+      // ★ は親セッションに付くものなので、プラグイン行は詰め物だけ置いて桁を揃える。
+      lines.push(`${cursor}${starCell(false)}  └ ${row.plugin.name}`)
       continue
     }
     const s = row.session
@@ -876,7 +908,7 @@ function buildRootListView(): string {
     const agent = s.source === 'codex' ? 'Codex' : s.source === 'claude' ? 'Claude' : 'Agent'
     // 既読セッションは空白で揃え、未読は '*' でマーク
     const unread = isUnread(s) ? '*' : ' '
-    const prefix = `${cursor}${s.tmuxSessionName} [${agent}] ${unread}${mark}`
+    const prefix = `${cursor}${starCell(isFavoriteSession(s))}${s.tmuxSessionName} [${agent}] ${unread}${mark}`
     lines.push(appendRootPreview(prefix, s.lastChat))
   }
   return lines.join('\n')
@@ -2166,6 +2198,9 @@ async function executeFullRender(force: boolean, frame: G2Frame | null = null): 
     // ヘッダも出す: 点滅 (headBlinkOn) のように「同じ phase で送信内容だけが変わる」
     // 挙動は、この行の時系列でしか外から確かめられない。
     console.log(`[refreshG2] firing (phase=${phase}, force=${force}) header=${JSON.stringify(header)}`)
+    // 本文とフッタは devMode の時だけ。「レンズに何が出ているか」はグラスを掛けずに
+    // 追える唯一の手掛かりなので、開発モードでは必ず残す (既定では 1 行も出さない)。
+    log(`[refreshG2] content=${JSON.stringify(content)} footer=${JSON.stringify(footer)}`)
     // dedup 基準は「送れたもの」だけを 1 つずつ記録する: scroll tick とポーリング由来の
     // 再描画がこの 3 つと突き合わせる。3 つまとめて先に立てると、途中の await が失敗した
     // 時に「送っていない内容を送信済み」と記録したフレームが残る (catch の一括取り消しは
@@ -3689,6 +3724,32 @@ function moveRootCursor(delta: number): void {
   void refreshG2(true)
 }
 
+/**
+ * rootlist で長押しされた時: カーソル行のセッションの ★ を切り替える。
+ *
+ * プラグイン行 (└ …) にカーソルがある場合も、★ は親セッションに付く/外れる。
+ * プラグインは親に従属した表示なので、単体で並び替えの対象にはしない。
+ *
+ * カーソルは飛ばない: rootCursorKey は index ではなく行の同一性キーなので、
+ * ★ を付けて並びが変わっても同じ行に付いていく。表示窓 (rootListStart) は
+ * buildRootListView が新しいカーソル位置から引き直す。
+ */
+function toggleFavoriteFromRoot(): void {
+  if (phase !== 'rootlist') return
+  const row = currentRootRow()
+  if (!row) return
+  const name = row.session.tmuxSessionName
+  const on = !favoriteSessions.has(name)
+  if (on) favoriteSessions.add(name)
+  else favoriteSessions.delete(name)
+  // 保存はレンズ更新を待たせない (bridge 書き込みは往復するため)。
+  void saveFavorites(bridge, favoriteSessions)
+  log(`favorite ${on ? 'on' : 'off'}: ${name} (total=${favoriteSessions.size})`)
+  // 長押しは押した手応えが無いので、何が起きたかをフッタに 1 行出す。
+  showG2Notice(t(on ? 'g2NoticeStarred' : 'g2NoticeUnstarred').replace('{name}', name))
+  void refreshG2(true)
+}
+
 // ─── G2 プラグインへの遷移 ─────────────────────────────────────────────
 // 遷移直前にレンズへフィードバックを出し、そのフレームが届くまで少し待つ。
 const PLUGIN_NAVIGATE_DELAY_MS = 400
@@ -4728,7 +4789,7 @@ async function boot(): Promise<void> {
     // 取り込み (performTakeover) の直前に no-op へ差し替えるので、取り込みに失敗して
     // headlenss に戻る時に同じ内容を再登録できるよう、登録処理を関数で持っておく。
     const installHandlers = (): void => setEventHandlers({
-      // rootlist: 上下=カーソル / click=open / dbl=OS終了
+      // rootlist: 上下=カーソル / click=open / 長押し=★トグル / dbl=OS終了
       // pending:  上=送信 / 下=テキスト削除 / dbl=破棄して idle へ
       // idle:     上=過去ログ / 下=新しい方へ / dbl=root へ戻る
       // cc-message:  上下=本文スクロール / click=選択肢画面へ / dbl=キャンセルして idle へ
@@ -4757,6 +4818,13 @@ async function boot(): Promise<void> {
         clearG2Notice()  // 一時通知は次の操作で消す
         if (respondInputBlocked()) return  // 応答 POST 中はタップも無視
         void toggleRecording()
+      },
+      // 長押し: rootlist でのお気に入り (★) トグル。
+      // 他の phase では何もしない (誤爆で状態が変わらないようにする)。
+      onLongPress: () => {
+        if (respondInputBlocked()) return
+        if (phase !== 'rootlist') return
+        toggleFavoriteFromRoot()
       },
       // 二重クリック: 各 phase での「戻る/キャンセル」操作
       onDoubleClick: () => {
@@ -4854,7 +4922,10 @@ async function boot(): Promise<void> {
 
   // 3. 設定ロード
   settings = await loadSettings(bridge)
-  log(`Loaded settings: server=${settings.serverBaseUrl || '(none)'} session=${settings.sessionName} lang=${settings.language}`)
+  // ★ (お気に入り) もここで復元する。設定と同じくブリッジ主体の二重保存なので、
+  // 起動のたびに WebView の localStorage が空になる本番環境でも残る。
+  favoriteSessions = await loadFavorites(bridge)
+  log(`Loaded settings: server=${settings.serverBaseUrl || '(none)'} session=${settings.sessionName} lang=${settings.language} favorites=${favoriteSessions.size}`)
   applyClientBase()
   setScrollCooldownMs(settings.scrollCooldownMs) // events.ts に保存済みの値を反映
   // 設定の言語を反映 (WebView の data-i18n を一斉に書き換え + セレクタラベル)
@@ -4900,6 +4971,13 @@ async function boot(): Promise<void> {
     } catch (err) {
       log(`G2 final render error: ${err}`)
     }
+  }
+
+  // E2E 検証時だけ、シミュレータが送れない長押しイベントを外から注入できるようにする。
+  // import.meta.env.DEV は本番ビルドで false に畳まれ、この分岐ごと (動的 import も)
+  // 出荷物から消える。加えて ?e2e=1 が無ければ動かないので通常の dev 起動にも影響しない。
+  if (import.meta.env.DEV && new URLSearchParams(location.search).has('e2e')) {
+    void import('./e2e-input').then((m) => m.startE2EInputBridge(settings.serverBaseUrl, onEvenHubEvent))
   }
 
   // セッション一覧を定期的に更新

@@ -228,6 +228,9 @@ const STRINGS = {
   g2NoticeRecFailAsr:  { en: 'Rec start failed (ASR)',               ja: '録音開始に失敗 (音声認識)' },
   g2NoticeRecFailMic:  { en: 'Rec start failed (mic)',               ja: '録音開始に失敗 (マイク)' },
   g2NoticeRecFail:     { en: 'Rec start failed',                     ja: '録音開始に失敗' },
+  // お気に入り (★) の付け外し。長押しは押した手応えが無いので、何が起きたかを必ず出す。
+  g2NoticeStarred:     { en: 'Starred: {name}',                      ja: '★ を付けました: {name}' },
+  g2NoticeUnstarred:   { en: 'Unstarred: {name}',                    ja: '★ を外しました: {name}' },
 } as const
 
 export type StringKey = keyof typeof STRINGS
