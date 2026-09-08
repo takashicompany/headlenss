@@ -18,6 +18,7 @@ import {
   isPageBuilt,
   MAIN_INNER_WIDTH,
   markPageAlreadyBuilt,
+  type LensMenuItem,
   resetPageState,
   setRendererExclusiveSender,
   setRendererLog,
@@ -357,6 +358,34 @@ const FAVORITE_PAD = '\u3000'
 /** そのセッションに ★ が付いているか。 */
 function isFavoriteSession(s: ClaudeSessionInfo): boolean {
   return favoriteSessions.has(s.tmuxSessionName)
+}
+
+/** OS 長押しメニューに出す「お気に入り切替」の itemID。0 は予約済みなので 1 から。 */
+const LENS_MENU_ID_TOGGLE_FAVORITE = 1
+
+/**
+ * 今の画面で OS の長押しメニューに載せる独自項目。null なら menuObject を付けず、
+ * OS のデフォルトメニューをそのまま使う。
+ *
+ * セッション一覧 (rootlist) にだけ出す。他の画面に付けないのは、独自項目を載せた
+ * 瞬間にその画面の OS デフォルトメニューを置き換えてしまうため。出す必要が無い
+ * 画面では OS 標準のままにしておく。
+ *
+ * 「登録 / 解除」でラベルを出し分けない理由: menuObject は create/rebuild にしか
+ * 載らない (textContainerUpgrade では差し替えられない) ので、カーソル行ごとに文言を
+ * 変えるとカーソルを 1 行動かすたびにページ全体の再構築が要る。一覧のスクロールは
+ * この app が最も送信本数を切り詰めている経路なので、そこに毎回 rebuild を挟むのは
+ * 割に合わない。項目は「切替」の 1 つに固定し、結果 (付いた/外れた) は実行後に
+ * フッタの一時通知で必ず知らせる。
+ */
+function lensMenuItems(): LensMenuItem[] | null {
+  if (phase !== 'rootlist') return null
+  return [{ itemID: LENS_MENU_ID_TOGGLE_FAVORITE, itemName: t('menuToggleFavorite') }]
+}
+
+/** 送信済みメニューとの比較用の指紋。null (メニュー無し) も 1 つの状態として区別する。 */
+function lensMenuSignature(menu: LensMenuItem[] | null): string {
+  return menu === null ? '' : JSON.stringify(menu)
 }
 
 // Claude Code hook 連携
@@ -1993,12 +2022,17 @@ function isForcedResyncDue(): boolean {
 let g2ContentLastSent: string | null = null
 let g2HeaderLastSent: string | null = null
 let g2FooterLastSent: string | null = null
+// 最後にレンズへ載せた長押しメニューの指紋。menuObject は create/rebuild でしか
+// 差し替えられないので、これが変わった時だけページごと組み直す。
+// null = 何を載せたか不明 (次の描画で必ず送り直す)。
+let g2MenuLastSent: string | null = null
 
 /** 送信済みマークを取り消す。送信に失敗した内容が「送った」ままだと再送されないため。 */
 function invalidateG2Dedup(): void {
   g2ContentLastSent = null
   g2HeaderLastSent = null
   g2FooterLastSent = null
+  g2MenuLastSent = null
 }
 
 /**
@@ -2201,6 +2235,29 @@ async function executeFullRender(force: boolean, frame: G2Frame | null = null): 
     // 本文とフッタは devMode の時だけ。「レンズに何が出ているか」はグラスを掛けずに
     // 追える唯一の手掛かりなので、開発モードでは必ず残す (既定では 1 行も出さない)。
     log(`[refreshG2] content=${JSON.stringify(content)} footer=${JSON.stringify(footer)}`)
+
+    // 長押しメニューが変わる時 (= 一覧に入った/出た) だけはページごと組み直す。
+    // menuObject は textContainerUpgrade に載らないので、差分更新では差し替わらない。
+    // 変わらない限りここは通らないので、ふだんの再描画は従来どおり差分更新のまま。
+    const menu = lensMenuItems()
+    const menuSig = lensMenuSignature(menu)
+    if (menuSig !== g2MenuLastSent) {
+      console.log(`[refreshG2] menu changed (${g2MenuLastSent ?? 'unknown'} -> ${menuSig || 'none'}) — ページを再構築します`)
+      try {
+        await showScreen(header, content, footer, menu)
+      } catch (err) {
+        // 送れていないので dedup 基準ごと捨てる (次の要求で必ず送り直させる)
+        invalidateG2Dedup()
+        throw err
+      }
+      g2HeaderLastSent = header
+      g2ContentLastSent = content
+      g2FooterLastSent = footer
+      g2MenuLastSent = menuSig
+      g2LastSentAt = performance.now()
+      noteBridgeSendOk()
+      return
+    }
     // dedup 基準は「送れたもの」だけを 1 つずつ記録する: scroll tick とポーリング由来の
     // 再描画がこの 3 つと突き合わせる。3 つまとめて先に立てると、途中の await が失敗した
     // 時に「送っていない内容を送信済み」と記録したフレームが残る (catch の一括取り消しは
@@ -2270,12 +2327,15 @@ async function runExclusiveG2Send(body: () => Promise<void>): Promise<void> {
 async function sendShowScreen(header: string, content: string, footer: string): Promise<void> {
   await runExclusiveG2Send(async () => {
     // ページ全体を送り直すので、待機中の content-only は用済み。dedup 基準も更新する。
+    const menu = lensMenuItems()
+    const menuSig = lensMenuSignature(menu)
     g2ContentQueued = null
     g2HeaderLastSent = header
     g2ContentLastSent = content
     g2FooterLastSent = footer
+    g2MenuLastSent = menuSig
     try {
-      await showScreen(header, content, footer)
+      await showScreen(header, content, footer, menu)
       g2LastSentAt = performance.now()
     } catch (err) {
       invalidateG2Dedup()
@@ -2296,6 +2356,9 @@ function g2FrameWouldChange(frame: G2Frame): boolean {
   return frame.header !== g2HeaderLastSent
     || frame.content !== g2ContentLastSent
     || frame.footer !== g2FooterLastSent
+    // 長押しメニューだけが変わる場合も「変化あり」。3 コンテナが同じでも
+    // メニューの差し替えにはページの再構築が要る。
+    || lensMenuSignature(lensMenuItems()) !== g2MenuLastSent
 }
 
 /** 現在の状態から 3 コンテナぶんの内容を一度に組む (同一スナップショット)。 */
@@ -3167,10 +3230,11 @@ async function startRecording(): Promise<void> {
   resetScroll()
 
   // 1. UI を即座に recording 画面へ遷移 (体感ラグを減らす)
-  //    録音時間はここを起点にした経過時間で数える。受信 PCM のバイト数から
-  //    割り出すと、ホストがマイクを開けなかった時に 0.0s のまま止まって見える。
+  //    ただし録音時間の計測はここでは始めない。ここから数えると、レンズに
+  //    「接続中…」を出してユーザがまだ喋ってはいけない間の秒数まで録音時間に
+  //    入ってしまう。計測は「発話を受け付け始めた時点」(下の recordingReady) から。
+  //    タイマー (再描画) だけは先に回す。時計が動き出すまで 0.0s を出し続ける。
   phase = 'recording'
-  startRecordingClock()
   startRecordingTimer()
   paintStatus()
   updateRecordButton()
@@ -3272,8 +3336,13 @@ async function startRecording(): Promise<void> {
       void closeMic('stale-after-open', MIC_CLOSE_WAIT_MS)
       return
     }
-    // レンズ表示を「録音中」に切り替え (取得の決着は待たない)
+    // レンズ表示を「接続中…」から「録音中」に切り替え (取得の決着は待たない)。
+    // 録音時間の計測もここから始める。ここが「ユーザが喋ってよくなった時点」で、
+    // レンズから「接続中…」が消える時点でもある。ASR の RecognitionStarted 受信
+    // だけを起点にすると、その後の G2 マイク取得待ち (最大 MIC_OPEN_SETTLE_MS) の
+    // 間もカウントが進む一方、レンズにはまだ「接続中…」が出ているままになる。
     recordingReady = true
+    startRecordingClock()
     dumpMicHealth('recording-started')
     void refreshG2(true)
   })()
@@ -3725,7 +3794,8 @@ function moveRootCursor(delta: number): void {
 }
 
 /**
- * rootlist で長押しされた時: カーソル行のセッションの ★ を切り替える。
+ * OS 長押しメニューの「★ お気に入り切替」が選ばれた時: カーソル行のセッションの
+ * ★ を切り替える。
  *
  * プラグイン行 (└ …) にカーソルがある場合も、★ は親セッションに付く/外れる。
  * プラグインは親に従属した表示なので、単体で並び替えの対象にはしない。
@@ -3735,7 +3805,13 @@ function moveRootCursor(delta: number): void {
  * buildRootListView が新しいカーソル位置から引き直す。
  */
 function toggleFavoriteFromRoot(): void {
-  if (phase !== 'rootlist') return
+  // メニューは rootlist にしか出していないが、閉じ遅れ等で別画面に届いた時に
+  // 黙って何も起きないと壊れて見える。使える場所を必ず伝える。
+  if (phase !== 'rootlist') {
+    showG2Notice(t('g2NoticeFavoriteNA'))
+    void refreshG2(true)
+    return
+  }
   const row = currentRootRow()
   if (!row) return
   const name = row.session.tmuxSessionName
@@ -4789,7 +4865,7 @@ async function boot(): Promise<void> {
     // 取り込み (performTakeover) の直前に no-op へ差し替えるので、取り込みに失敗して
     // headlenss に戻る時に同じ内容を再登録できるよう、登録処理を関数で持っておく。
     const installHandlers = (): void => setEventHandlers({
-      // rootlist: 上下=カーソル / click=open / 長押し=★トグル / dbl=OS終了
+      // rootlist: 上下=カーソル / click=open / 長押しメニュー=★切替 / dbl=OS終了
       // pending:  上=送信 / 下=テキスト削除 / dbl=破棄して idle へ
       // idle:     上=過去ログ / 下=新しい方へ / dbl=root へ戻る
       // cc-message:  上下=本文スクロール / click=選択肢画面へ / dbl=キャンセルして idle へ
@@ -4819,12 +4895,14 @@ async function boot(): Promise<void> {
         if (respondInputBlocked()) return  // 応答 POST 中はタップも無視
         void toggleRecording()
       },
-      // 長押し: rootlist でのお気に入り (★) トグル。
-      // 他の phase では何もしない (誤爆で状態が変わらないようにする)。
-      onLongPress: () => {
+      // OS 長押しメニューの独自項目。今のところ rootlist のお気に入り (★) 切替だけ。
+      // メニューは rootlist にしか出していないが、閉じ遅れなどで別 phase に届いても
+      // 何も起きないよう、実行側 (toggleFavoriteFromRoot) でも phase を見ている。
+      onMenuItem: (itemID) => {
+        clearG2Notice()  // 一時通知は次の操作で消す
         if (respondInputBlocked()) return
-        if (phase !== 'rootlist') return
-        toggleFavoriteFromRoot()
+        if (itemID === LENS_MENU_ID_TOGGLE_FAVORITE) toggleFavoriteFromRoot()
+        else log(`未知のメニュー項目: itemID=${itemID}`)
       },
       // 二重クリック: 各 phase での「戻る/キャンセル」操作
       onDoubleClick: () => {

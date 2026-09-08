@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """E2E: お気に入りセッション (★) の検証。
 
-公式シミュレータ (evenhub-simulator / xvfb) で、レンズへ実際に送られた本文を見て
-以下を確かめる:
+実機では長押しは OS の長押しメニューを開く操作なので、お気に入りの切替は
+アプリ独自の長押しではなく **OS 長押しメニューの独自項目** に載せている。
+このスクリプトはその経路を検証する。
+
+公式シミュレータ (evenhub-simulator / xvfb) で、レンズへ実際に送られた本文と
+登録されたメニューを見て以下を確かめる:
 
   1. ★ が 1 つも無い間は星の列を作らない (名前の開始位置が今までどおり)
-  2. セッション行を長押し → ★ が付き、一覧の先頭へ移動する
-  3. 並べ替えてもカーソルは同じ行に付いていく (飛ばない)
-  4. もう一度長押し → ★ が外れ、元の位置に戻る
-  5. プラグイン行 (└ …) にカーソルがある状態で長押し → 親セッションに作用する
+  2. セッション一覧では独自メニュー項目「★ お気に入り切替」が登録される
+  3. メニュー項目を選ぶ → ★ が付き、一覧の先頭へ移動する。カーソルは飛ばない
+  4. もう一度選ぶ → ★ が外れ、元の位置に戻る
+  5. プラグイン行 (└ …) にカーソルがある状態で選ぶ → 親セッションに作用する
      (プラグイン行は親の直下に従属したまま一緒に上がる)
-  6. 長押しの直後に来るタップは無視される (★ を付けた勢いでセッションが開かない)
-  7. 再起動しても ★ が残る。**WebView の localStorage を消してから** リロードするので、
+  6. 素の長押し (LONG_PRESS_EVENT) ではお気に入りが動かない
+     = OS メニューと二重に作用しない
+  7. メニュー操作に巻き込まれたタップは無視される (勢いでセッションが開かない)
+  8. セッションを開くとメニューは外れ、OS デフォルトに戻る。一覧へ戻ると再び付く
+  9. 再起動しても ★ が残る。**WebView の localStorage を消してから** リロードするので、
      復元できたならブリッジ側 KVS に保存できていた証拠になる (本番と同じ条件)
 
-長押しはシミュレータの automation API (`/api/input`) では送れない (up/down/click/
-double_click の 4 つだけ) ため、dev server 限定のイベント注入口 (src/e2e-input.ts) を
-使う。アプリがこのスタブサーバの `/e2e/input` を取りに来るので、そこへ注入したい
-イベントを積む。出荷ビルドにはこの経路は入らない (import.meta.env.DEV で消える)。
+長押しも menuItemClickEvent もシミュレータの automation API (`/api/input`) では
+送れない (up/down/click/double_click の 4 つだけ) ため、dev server 限定のイベント
+注入口 (src/e2e-input.ts) を使う。アプリがこのスタブサーバの `/e2e/input` を
+取りに来るので、そこへ注入したいイベントを積む。出荷ビルドにはこの経路は入らない
+(import.meta.env.DEV で消える)。
 
 本番サーバ (3000) も dev server (5177) もプロキシ (6177) も使わない。
 このスクリプトが自前のスタブ API サーバを空きポートに立てる。tmux にも触らない。
@@ -27,7 +35,9 @@ double_click の 4 つだけ) ため、dev server 限定のイベント注入口
 """
 
 import json
+import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -52,6 +62,8 @@ PLUGIN_NAME = "devsite"
 
 STAR = "★"        # ★
 STAR_PAD = "　"    # 全角スペース (★ と同じ 20px)
+MENU_ITEM = "★ お気に入り切替"   # i18n ja の menuToggleFavorite
+MENU_ID = 1                       # LENS_MENU_ID_TOGGLE_FAVORITE
 
 results: list[tuple[bool, str, str]] = []
 
@@ -196,6 +208,8 @@ def wait_console(substr: str, timeout_s: float = 30) -> bool:
 CONTENT_RE = re.compile(r"\[refreshG2\] content=(\".*?\") footer=(\".*?\")$")
 # フッタの位置カウンタ「(3/4)」。一時通知が出ている間は現れない。
 COUNTER_RE = re.compile(r"\((\d+)/(\d+)\)$")
+# create/rebuild のたびに renderer が出す「今このページに載せたメニュー」。
+MENU_RE = re.compile(r"\[renderer\] menu=(\[.*\])$")
 
 
 class LensTail:
@@ -203,6 +217,8 @@ class LensTail:
         self.last_id = -1
         self.content = ""
         self.footer = ""
+        self.menu: list[str] = []
+        self.menu_log: list[list[str]] = []
         self.count = 0
         self.stop = threading.Event()
         self.th = threading.Thread(target=self._run, daemon=True)
@@ -222,12 +238,20 @@ class LensTail:
                 if eid <= self.last_id:
                     continue
                 self.last_id = eid
-                m = CONTENT_RE.search(str(e.get("message", "")))
+                msg = str(e.get("message", ""))
+                m = CONTENT_RE.search(msg)
                 if m:
                     try:
                         self.content = json.loads(m.group(1))
                         self.footer = json.loads(m.group(2))
                         self.count += 1
+                    except Exception:
+                        pass
+                m = MENU_RE.search(msg)
+                if m:
+                    try:
+                        self.menu = json.loads(m.group(1))
+                        self.menu_log.append(self.menu)
                     except Exception:
                         pass
             time.sleep(0.08)
@@ -262,11 +286,24 @@ def send_input(action: str) -> None:
 
 
 def long_press() -> None:
-    """長押し (押し始め + 離す) を注入する。実機と同じ 2 イベント順で送る。"""
+    """素の長押し (押し始め + 離す) を注入する。実機と同じ 2 イベント順で送る。
+    実機ではこのジェスチャーで OS の長押しメニューが開く。アプリ側はこれ自体には
+    何も割り当てていないことを確かめるために使う。"""
     stub.push("long_press")
-    time.sleep(0.45)
+    time.sleep(0.5)
     stub.push("long_press_release")
-    time.sleep(0.45)
+    time.sleep(0.5)
+
+
+def menu_click(item_id: int = MENU_ID) -> None:
+    """OS 長押しメニューで独自項目が選ばれた (menuItemClickEvent) を注入する。
+    実機の流れに合わせ、長押しでメニューを開いてから項目を選ぶ順で送る。"""
+    stub.push("long_press")
+    time.sleep(0.4)
+    stub.push("long_press_release")
+    time.sleep(0.4)
+    stub.push(f"menu:{item_id}")
+    time.sleep(0.5)
 
 
 def show(lines: list[str]) -> str:
@@ -285,6 +322,11 @@ def main() -> int:
     httpd = ThreadingHTTPServer(("127.0.0.1", STUB_PORT), Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
+        # 前回の残骸が同じポートで生きていると、そちらに繋がったまま「起動した」と
+        # 誤認して検証にならない。空いていることを先に確かめる。
+        for port, label in ((APP_PORT, "dev server"), (AUTOMATION_PORT, "simulator")):
+            if port_open(port):
+                raise RuntimeError(f"port {port} が既に使われています ({label} の残骸?)。先に落としてください")
         print(f"スタブ API サーバ: http://127.0.0.1:{STUB_PORT}")
 
         print("headlenss アプリの dev server を起動中...")
@@ -324,51 +366,68 @@ def main() -> int:
               got_initial == sorted(got_initial) and -1 not in got_initial,
               f"{expect_initial} -> {got_initial}: {show(lines)}")
 
-        # ─── 2. セッション行を長押し → ★ が付いて先頭へ ─────────────
-        print("\n[セッション行の長押し]")
+        # ─── 2. 一覧では独自メニュー項目が登録される ────────────────
+        check("2. セッション一覧に独自メニュー項目が登録される", lens.menu == [MENU_ITEM],
+              f"menu={lens.menu}")
+
+        # ─── 3. メニューから ★ を付ける → 先頭へ ────────────────────
+        print("\n[メニューから ★ を付ける]")
         # カーソルは alpha (seed の session)。charlie (行 index 3) まで下げる
         for _ in range(3):
             send_input("down")
         lines, footer = lens.settle(1.2)
-        check("2. 前提: カーソルが charlie の行にある", footer.endswith("(4/4)"),
+        check("3. 前提: カーソルが charlie の行にある", footer.endswith("(4/4)"),
               f"footer={footer!r} {show(lines)}")
 
+        # 素の長押しだけでは何も起きない (OS メニューと二重に作用しない)
         long_press()
-        lines, footer = lens.settle(1.2)
-        print(f"    長押し後: {show(lines)}  footer={footer!r}")
-        check("2. 長押しした手応えをフッタに出す", "★" in footer and SESSIONS[2] in footer,
+        lines_lp, footer_lp = lens.settle(1.2)
+        check("6. 素の長押しだけでは ★ が動かない (OS メニューと二重作用しない)",
+              all(STAR not in ln for ln in lines_lp) and "favorite " not in console_text(),
+              f"{show(lines_lp)}")
+        # 「届いていないから動かない」ではなく「届いた上で何もしていない」ことの確認。
+        # 振り分けから漏れていれば events.ts が UNHANDLED を吐く。
+        # = menuObject を登録した状態でも素の長押しはアプリまで来る → 独自動作を
+        #   割り当てれば OS メニューと必ず二重に作用する、の根拠。
+        check("6. 長押しイベント自体はアプリに届いている (取りこぼしではない)",
+              "UNHANDLED" not in console_text(),
+              [ln for ln in console_text().split("\n") if "UNHANDLED" in ln][:2])
+
+        stub.push(f"menu:{MENU_ID}")
+        lines, footer = lens.settle(1.5)
+        print(f"    メニュー選択後: {show(lines)}  footer={footer!r}")
+        check("3. 何が起きたかをフッタに出す", "★" in footer and SESSIONS[2] in footer,
               f"footer={footer!r}")
-        check("2. charlie に ★ が付く", any(STAR in ln and SESSIONS[2] in ln for ln in lines), show(lines))
-        check("2. ★ 付きが一覧の先頭に来る", row_index(lines, SESSIONS[2]) == 0, show(lines))
-        check("2. ★ は行の冒頭 (カーソル記号の直後)",
+        check("3. charlie に ★ が付く", any(STAR in ln and SESSIONS[2] in ln for ln in lines), show(lines))
+        check("3. ★ 付きが一覧の先頭に来る", row_index(lines, SESSIONS[2]) == 0, show(lines))
+        check("3. ★ は行の冒頭 (カーソル記号の直後)",
               any(re.match(rf"^(▶ |  ){STAR}{SESSIONS[2]} ", ln) for ln in lines), show(lines))
-        check("2. ★ 無しの行は全角スペースで桁を揃える",
+        check("3. ★ 無しの行は全角スペースで桁を揃える",
               all(re.match(rf"^(▶ |  )[{STAR}{STAR_PAD}]", ln) for ln in lines), show(lines))
-        check("2. ★ 以外の並びは崩れない (alpha, bravo, └devsite の順)",
+        check("3. ★ 以外の並びは崩れない (alpha, bravo, └devsite の順)",
               [row_index(lines, n) for n in [SESSIONS[0], SESSIONS[1], PLUGIN_NAME]] == [1, 2, 3],
               show(lines))
+        check("3. ★ の付け外しではページを組み直さない (メニューは変わらないので差分更新のまま)",
+              lens.menu == [MENU_ITEM], f"menu={lens.menu}")
 
         lines, footer = lens.wait_counter()
         check("3. カーソルは同じ行に付いていく (飛ばない)", footer.endswith("(1/4)"),
               f"footer={footer!r} {show(lines)}")
 
-        # ─── 4 + 6. もう一度長押し → 解除。押している間のタップは無視される ───
-        print("\n[再長押しで解除 / 長押し中のタップ抑制]")
-        stub.push("long_press")          # 押し始め (ここで ★ が外れる)
-        time.sleep(0.8)
-        api("/api/input", {"action": "click"})   # 押しっぱなしの最中に来たタップ
-        time.sleep(0.8)
-        stub.push("long_press_release")  # 離す (ここでは何もしない)
-        lines, footer = lens.settle(1.2)
+        # ─── 4 + 7. もう一度選んで解除。メニュー操作直後のタップは無視 ───
+        print("\n[メニューから ★ を外す / 直後のタップ抑制]")
+        menu_click()
+        api("/api/input", {"action": "click"})   # メニューを閉じた勢いのタップ
+        lines, footer = lens.settle(1.5)
         print(f"    解除後: {show(lines)}  footer={footer!r}")
         check("4. 解除もフッタで知らせる", "★" in footer and SESSIONS[2] in footer, f"footer={footer!r}")
         check("4. ★ が消える", all(STAR not in ln for ln in lines), show(lines))
         check("4. 星の列ごと畳まれる", all(STAR_PAD not in ln for ln in lines), show(lines))
         check("4. 元の並びに戻る",
               [row_index(lines, n) for n in expect_initial] == [0, 1, 2, 3], show(lines))
-        check("6. 長押し中のタップでセッションが開かない (rootlist のまま)",
+        check("7. メニュー操作直後のタップでセッションが開かない (rootlist のまま)",
               "phase=idle" not in console_text(), "click が通ってセッションが開いてしまった")
-        check("6. 1 回の長押しで 1 回だけトグルされる (離した時に二重発火しない)",
+        check("4. 1 回のメニュー選択で 1 回だけトグルされる",
               console_text().count("favorite off: charlie") == 1,
               f'favorite off の回数={console_text().count("favorite off: charlie")}')
 
@@ -376,8 +435,8 @@ def main() -> int:
         check("4. カーソルは charlie に付いたまま", footer.endswith("(4/4)"),
               f"footer={footer!r} {show(lines)}")
 
-        # ─── 5. プラグイン行の長押し → 親セッションに作用 ─────────────
-        print("\n[プラグイン行の長押し]")
+        # ─── 5. プラグイン行にカーソル → 親セッションに作用 ─────────────
+        print("\n[プラグイン行でメニューを使う]")
         # charlie(4/4) から 1 つ上げて プラグイン行 devsite(3/4) へ
         send_input("up")
         lines, footer = lens.settle(1.2)
@@ -386,9 +445,9 @@ def main() -> int:
               footer.endswith("(3/4)") and bool(plugin_rows) and "▶" in plugin_rows[0],
               f"footer={footer!r} {show(lines)}")
 
-        long_press()
-        lines, footer = lens.settle(1.2)
-        print(f"    長押し後: {show(lines)}  footer={footer!r}")
+        menu_click()
+        lines, footer = lens.settle(1.5)
+        print(f"    メニュー選択後: {show(lines)}  footer={footer!r}")
         check("5. 親セッション bravo に対して働く (通知も親の名前)",
               "★" in footer and SESSIONS[1] in footer, f"footer={footer!r}")
         check("5. 親セッション bravo に ★ が付く",
@@ -401,6 +460,29 @@ def main() -> int:
         lines, footer = lens.wait_counter()
         check("5. カーソルはプラグイン行に付いていく", footer.endswith("(2/4)"),
               f"footer={footer!r} {show(lines)}")
+
+        # ─── 8. 他画面では独自メニューを外し、OS デフォルトに戻す ──────
+        print("\n[一覧を出るとメニューが外れる]")
+        send_input("up")   # プラグイン行(2/4) -> bravo(1/4)
+        lens.settle(1.0)
+        send_input("click")   # セッションを開く -> phase=idle
+        opened = wait_console("phase=idle", 20)
+        check("8. 前提: セッションを開けた (chat 画面)", opened)
+        lens.settle(2.0)
+        check("8. 一覧以外では独自メニューを外す (OS デフォルトに戻す)", lens.menu == [],
+              f"menu={lens.menu}")
+        # 閉じ遅れ等で一覧以外にメニュー項目が届いた時、黙って無視せず案内を出す
+        stub.push(f"menu:{MENU_ID}")
+        time.sleep(1.5)
+        lines, footer = lens.settle(1.0)
+        check("8. 一覧以外でメニュー項目が届いた時の案内が出る",
+              "セッション一覧" in footer, f"footer={footer!r}")
+
+        send_input("double_click")   # idle -> rootlist へ戻る
+        back = wait_console("phase=rootlist, force=true", 20)
+        lens.settle(2.0)
+        check("8. 一覧へ戻るとメニューが再登録される", lens.menu == [MENU_ITEM],
+              f"back={back} menu={lens.menu}")
 
         # ─── 7. 再起動 (localStorage を消してリロード) しても残る ─────
         print("\n[再起動後の復元 (WebView localStorage を消してから)]")
@@ -445,15 +527,22 @@ def main() -> int:
         except Exception:
             pass
         httpd.shutdown()
+        httpd.server_close()
+        # npm run dev も xvfb-run も「自分の子」として本体を起こすので、親だけ
+        # terminate すると vite / simulator が生き残る。残ると次回の実行がその
+        # 残骸に繋がって検証にならないため、プロセスグループごと落とす
+        # (Popen は start_new_session=True で起動している)。
         for p in procs:
-            try:
-                p.terminate()
-                p.wait(timeout=5)
-            except Exception:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
                 try:
-                    p.kill()
+                    os.killpg(os.getpgid(p.pid), sig)
                 except Exception:
                     pass
+                try:
+                    p.wait(timeout=5)
+                    break
+                except Exception:
+                    continue
 
     ng = [r for r in results if not r[0]]
     print(f"\n=== {len(results) - len(ng)}/{len(results)} OK ===")

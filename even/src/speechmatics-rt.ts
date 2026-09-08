@@ -20,6 +20,23 @@
 import type { OperatingPoint } from './settings'
 
 const JWT_ENDPOINT = 'https://mp.speechmatics.com/v1/api_keys?type=rt'
+
+/**
+ * E2E 検証用の接続先差し替え (dev server 限定)。
+ *
+ * 録音まわりの検証 (「接続中…」の間はタイマーを進めない、等) を自動化するには
+ * Speechmatics の応答タイミングを外から操れる必要がある。本物のサービスに繋いで
+ * 検証すると再現性が無く課金も走るので、dev 実行時だけスタブへ向けられるようにする。
+ *
+ * 本番ビルドでは import.meta.env.DEV が false に畳まれ、この関数の中身ごと
+ * dead code elimination で消える (dist に接続先の分岐は 1 行も残らない)。
+ */
+type AsrEndpointOverride = { jwt?: string; wsBase?: string }
+function asrOverride(): AsrEndpointOverride | null {
+  if (!import.meta.env.DEV) return null
+  return (window as unknown as { __headlenssAsrOverride?: AsrEndpointOverride })
+    .__headlenssAsrOverride ?? null
+}
 const JWT_TTL_SEC = 60
 const STOP_TIMEOUT_MS = 8000
 /** JWT 発行の締切。ここを過ぎたら接続そのものを諦める。 */
@@ -58,7 +75,7 @@ type ServerMessage =
   | { message: 'Error'; type?: string; reason?: string }
 
 async function fetchJwt(apiKey: string, signal?: AbortSignal): Promise<string> {
-  const res = await fetch(JWT_ENDPOINT, {
+  const res = await fetch(asrOverride()?.jwt ?? JWT_ENDPOINT, {
     signal,
     method: 'POST',
     headers: {
@@ -127,7 +144,8 @@ export class SpeechmaticsRT {
       throw new Error('aborted before WebSocket open')
     }
     const region: RTRegion = opts.region ?? 'eu'
-    const url = `wss://${region}.rt.speechmatics.com/v2?jwt=${encodeURIComponent(jwt)}`
+    const wsBase = asrOverride()?.wsBase ?? `wss://${region}.rt.speechmatics.com/v2`
+    const url = `${wsBase}?jwt=${encodeURIComponent(jwt)}`
 
     return new Promise<void>((resolve, reject) => {
       if (this.aborted) {

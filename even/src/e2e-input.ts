@@ -1,13 +1,14 @@
-import { List_ItemEvent, OsEventTypeList, type EvenHubEvent } from '@evenrealities/even_hub_sdk'
+import { List_ItemEvent, MenuItemClickEvent, OsEventTypeList, type EvenHubEvent } from '@evenrealities/even_hub_sdk'
 
 /**
  * E2E 検証専用のイベント注入口。**出荷ビルドには一切入らない。**
  *
  * なぜ要るか: 公式シミュレータの automation API (`POST /api/input`) が送れるのは
- * up / down / click / double_click の 4 つだけで、長押し (LONG_PRESS_EVENT) を
- * 発火できない。長押しの検証を諦めるとお気に入り機能の入口がまるごと未検証になるので、
- * 検証スクリプトが立てたスタブサーバから「注入したいイベント」を受け取り、
- * 実機と同じ経路 (events.ts の onEvenHubEvent) に流し込む。
+ * up / down / click / double_click の 4 つだけで、長押し (LONG_PRESS_EVENT) も
+ * OS 長押しメニューの項目選択 (menuItemClickEvent) も発火できない。これらの検証を
+ * 諦めるとお気に入り機能の入口がまるごと未検証になるので、検証スクリプトが立てた
+ * スタブサーバから「注入したいイベント」を受け取り、実機と同じ経路
+ * (events.ts の onEvenHubEvent) に流し込む。
  *
  * 出荷物に混ざらない根拠:
  *   - 呼び出し側 (main.ts) が `import.meta.env.DEV` で括っている。本番ビルドでは
@@ -18,8 +19,11 @@ import { List_ItemEvent, OsEventTypeList, type EvenHubEvent } from '@evenrealiti
 /** ポーリング間隔。検証スクリプトの待ち時間に直結するので短めにする。 */
 const POLL_MS = 150
 
-/** スタブサーバが返すアクション名。 */
-type E2EAction = 'long_press' | 'long_press_release' | 'reload' | 'wipe_local_reload'
+/**
+ * スタブサーバが返すアクション名。
+ * `menu:<itemID>` は OS 長押しメニューでその項目が選ばれたことを表す。
+ */
+type E2EAction = 'long_press' | 'long_press_release' | 'reload' | 'wipe_local_reload' | `menu:${number}`
 
 /** ★ の保存キー。wipe_local_reload で「本番の WebView localStorage が消えた状態」を作る。 */
 const FAVORITES_KEY = 'headlenss_favorites_v1'
@@ -32,8 +36,12 @@ function eventFor(action: E2EAction): EvenHubEvent | null {
       return { listEvent: new List_ItemEvent({ eventType: OsEventTypeList.LONG_PRESS_EVENT }) }
     case 'long_press_release':
       return { listEvent: new List_ItemEvent({ eventType: OsEventTypeList.LONG_PRESS_RELEASE_EVENT }) }
-    default:
+    default: {
+      // menuItemClickEvent は eventType を持たない独立したトップレベルイベント。
+      const m = /^menu:(\d+)$/.exec(action)
+      if (m) return { menuItemClickEvent: new MenuItemClickEvent({ itemID: Number(m[1]) }) }
       return null
+    }
   }
 }
 
@@ -44,6 +52,15 @@ function eventFor(action: E2EAction): EvenHubEvent | null {
  */
 export function startE2EInputBridge(base: string, inject: (event: EvenHubEvent) => void): void {
   if (!base) return
+  // 音声認識の接続先も検証スタブへ向ける。録音まわり (「接続中…」の間はタイマーを
+  // 進めない等) は Speechmatics の応答タイミングを外から操れないと検証できない。
+  // speechmatics-rt.ts 側は import.meta.env.DEV で括ってこの値を読むので、
+  // 本番ビルドでは差し替えの分岐ごと消える。
+  ;(window as unknown as { __headlenssAsrOverride?: { jwt: string; wsBase: string } })
+    .__headlenssAsrOverride = {
+      jwt: `${base}/e2e/asr/jwt`,
+      wsBase: `${base.replace(/^http/, 'ws')}/e2e/asr/ws`,
+    }
   console.log(`[e2e] input bridge on ${base}/e2e/input`)
   setInterval(() => {
     void (async () => {
