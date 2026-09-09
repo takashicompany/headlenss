@@ -8,17 +8,20 @@
 公式シミュレータ (evenhub-simulator / xvfb) で、レンズへ実際に送られた本文と
 登録されたメニューを見て以下を確かめる:
 
-  1. ★ が 1 つも無い間は星の列を作らない (名前の開始位置が今までどおり)
+  1. ★ の無い行には詰め物を一切入れない (カーソルとセッション名の間に空白が無い)
   2. セッション一覧では独自メニュー項目「★ お気に入り切替」が登録される
-  3. メニュー項目を選ぶ → ★ が付き、一覧の先頭へ移動する。カーソルは飛ばない
+  3. メニュー項目を選ぶ → ★ がカーソルの直後に詰めて付き、一覧の先頭へ移動する。
+     カーソルは飛ばない
   4. もう一度選ぶ → ★ が外れ、元の位置に戻る
   5. プラグイン行 (└ …) にカーソルがある状態で選ぶ → 親セッションに作用する
      (プラグイン行は親の直下に従属したまま一緒に上がる)
   6. 素の長押し (LONG_PRESS_EVENT) ではお気に入りが動かない
      = OS メニューと二重に作用しない
   7. メニュー操作に巻き込まれたタップは無視される (勢いでセッションが開かない)
-  8. セッションを開くとメニューは外れ、OS デフォルトに戻る。一覧へ戻ると再び付く
-  9. 再起動しても ★ が残る。**WebView の localStorage を消してから** リロードするので、
+  8. セッションを開いた画面でも同じメニューで切り替えられる (作用先は開いている
+     セッション)。一覧⇄セッションの遷移ではページを組み直さない
+  9. ★ 付きセッションを開くとヘッダが「★セッション名」になり、外すと消える
+ 10. 再起動しても ★ が残る。**WebView の localStorage を消してから** リロードするので、
      復元できたならブリッジ側 KVS に保存できていた証拠になる (本番と同じ条件)
 
 長押しも menuItemClickEvent もシミュレータの automation API (`/api/input`) では
@@ -205,6 +208,7 @@ def wait_console(substr: str, timeout_s: float = 30) -> bool:
 # ─── レンズ本文の追跡 ───────────────────────────────────────────────
 # devMode の `[refreshG2] content="..." footer="..."` を id で追い、最新の 1 枚を保つ。
 
+HEADER_RE = re.compile(r'\[refreshG2\] firing \(phase=[\w-]+, force=\w+\) header="(.*)"$')
 CONTENT_RE = re.compile(r"\[refreshG2\] content=(\".*?\") footer=(\".*?\")$")
 # フッタの位置カウンタ「(3/4)」。一時通知が出ている間は現れない。
 COUNTER_RE = re.compile(r"\((\d+)/(\d+)\)$")
@@ -217,6 +221,8 @@ class LensTail:
         self.last_id = -1
         self.content = ""
         self.footer = ""
+        self.header = ""
+        self._pending_header: str | None = None
         self.menu: list[str] = []
         self.menu_log: list[list[str]] = []
         self.count = 0
@@ -239,8 +245,15 @@ class LensTail:
                     continue
                 self.last_id = eid
                 msg = str(e.get("message", ""))
+                m = HEADER_RE.search(msg)
+                if m:
+                    self._pending_header = m.group(1)
+                    continue
                 m = CONTENT_RE.search(msg)
                 if m:
+                    if self._pending_header is not None:
+                        self.header = self._pending_header
+                        self._pending_header = None
                     try:
                         self.content = json.loads(m.group(1))
                         self.footer = json.loads(m.group(2))
@@ -357,9 +370,11 @@ def main() -> int:
         lines, footer = lens.settle(2.5)
         print(f"    初期表示: {show(lines)}  footer={footer!r}")
 
-        # ─── 1. ★ が無い間は星の列を作らない ───────────────────────
-        check("1. ★ 未使用時は星の列を作らない (行頭がカーソルの直後から)",
+        # ─── 1. ★ 無しの行に余白を入れない ─────────────────────────
+        check("1. ★ 未使用時は星も詰め物も入らない",
               all(STAR not in ln and STAR_PAD not in ln for ln in lines), show(lines))
+        check("1. カーソルとセッション名の間に余分な空白が無い",
+              any(ln.startswith(f"▶ {SESSIONS[0]}") for ln in lines), show(lines))
         expect_initial = [SESSIONS[0], SESSIONS[1], PLUGIN_NAME, SESSIONS[2]]
         got_initial = [row_index(lines, n) for n in expect_initial]
         check("1. 初期の並びは サーバ順 + プラグインが親の直下",
@@ -400,10 +415,11 @@ def main() -> int:
               f"footer={footer!r}")
         check("3. charlie に ★ が付く", any(STAR in ln and SESSIONS[2] in ln for ln in lines), show(lines))
         check("3. ★ 付きが一覧の先頭に来る", row_index(lines, SESSIONS[2]) == 0, show(lines))
-        check("3. ★ は行の冒頭 (カーソル記号の直後)",
-              any(re.match(rf"^(▶ |  ){STAR}{SESSIONS[2]} ", ln) for ln in lines), show(lines))
-        check("3. ★ 無しの行は全角スペースで桁を揃える",
-              all(re.match(rf"^(▶ |  )[{STAR}{STAR_PAD}]", ln) for ln in lines), show(lines))
+        check("3. ★ はカーソル記号の直後に詰めて置く (★ と名前の間も空けない)",
+              any(ln.startswith(f"▶ {STAR}{SESSIONS[2]} ") for ln in lines), show(lines))
+        check("3. ★ 無しの行には詰め物を入れない (機能導入前と同じ見た目)",
+              all(STAR_PAD not in ln for ln in lines)
+              and any(ln.startswith(f"  {SESSIONS[0]} ") for ln in lines), show(lines))
         check("3. ★ 以外の並びは崩れない (alpha, bravo, └devsite の順)",
               [row_index(lines, n) for n in [SESSIONS[0], SESSIONS[1], PLUGIN_NAME]] == [1, 2, 3],
               show(lines))
@@ -422,7 +438,7 @@ def main() -> int:
         print(f"    解除後: {show(lines)}  footer={footer!r}")
         check("4. 解除もフッタで知らせる", "★" in footer and SESSIONS[2] in footer, f"footer={footer!r}")
         check("4. ★ が消える", all(STAR not in ln for ln in lines), show(lines))
-        check("4. 星の列ごと畳まれる", all(STAR_PAD not in ln for ln in lines), show(lines))
+        check("4. 解除後も詰め物は残らない", all(STAR_PAD not in ln for ln in lines), show(lines))
         check("4. 元の並びに戻る",
               [row_index(lines, n) for n in expect_initial] == [0, 1, 2, 3], show(lines))
         check("7. メニュー操作直後のタップでセッションが開かない (rootlist のまま)",
@@ -461,28 +477,49 @@ def main() -> int:
         check("5. カーソルはプラグイン行に付いていく", footer.endswith("(2/4)"),
               f"footer={footer!r} {show(lines)}")
 
-        # ─── 8. 他画面では独自メニューを外し、OS デフォルトに戻す ──────
-        print("\n[一覧を出るとメニューが外れる]")
+        # ─── 8. セッションを開いた画面でも同じメニューで切り替えられる ──
+        print("\n[セッションを開いた画面でのお気に入り]")
         send_input("up")   # プラグイン行(2/4) -> bravo(1/4)
         lens.settle(1.0)
+        rebuilds_before = len(lens.menu_log)
         send_input("click")   # セッションを開く -> phase=idle
         opened = wait_console("phase=idle", 20)
         check("8. 前提: セッションを開けた (chat 画面)", opened)
         lens.settle(2.0)
-        check("8. 一覧以外では独自メニューを外す (OS デフォルトに戻す)", lens.menu == [],
-              f"menu={lens.menu}")
-        # 閉じ遅れ等で一覧以外にメニュー項目が届いた時、黙って無視せず案内を出す
-        stub.push(f"menu:{MENU_ID}")
-        time.sleep(1.5)
-        lines, footer = lens.settle(1.0)
-        check("8. 一覧以外でメニュー項目が届いた時の案内が出る",
-              "セッション一覧" in footer, f"footer={footer!r}")
+        check("8. セッションを開いた画面にも独自メニューが載っている",
+              lens.menu == [MENU_ITEM], f"menu={lens.menu}")
+        check("8. 一覧⇄セッションの遷移でページを組み直さない (差分更新のまま)",
+              len(lens.menu_log) == rebuilds_before,
+              f"menu 付きの再構築が {len(lens.menu_log) - rebuilds_before} 回増えた")
+
+        # ヘッダにも ★ が出る (bravo は ★ 付きのまま開いた)
+        check("9. ★ 付きセッションを開くとヘッダに ★ が出る",
+              lens.header == f"{STAR}{SESSIONS[1]}", f"header={lens.header!r}")
+
+        # 開いたまま解除 → ヘッダから ★ が消える
+        menu_click()
+        lines, footer = lens.settle(1.5)
+        print(f"    解除後: header={lens.header!r} footer={footer!r}")
+        check("8. 開いている画面でも ★ を外せる (作用先は開いているセッション)",
+              "★" in footer and SESSIONS[1] in footer, f"footer={footer!r}")
+        check("9. 外すとヘッダの ★ も消える",
+              lens.header == SESSIONS[1], f"header={lens.header!r}")
+
+        # もう一度付け直す (この後の再起動テストで ★ が残っていることを見るため)
+        menu_click()
+        lens.settle(1.5)
+        print(f"    再付与後: header={lens.header!r}")
+        check("8. 開いている画面で付け直せる",
+              lens.header == f"{STAR}{SESSIONS[1]}", f"header={lens.header!r}")
 
         send_input("double_click")   # idle -> rootlist へ戻る
         back = wait_console("phase=rootlist, force=true", 20)
-        lens.settle(2.0)
-        check("8. 一覧へ戻るとメニューが再登録される", lens.menu == [MENU_ITEM],
+        lines, footer = lens.settle(2.0)
+        check("8. 一覧へ戻ってもメニューは載ったまま", lens.menu == [MENU_ITEM],
               f"back={back} menu={lens.menu}")
+        check("8. 開いている画面での操作が一覧にも反映されている",
+              row_index(lines, SESSIONS[1]) == 0
+              and any(STAR in ln and SESSIONS[1] in ln for ln in lines), show(lines))
 
         # ─── 7. 再起動 (localStorage を消してリロード) しても残る ─────
         print("\n[再起動後の復元 (WebView localStorage を消してから)]")

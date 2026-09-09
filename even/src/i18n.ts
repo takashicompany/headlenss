@@ -231,7 +231,9 @@ const STRINGS = {
   // お気に入り (★) の付け外し。長押しは押した手応えが無いので、何が起きたかを必ず出す。
   g2NoticeStarred:     { en: 'Starred: {name}',                      ja: '★ を付けました: {name}' },
   g2NoticeUnstarred:   { en: 'Unstarred: {name}',                    ja: '★ を外しました: {name}' },
-  g2NoticeFavoriteNA:  { en: 'Only in the session list',              ja: 'セッション一覧でのみ使えます' },
+  // ★ の切替が効く画面 (一覧 / セッションを開いている画面) の外でメニュー項目が
+  // 届いた時の案内。対象セッションが決まらないので何もできない、を伝える。
+  g2NoticeFavoriteNA:  { en: 'No session selected',                   ja: 'セッションが選ばれていません' },
 
   // ─── G2 OS 長押しメニューの独自項目 (32 UTF-8 バイト以内) ────────────
   // 「登録 / 解除」で出し分けないのは、menuObject が create/rebuild にしか載らず

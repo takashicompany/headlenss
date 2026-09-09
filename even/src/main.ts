@@ -347,39 +347,61 @@ function isUnread(s: ClaudeSessionInfo): boolean {
 // 起動時に loadFavorites で復元し、変更のたびに saveFavorites で書き戻す。
 let favoriteSessions = new Set<string>()
 
-/** レンズ一覧で ★ の先頭に出す印。'★' (U+2605) は G2 のフォントに実体があり、
- *  pretext の getTextWidth で 20px (全角 1 枠) と出る。欠字は 4px (notdef) になるので
- *  幅で見分けられる。'⚠'/'⏸' が 4px = 欠字だったのに対し ★/☆ は実グリフ。 */
+/** ★ の印。'★' (U+2605) は G2 のフォントに実体があり、pretext の getTextWidth で
+ *  20px (全角 1 枠) と出る。欠字は 4px (notdef) になるので幅で見分けられる。
+ *  '⚠'/'⏸' が 4px = 欠字だったのに対し ★/☆ は実グリフ。
+ *
+ *  ★ の無い行には詰め物を入れない (桁は揃えない)。揃えるために全角スペースを
+ *  置いていたが、実機では「カーソルとセッション名の間の謎の空白」にしか見えず、
+ *  ★ を 1 つも使っていない人にまで余白が出る。★ が付いた行だけが 1 枠ぶん
+ *  右へずれる形にして、★ 無しの行は機能導入前と 1px も変えない。 */
 const FAVORITE_MARK = '★'
-/** ★ が付いていない行で ★ 列を空けるための詰め物。全角スペース (U+3000) は
- *  ★ と同じ 20px なので、★ 有無で名前の開始位置がずれない。 */
-const FAVORITE_PAD = '\u3000'
+
+/** そのセッション名に ★ が付いているか。 */
+function isFavoriteName(name: string | undefined): boolean {
+  return Boolean(name) && favoriteSessions.has(name as string)
+}
 
 /** そのセッションに ★ が付いているか。 */
 function isFavoriteSession(s: ClaudeSessionInfo): boolean {
-  return favoriteSessions.has(s.tmuxSessionName)
+  return isFavoriteName(s.tmuxSessionName)
 }
 
 /** OS 長押しメニューに出す「お気に入り切替」の itemID。0 は予約済みなので 1 から。 */
 const LENS_MENU_ID_TOGGLE_FAVORITE = 1
 
 /**
+ * OS 長押しメニューの「★ お気に入り切替」が作用する対象のセッション名。
+ * null ならその画面ではメニュー項目を出さない (対象が無いので出しても押せない)。
+ *
+ *  - セッション一覧 (rootlist) … カーソル行のセッション。プラグイン行 (└ …) に
+ *    いる場合も親セッションを返す (プラグインは親に従属した表示なので)。
+ *  - セッションを開いている画面 … 今開いているセッション。
+ *  - 起動中 / 設定前 / エラー … 対象が無いので null。
+ */
+function favoriteTargetSession(): string | null {
+  if (phase === 'boot' || phase === 'unconfigured' || phase === 'error') return null
+  if (phase === 'rootlist') return currentRootRow()?.session.tmuxSessionName ?? null
+  return settings.sessionName || null
+}
+
+/**
  * 今の画面で OS の長押しメニューに載せる独自項目。null なら menuObject を付けず、
  * OS のデフォルトメニューをそのまま使う。
  *
- * セッション一覧 (rootlist) にだけ出す。他の画面に付けないのは、独自項目を載せた
- * 瞬間にその画面の OS デフォルトメニューを置き換えてしまうため。出す必要が無い
- * 画面では OS 標準のままにしておく。
+ * 対象セッションがある画面には一律で出す (一覧でもセッションを開いた後でも同じ
+ * 操作でお気に入りを切り替えられる)。付ける画面をこれ以上絞らないのは、
+ * menuObject が create/rebuild にしか載らないため: 画面ごとに出し分けると
+ * その境界を跨ぐたびにページ全体の再構築が要る。とくに録音の開始/停止は
+ * phase が短時間に何度も変わるので、そこに rebuild を挟むと表示が遅れる。
+ * 対象が無い画面 (起動中 / 設定前 / エラー) だけ外して OS 標準に戻す。
  *
- * 「登録 / 解除」でラベルを出し分けない理由: menuObject は create/rebuild にしか
- * 載らない (textContainerUpgrade では差し替えられない) ので、カーソル行ごとに文言を
- * 変えるとカーソルを 1 行動かすたびにページ全体の再構築が要る。一覧のスクロールは
- * この app が最も送信本数を切り詰めている経路なので、そこに毎回 rebuild を挟むのは
- * 割に合わない。項目は「切替」の 1 つに固定し、結果 (付いた/外れた) は実行後に
- * フッタの一時通知で必ず知らせる。
+ * 「登録 / 解除」でラベルを出し分けない理由も同じ。カーソル行ごとに文言を変えると
+ * 一覧でカーソルを 1 行動かすたびに再構築が要る。項目は「切替」の 1 つに固定し、
+ * 結果 (付いた/外れた) は実行後にフッタの一時通知で必ず知らせる。
  */
 function lensMenuItems(): LensMenuItem[] | null {
-  if (phase !== 'rootlist') return null
+  if (favoriteTargetSession() === null) return null
   return [{ itemID: LENS_MENU_ID_TOGGLE_FAVORITE, itemName: t('menuToggleFavorite') }]
 }
 
@@ -917,19 +939,17 @@ function buildRootListView(): string {
   // セッション数が ROOT_LIST_VISIBLE 以下、もしくは末尾近辺で start が範囲を超えそうな時のクリップ
   rootListStart = Math.max(0, Math.min(rootListStart, Math.max(0, total - ROOT_LIST_VISIBLE)))
 
-  // ★ 列は「★ が 1 つでも付いている時」だけ確保する。★ は全角 1 枠 (20px) なので、
-  // 誰も使っていないうちから常時空けておくと、名前とプレビューをそのぶん押し出す。
-  const starColumn = favoriteSessions.size > 0
-  const starCell = (on: boolean): string => (starColumn ? (on ? FAVORITE_MARK : FAVORITE_PAD) : '')
-
+  // ★ は付いている行にだけ置き、付いていない行には何も入れない (桁は揃えない)。
+  // 揃えるために全角スペースを置くと、カーソルとセッション名の間に意味の無い
+  // 空白が居座って読みづらい。★ 無しの行は機能導入前とまったく同じ見た目にする。
   const lines: string[] = []
   for (let i = rootListStart; i < Math.min(rootListStart + ROOT_LIST_VISIBLE, total); i++) {
     const row = items[i]
     const cursor = i === rootCursor ? '▶ ' : '  '
     if (row.kind === 'plugin') {
       // セッション行の下にぶら下げる。字下げで従属関係を示す。
-      // ★ は親セッションに付くものなので、プラグイン行は詰め物だけ置いて桁を揃える。
-      lines.push(`${cursor}${starCell(false)}  └ ${row.plugin.name}`)
+      // ★ は親セッション行にだけ出す (プラグイン単体はお気に入りの対象ではない)。
+      lines.push(`${cursor}  └ ${row.plugin.name}`)
       continue
     }
     const s = row.session
@@ -937,7 +957,8 @@ function buildRootListView(): string {
     const agent = s.source === 'codex' ? 'Codex' : s.source === 'claude' ? 'Claude' : 'Agent'
     // 既読セッションは空白で揃え、未読は '*' でマーク
     const unread = isUnread(s) ? '*' : ' '
-    const prefix = `${cursor}${starCell(isFavoriteSession(s))}${s.tmuxSessionName} [${agent}] ${unread}${mark}`
+    const star = isFavoriteSession(s) ? FAVORITE_MARK : ''
+    const prefix = `${cursor}${star}${s.tmuxSessionName} [${agent}] ${unread}${mark}`
     lines.push(appendRootPreview(prefix, s.lastChat))
   }
   return lines.join('\n')
@@ -1829,23 +1850,29 @@ function buildG2Header(): string {
     }
     case 'error':        return t('g2HeadError')
     case 'idle': {
+      // お気に入りなら名前の前に ★ を出す。一覧と同じ印なので、開いたまま
+      // 「これは ★ を付けてあるセッションか」がヘッダだけで分かる。
+      // ★ は点滅させない: 状態表示 (badge) と違って ★ は継続的な属性なので、
+      // 消えるコマがあると「付いているのか外れたのか」が読めなくなる。
+      const star = isFavoriteName(settings.sessionName) ? FAVORITE_MARK : ''
       // 画面が塞がっている / 回答待ちがあるなら、スクロールしても消えないヘッダで知らせる
       // (フッタは操作の案内なので変えない)
       const badge = headBlinkBadge()
       if (badge) {
-        // 並びは「セッション名　(印) 状態」。状態は必ず出したいので、ヘッダの実描画幅に
+        // 並びは「★セッション名　(印) 状態」。状態は必ず出したいので、ヘッダの実描画幅に
         // 収まらないぶんはセッション名側を切り詰める。文字数ではなく px で測るのは、
         // レンズが裁ち落とすのが px 幅だから (全角名だと文字数では収まって見えても
-        // 状態が画面外へ押し出される)。
+        // 状態が画面外へ押し出される)。★ の幅もここで先に引く (引かないと ★ の
+        // ぶんだけ状態表示が画面外へ出る)。
         // 切り詰めは点滅の両フェーズに同じだけ掛ける。非表示コマだけ名前が伸びると
         // 名前そのものがちらついて読みにくいため。
         const sep = '　'
-        const avail = HEADER_INNER_WIDTH - measuredWidth(sep + badge)
+        const avail = HEADER_INNER_WIDTH - measuredWidth(star + sep + badge)
         const name = truncateToPx(settings.sessionName || '', avail).s
         // 56 は他のヘッダと揃えた最後の歯止め (px で切った後は通常ここに掛からない)
-        return (headBlinkOn ? `${name}${sep}${badge}` : name).slice(0, 56)
+        return (headBlinkOn ? `${star}${name}${sep}${badge}` : `${star}${name}`).slice(0, 56)
       }
-      return settings.sessionName || t('appName')
+      return settings.sessionName ? `${star}${settings.sessionName}` : t('appName')
     }
     default:             return t('appName')
   }
@@ -3794,27 +3821,26 @@ function moveRootCursor(delta: number): void {
 }
 
 /**
- * OS 長押しメニューの「★ お気に入り切替」が選ばれた時: カーソル行のセッションの
- * ★ を切り替える。
+ * OS 長押しメニューの「★ お気に入り切替」が選ばれた時: 対象セッションの ★ を
+ * 切り替える。対象は画面で決まる (favoriteTargetSession 参照):
+ * 一覧ならカーソル行のセッション、セッションを開いていれば そのセッション。
  *
- * プラグイン行 (└ …) にカーソルがある場合も、★ は親セッションに付く/外れる。
+ * 一覧のプラグイン行 (└ …) にカーソルがある場合も、★ は親セッションに付く/外れる。
  * プラグインは親に従属した表示なので、単体で並び替えの対象にはしない。
  *
- * カーソルは飛ばない: rootCursorKey は index ではなく行の同一性キーなので、
+ * 一覧でカーソルは飛ばない: rootCursorKey は index ではなく行の同一性キーなので、
  * ★ を付けて並びが変わっても同じ行に付いていく。表示窓 (rootListStart) は
  * buildRootListView が新しいカーソル位置から引き直す。
  */
-function toggleFavoriteFromRoot(): void {
-  // メニューは rootlist にしか出していないが、閉じ遅れ等で別画面に届いた時に
-  // 黙って何も起きないと壊れて見える。使える場所を必ず伝える。
-  if (phase !== 'rootlist') {
+function toggleFavoriteFromMenu(): void {
+  const name = favoriteTargetSession()
+  // 対象が無い画面 (起動中 / 設定前) にはメニュー項目を出していないが、閉じ遅れ等で
+  // 届いた時に黙って何も起きないと壊れて見える。使える場所を必ず伝える。
+  if (!name) {
     showG2Notice(t('g2NoticeFavoriteNA'))
     void refreshG2(true)
     return
   }
-  const row = currentRootRow()
-  if (!row) return
-  const name = row.session.tmuxSessionName
   const on = !favoriteSessions.has(name)
   if (on) favoriteSessions.add(name)
   else favoriteSessions.delete(name)
@@ -4865,7 +4891,8 @@ async function boot(): Promise<void> {
     // 取り込み (performTakeover) の直前に no-op へ差し替えるので、取り込みに失敗して
     // headlenss に戻る時に同じ内容を再登録できるよう、登録処理を関数で持っておく。
     const installHandlers = (): void => setEventHandlers({
-      // rootlist: 上下=カーソル / click=open / 長押しメニュー=★切替 / dbl=OS終了
+      // 長押しメニュー: ★切替 (一覧ならカーソル行 / 開いていればそのセッション)
+      // rootlist: 上下=カーソル / click=open / dbl=OS終了
       // pending:  上=送信 / 下=テキスト削除 / dbl=破棄して idle へ
       // idle:     上=過去ログ / 下=新しい方へ / dbl=root へ戻る
       // cc-message:  上下=本文スクロール / click=選択肢画面へ / dbl=キャンセルして idle へ
@@ -4895,13 +4922,13 @@ async function boot(): Promise<void> {
         if (respondInputBlocked()) return  // 応答 POST 中はタップも無視
         void toggleRecording()
       },
-      // OS 長押しメニューの独自項目。今のところ rootlist のお気に入り (★) 切替だけ。
-      // メニューは rootlist にしか出していないが、閉じ遅れなどで別 phase に届いても
-      // 何も起きないよう、実行側 (toggleFavoriteFromRoot) でも phase を見ている。
+      // OS 長押しメニューの独自項目。今のところお気に入り (★) 切替だけ。
+      // 対象セッション (一覧ならカーソル行 / 開いていればそのセッション) の決め方は
+      // 実行側 (toggleFavoriteFromMenu) に集約してある。
       onMenuItem: (itemID) => {
         clearG2Notice()  // 一時通知は次の操作で消す
         if (respondInputBlocked()) return
-        if (itemID === LENS_MENU_ID_TOGGLE_FAVORITE) toggleFavoriteFromRoot()
+        if (itemID === LENS_MENU_ID_TOGGLE_FAVORITE) toggleFavoriteFromMenu()
         else log(`未知のメニュー項目: itemID=${itemID}`)
       },
       // 二重クリック: 各 phase での「戻る/キャンセル」操作
