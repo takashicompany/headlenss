@@ -83,6 +83,14 @@ function sameChatMessages(a: ChatMessage[], b: ChatMessage[]): boolean {
 }
 
 const markdownComponents: Components = {
+  // 表は列の中身より狭くできないので、はみ出す分はコードブロックと同じく
+  // ブロック内の横スクロールに閉じ込める (チャット領域は overflow-x:hidden で
+  // 横スクロール禁止のため、包まないと右側が切り落とされて見えなくなる)。
+  table: ({ children, ...rest }) => (
+    <div className="md-table-wrap">
+      <table {...rest}>{children}</table>
+    </div>
+  ),
   a: ({ children, href, ...rest }) => (
     <a href={href} target="_blank" rel="noopener noreferrer" {...rest}>
       {children}

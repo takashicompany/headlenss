@@ -1128,6 +1128,31 @@ button {
   font-size: inherit;
 }
 
+/* 表はブロック内の横スクロールに閉じ込める (ChatView の table コンポーネントが
+   .md-table-wrap で包む)。チャット領域は overflow-x:hidden なので、包まないと
+   画面幅を超えた表の右側が見えなくなる。 */
+.md-table-wrap {
+  overflow-x: auto;
+  margin: 0.5em 0;
+  -webkit-overflow-scrolling: touch;
+}
+.markdown-body table {
+  border-collapse: collapse;
+  font-size: 0.88em;
+}
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid var(--border);
+  padding: 0.25em 0.6em;
+  /* セル内は折り返してよい (表全体の横幅を必要以上に伸ばさない)。
+     それでも収まらない分だけ .md-table-wrap がスクロールになる。 */
+  overflow-wrap: anywhere;
+}
+.markdown-body th {
+  background: rgba(255, 255, 255, 0.04);
+  font-weight: 600;
+}
+
 .markdown-body a {
   color: var(--accent);
   text-decoration: underline;
