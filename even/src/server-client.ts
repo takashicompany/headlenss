@@ -29,6 +29,17 @@ export type ClaudeSessionInfo = {
   source?: AgentSource
   /** rootlist プレビュー用: 最後のメッセージ冒頭 (サーバ側で 48 文字に丸め済み)。 */
   lastChat?: string
+  /**
+   * 対話ウィザード等が tmux の画面を占有していて、通常の入力欄が見えていない。
+   * status は idle/busy のままなので、送っても会話に届かないことはこれでしか分からない。
+   * サーバは true のときだけ付けてくる (false は送らない)。
+   */
+  screenBlocked?: boolean
+  /**
+   * 送ったのに ACK (エージェントの UserPromptSubmit フック) が返ってこなかった
+   * 直近の送信。サーバは未確認の間だけ付けてくる (確認できたら消える)。
+   */
+  deliveryWarning?: DeliveryWarning
   /** このセッションの作業フォルダ配下で動いている G2 プラグインの dev server。 */
   g2Plugins?: G2PluginInfo[]
 }
@@ -42,6 +53,16 @@ export type G2PluginInfo = {
   name: string
   /** 宣言ファイルに書かれた URL。そのまま遷移先になる (組み立て直さない) */
   url: string
+}
+
+/**
+ * 送達未確認の知らせ。tmux へのキー注入は成功しても、pane が塞がっていれば
+ * 会話には入らない。エージェントがプロンプトを受理した証拠 (フック) が期限内に
+ * 来なかった送信を、サーバがこの形で教えてくる。
+ */
+export type DeliveryWarning = {
+  /** 未確認のまま残っている送信を投げた時刻 (epoch ms)。 */
+  sentAt: number
 }
 
 export type ChatRole = 'user' | 'assistant'
@@ -59,6 +80,8 @@ export type ClaudeChatResponse = {
   source?: AgentSource
   /** Agent の動作状態。未知の値が増えても壊れないよう string も許容する。 */
   status?: ClaudeSessionStatus | string
+  /** 送ったのに届いた確証が得られていない送信 (未確認の間だけ付く)。 */
+  deliveryWarning?: DeliveryWarning
 }
 
 export type AskQuestionOption = { label: string; description?: string }
@@ -111,6 +134,8 @@ export type RespondInput = (
  */
 /** 応答 POST の上限時間 (ms)。サーバ側のキー注入と確認 (数百 ms〜数秒) より十分長く取る。 */
 const RESPOND_TIMEOUT_MS = 15000
+/** tmux への送信 (sendKeys) の締切。返らないと 'sending' 表示が固着する。 */
+const SEND_KEYS_TIMEOUT_MS = 15000
 
 /**
  * ms 後に abort する signal。
@@ -164,18 +189,24 @@ export class HeadlenssClient {
     return (await res.json()) as { ok: boolean }
   }
 
-  async listSessions(): Promise<Session[]> {
-    const res = await fetch(this.url('/api/sessions'))
+  async listSessions(signal?: AbortSignal): Promise<Session[]> {
+    const res = await fetch(this.url('/api/sessions'), { signal })
     if (!res.ok) throw new Error(`listSessions HTTP ${res.status}`)
     const data = (await res.json()) as { sessions: Session[] }
     return data.sessions
   }
 
+  /**
+   * tmux セッションへ本文を流し込む。
+   * 締切を必ず張る: ここが返らないと呼び出し側は 'sending' のまま操作を
+   * 受け付けない画面に閉じ込められる (電波が切れた時に実際に起きる)。
+   */
   async sendKeys(name: string, opts: SendKeysOptions): Promise<void> {
     const res = await fetch(this.url(`/api/sessions/${encodeURIComponent(name)}/input`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: opts.text, submit: opts.submit }),
+      signal: timeoutSignal(SEND_KEYS_TIMEOUT_MS),
     })
     if (!res.ok) {
       const body = await res.text().catch(() => '')
@@ -241,7 +272,12 @@ export class HeadlenssClient {
     if (res.status === 404) return { chat: [] }
     if (!res.ok) throw new Error(`getClaudeChat HTTP ${res.status}`)
     const data = (await res.json()) as ClaudeChatResponse
-    return { chat: data.chat ?? [], source: data.source, status: data.status }
+    return {
+      chat: data.chat ?? [],
+      source: data.source,
+      status: data.status,
+      deliveryWarning: data.deliveryWarning,
+    }
   }
 
   async getClaudePending(name: string, signal?: AbortSignal): Promise<Pending | null> {

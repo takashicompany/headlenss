@@ -108,6 +108,8 @@ body[data-view="dashboard"] details.card:not(#settingsDetails):not(#claudeSessio
   font-weight: 500;
   vertical-align: 1px;
 }
+/* 画面ブロック中 (対話ウィザード等が tmux の画面を占有) の警告マーク */
+.claude-blocked { color: var(--warn); }
 .claude-cwd  {
   font-size: 0.78rem;
   color: var(--muted);

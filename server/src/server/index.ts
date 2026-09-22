@@ -9,24 +9,25 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cpus, freemem, loadavg, tmpdir, totalmem } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { captureOutput, createSession, getSessionCwd, killSession, listSessions, renameSession, sendKey, sendKeys } from './tmux.ts';
+import { captureOutput, createSession, getSessionCwd, killSession, listSessions, renameSession, sendKey, sendKeys, sendTextAsPaste } from './tmux.ts';
 import { cleanupAllHeadlessEntries, handlePtyConnection } from './pty.ts';
 import { getBackendName, isAsrReady, transcribePcm16, transcribeWav } from './asr/index.ts';
 import { claudeRouter } from './claude/router.ts';
 import { codexRouter } from './codex/router.ts';
-import { detectCodexSessions, getCodexHookHealth, invalidateCodexDetectCache } from './codex/status.ts';
+import { detectAgentPaneTexts, detectCodexSessions, getCodexHookHealth, invalidateCodexDetectCache, isCodexPermissionPrompt } from './codex/status.ts';
 import { detectClaudeSessions, invalidateClaudeDetectCache } from './claude/process-detect.ts';
 import { detectLiveOwners, invalidateLiveOwnerCache } from './claude/live-owner.ts';
 import * as claudeStore from './claude/store.ts';
 import { sanitizeChatText } from './claude/transcript.ts';
 import { restoreSessions, saveSnapshot, startPeriodicSnapshot, stopPeriodicSnapshot } from './persist.ts';
-import { recordUiSubmission } from './uiSubmissions.ts';
+import { createDelivery, getDeliveryState, getDeliveryWarning, markDeliveryFailed, markDeliveryInjected, pruneDeliveries, type DeliveryState } from './uiSubmissions.ts';
 import {
   deleteSessionStatusObservation,
   pickEffectiveSource,
   pruneSessionStatusObservations,
   resolveTrackedSessionStatus,
 } from './session-status.ts';
+import { pruneScreenBlockObservations, resolveScreenBlocked } from './screen-block.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -174,18 +175,23 @@ function buildLastChat(tmuxName: string): { role: 'user' | 'assistant'; text: st
 }
 
 app.get('/api/sessions', async (c) => {
-  const [sessions, detected, codexDetected, liveOwners] = await Promise.all([
+  const [sessions, detected, codexDetected, liveOwners, paneTexts] = await Promise.all([
     listSessions(),
     detectClaudeSessions().catch(() => []),
     detectCodexSessions().catch(() => []),
     // live owner (今その画面を握っている本人)。失敗時は null → sticky フォールバック。
     detectLiveOwners().catch(() => null),
+    // 画面ブロック検知用の pane テキスト。codex 検出と同じ走査結果なので tmux 呼び出しは増えない。
+    detectAgentPaneTexts().catch(() => new Map<string, string>()),
   ]);
   // codex の hookHealth / needsHookAttention 用 (status と source の判定は共有関数側)。
   const codexMap = new Map(codexDetected.map((d) => [d.tmuxSessionName, d]));
   const liveNames = new Set(sessions.map((s) => s.name));
   // 死んだ / 改名された tmux セッションの status 変化時刻は捨てる。
   pruneSessionStatusObservations(liveNames);
+  pruneScreenBlockObservations(liveNames);
+  // 死んだ / 改名されたセッションの送達追跡も捨てる (無制限成長させない)。
+  pruneDeliveries(liveNames);
   const enriched = sessions.map((s) => {
     const tracked = claudeStore.getSession(s.name);
     // agent (実効ソース) も status も /api/claude/sessions と同じ共有関数で決める。
@@ -208,6 +214,14 @@ app.get('/api/sessions', async (c) => {
     if (!agent) deleteSessionStatusObservation(s.name);
     const resolved = agent ? resolveTrackedSessionStatus({ ...signals, source: agent }) : undefined;
     const status = resolved?.status;
+    // 画面ブロック (対話ウィザード等が pane を占有していて通常の入力欄が見えない)。
+    // status は据え置きで、別フィールドとして足すだけ (既存クライアントは無視できる)。
+    const screenBlocked = resolveScreenBlocked({
+      tmuxSessionName: s.name,
+      source: agent,
+      status,
+      paneText: paneTexts.get(s.name),
+    });
     return {
       ...s,
       claudeStatus: agent === 'claude' ? status : undefined,
@@ -218,6 +232,10 @@ app.get('/api/sessions', async (c) => {
       codexHookHealth: codexMap.get(s.name)?.hookHealth ?? (agent === 'codex' ? getCodexHookHealth(tracked?.cwd) : getCodexHookHealth()),
       codexNeedsHookAttention: (agent === 'codex' && codexMap.get(s.name)?.needsHookAttention) ?? false,
       lastChat: storeMatches ? buildLastChat(s.name) : undefined,
+      screenBlocked: screenBlocked ? (true as const) : undefined,
+      // 送ったのに ACK (UserPromptSubmit) が返ってこなかった直近の送信。
+      // 確認できた時点で消える。付くのは未確認のときだけ。
+      deliveryWarning: getDeliveryWarning(s.name),
     };
   });
   for (const retained of listRetainedSessions(liveNames)) {
@@ -230,6 +248,9 @@ app.get('/api/sessions', async (c) => {
       codexHookHealth: retained.agent === 'codex' ? getCodexHookHealth() : getCodexHookHealth(),
       codexNeedsHookAttention: false,
       lastChat: undefined,
+      // 解放済み (tmux が無い) セッションは画面そのものが無いので常に付けない。
+      screenBlocked: undefined,
+      deliveryWarning: undefined,
     });
   }
   return c.json({ sessions: enriched });
@@ -411,6 +432,75 @@ async function acquireTmuxLockWithWait(name: string): Promise<boolean> {
   }
 }
 
+/**
+ * Codex への送信で「本文の流し込み」と「Enter」の間に置く待ち。
+ * これ自体は issue #73 の対策ではない (待ちを 2 秒に延ばしても直らないことを実測済み)。
+ * 貼り付けの反映と Enter が同じ描画フレームに重ならないようにするための保険。
+ */
+const CODEX_SUBMIT_KEY_DELAY_MS = 150;
+
+/**
+ * 送信後、送達 (ACK) を待ってから composer 残りを見るまでの時間。
+ * 受理されていれば UserPromptSubmit フックがこの間に届く。
+ */
+const CODEX_ENTER_RETRY_DELAY_MS = 3_000;
+
+/** 空白を全て落とした比較用の文字列。composer は pane 幅で折り返され行頭に余白が付くため。 */
+function squeezeSpaces(text: string): string {
+  return text.replace(/\s+/g, '');
+}
+
+/**
+ * 「送った本文がまだ composer に残っている」ことの確認。
+ * 長文の composer は pane に収まらず一部しか見えないので、本文の先頭 / 中央 / 末尾から
+ * 採った断片のどれかが見えていれば「残っている」とみなす。見えなければ追送しない
+ * (判断できない時は撃たない = 二重送信を出さない側に倒す)。
+ */
+function paneStillHoldsText(pane: string, text: string): boolean {
+  const body = squeezeSpaces(text);
+  const paneBody = squeezeSpaces(pane);
+  if (!body || !paneBody) return false;
+  const size = Math.min(24, body.length);
+  const mid = Math.max(0, Math.floor((body.length - size) / 2));
+  const samples = [body.slice(0, size), body.slice(mid, mid + size), body.slice(body.length - size)];
+  return samples.some((s) => paneBody.includes(s));
+}
+
+/**
+ * Codex 送信の最後の安全網 (issue #73)。
+ *
+ * 本文は bracketed paste で流し込むので Enter が貼り付けに食われることは無いはずだが、
+ * pane 内のアプリが bracketed paste を要求していない等で素のテキストとして届いた場合は
+ * 従来どおり Enter が食われて本文が composer に残りうる。そこで
+ *   - 送達が確認されていない (UserPromptSubmit フックが来ていない)
+ *   - Codex が動いていない (esc to interrupt が出ていない = 受理されていない)
+ *   - 許可ダイアログが出ていない (Enter が「承認」になってしまう画面では絶対に撃たない)
+ *   - 本文がまだ composer に見えている
+ * の 4 つが揃った時に限り、Enter を 1 回だけ追送する。1 送信につき 1 回だけ。
+ *
+ * 追送も tmux 単位の mutex の中で行う (応答注入や他の送信とキーを混ぜない)。
+ */
+async function retryCodexEnterIfStuck(name: string, deliveryId: string, text: string): Promise<void> {
+  const settled = (s: DeliveryState | undefined): boolean =>
+    s === undefined || s === 'confirmed' || s === 'confirmed_late';
+  if (settled(getDeliveryState(name, deliveryId))) return;
+  if (!(await acquireTmuxLockWithWait(name))) return;
+  try {
+    // ロック待ちの間に確定していることがあるので、握ってからもう一度見る。
+    if (settled(getDeliveryState(name, deliveryId))) return;
+    const pane = await captureOutput(name, 1);
+    if (/esc to interrupt/i.test(pane)) return;
+    if (isCodexPermissionPrompt(pane)) return;
+    if (!paneStillHoldsText(pane, text)) return;
+    await sendKey(name, 'Enter');
+    console.log(`[codex-send] re-sent Enter (text stayed in composer) tmux=${name} delivery=${deliveryId}`);
+  } catch (e) {
+    console.log(`[codex-send] enter retry skipped tmux=${name}: ${(e as Error).message}`);
+  } finally {
+    claudeStore.releaseRespondLock(name);
+  }
+}
+
 app.post('/api/sessions/:name/input', async (c) => {
   const name = c.req.param('name');
   const body = (await c.req.json().catch(() => ({}))) as { text?: unknown; submit?: unknown };
@@ -423,6 +513,8 @@ app.post('/api/sessions/:name/input', async (c) => {
       409,
     );
   }
+  // 送達 (ack) の追跡 id。注入前に作るので、finally/catch でも見えるところに置く。
+  let deliveryId: string | null = null;
   try {
     const tracked = claudeStore.getSession(name);
     const pane = body.submit === true ? await captureOutput(name, 120).catch(() => '') : '';
@@ -441,21 +533,47 @@ app.post('/api/sessions/:name/input', async (c) => {
         (await detectCodexSessions()).some((session) => session.tmuxSessionName === name)
       );
     }
-    // UI 送信を記録: 後続の user-prompt-submit hook で origin 判定に使う
+    // 送達を記録: 後続の user-prompt-submit hook で origin 判定と ACK 突き合わせに使う。
+    // 注入「前」に作るのは、注入が終わる前にフックが届くことがあるため。
     if (body.submit === true && body.text.trim()) {
-      recordUiSubmission(name, body.text);
+      deliveryId = createDelivery(name, body.text);
     }
     if (body.submit === true && isCodex) {
       const visiblePaneTail = pane.slice(-3000);
       const shouldQueueInCodex = /esc to interrupt/i.test(visiblePaneTail);
-      await sendKeys(name, body.text, false);
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      // 本文は「貼り付け」として流し込む。1 文字ずつのキーとして流すと、後段の Enter が
+      // Codex TUI の貼り付け判定に巻き込まれ、送信ではなく composer 内の改行になる
+      // (issue #73: 本文だけが入力欄に残る)。
+      await sendTextAsPaste(name, body.text);
+      await new Promise((resolve) => setTimeout(resolve, CODEX_SUBMIT_KEY_DELAY_MS));
       await sendKey(name, shouldQueueInCodex ? 'Tab' : 'Enter');
-      return c.json({ ok: true, queued: shouldQueueInCodex });
+      // Tab キューに積んだ場合は、現ターンが終わる (Stop) まで受理されないので
+      // 期限の考え方が変わる。その区別を送達側に渡す。
+      if (deliveryId) markDeliveryInjected(name, deliveryId, { queued: shouldQueueInCodex });
+      // 追送の安全網は「今すぐ受理されるはずの送信」にだけ掛ける。Tab で積んだ分は
+      // 現ターンが終わるまで受理されないので、composer の残りからは判断できない。
+      if (deliveryId && !shouldQueueInCodex) {
+        const trackedId = deliveryId;
+        const sentText = body.text;
+        setTimeout(() => {
+          void retryCodexEnterIfStuck(name, trackedId, sentText);
+        }, CODEX_ENTER_RETRY_DELAY_MS).unref();
+      }
+      return c.json({ ok: true, queued: shouldQueueInCodex, ...(deliveryId ? { deliveryId } : {}) });
     }
     await sendKeys(name, body.text, body.submit === true);
-    return c.json({ ok: true });
+    if (deliveryId) {
+      // Claude Code も処理中 (esc to interrupt 表示中) に Enter を撃つと、その本文は
+      // 入力キューに積まれ、今のターンが終わるまで受理されない。Codex の Tab キューと
+      // 同じ扱いにしないと、長いターンの最中に送っただけで「届いていない」と誤報する。
+      // (注入の仕方は一切変えていない。期限の数え方だけを変える。)
+      const queued = /esc to interrupt/i.test(pane.slice(-3000));
+      markDeliveryInjected(name, deliveryId, { queued });
+    }
+    return c.json({ ok: true, ...(deliveryId ? { deliveryId } : {}) });
   } catch (e) {
+    // 注入そのものが失敗した = 確実に届いていない。待たずに未達として確定させる。
+    if (deliveryId) markDeliveryFailed(name, deliveryId);
     const msg = (e as Error).message;
     const status =
       msg.includes("can't find session") || msg.includes('no server running') ? 404 : 400;
