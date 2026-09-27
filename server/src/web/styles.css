@@ -1339,6 +1339,48 @@ button {
   touch-action: pan-y;
 }
 
+/* タッチ端末向けキーバー (Esc/Tab/Ctrl+C/矢印)。terminal-container の下に並び、
+   .page-session の flex で高さが差し引かれるので、fit は ResizeObserver 経由で追従する。
+   下端の安全域はキーバー側が持つ。 */
+.page-session.has-keybar .terminal-container {
+  padding-bottom: 0.25rem;
+}
+.term-keybar {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 4px;
+  padding: 4px 4px calc(4px + env(safe-area-inset-bottom));
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+.term-keybar button {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 36px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+.term-keybar button.is-wide {
+  /* "Ctrl+C" は他より文字数が多いので 320px 幅でも収まるよう少し広く取る */
+  flex-grow: 1.5;
+}
+.term-keybar button:active {
+  background: var(--border);
+  border-color: var(--accent);
+}
+
 /* xterm.js v5 のデフォルト DOM 構造で .xterm-screen が .xterm-viewport の上に
    重なって hit-test を奪うため、中央のタッチがネイティブスクロール対象 (=viewport)
    に届かない。pointer-events: none で touch を viewport まで貫通させる。

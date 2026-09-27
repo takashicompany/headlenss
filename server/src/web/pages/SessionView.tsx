@@ -11,6 +11,35 @@ import { useLanguage } from '../i18n.tsx';
 //   server → client: { type: 'screen', serialized } / { type: 'output', data } /
 //                    { type: 'attached', cols, rows } / { type: 'exit', code }
 
+// タッチ端末向けキーバー。ソフトキーボードに無い/打ちにくいキーを PTY に直接送る。
+// 送るバイト列は xterm.js が物理キー入力時に onData へ流すものと同じ (通常カーソルキーモード)。
+const KEYBAR_KEYS: { label: string; data: string; aria: string; wide?: boolean }[] = [
+  { label: 'Esc', data: '\x1b', aria: 'Escape' },
+  { label: 'Tab', data: '\t', aria: 'Tab' },
+  { label: 'Ctrl+C', data: '\x03', aria: 'Ctrl+C', wide: true },
+  { label: '←', data: '\x1b[D', aria: 'Left' },
+  { label: '↓', data: '\x1b[B', aria: 'Down' },
+  { label: '↑', data: '\x1b[A', aria: 'Up' },
+  { label: '→', data: '\x1b[C', aria: 'Right' },
+];
+
+const COARSE_QUERY = '(pointer: coarse)';
+
+// ChatView の送信判定と同じく pointer: coarse をタッチ主体端末とみなす。
+function useCoarsePointer(): boolean {
+  const [coarse, setCoarse] = useState(
+    () => typeof window !== 'undefined' && !!window.matchMedia?.(COARSE_QUERY).matches,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia?.(COARSE_QUERY);
+    if (!mq) return;
+    const onChange = () => setCoarse(mq.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+  return coarse;
+}
+
 type ServerMsg =
   | { type: 'screen'; serialized: string }
   | { type: 'output'; data: string }
@@ -39,6 +68,7 @@ export function SessionView({
   // pty WebSocket がサーバから 4404 (session not found) で閉じられた時に立てる。
   // 立つと reconnect ループを止めて「セッションが無い」UI を出す。
   const [sessionMissing, setSessionMissing] = useState(false);
+  const showKeybar = useCoarsePointer();
 
   // 画像をアップロード → 取得した path を `@path ` として PTY に流し込む。
   // Claude Code の TUI が `@/path/to/file.png` を画像参照として解釈する。
@@ -327,7 +357,7 @@ export function SessionView({
   }, [sessionName]);
 
   return (
-    <div className="page-session">
+    <div className={showKeybar ? 'page-session has-keybar' : 'page-session'}>
       <header className="session-header">
         <button onClick={onBack} aria-label={t('back')}>
           {t('back')}
@@ -367,6 +397,33 @@ export function SessionView({
         {modeTabs}
       </header>
       <div ref={containerRef} className="terminal-container" />
+      {showKeybar && (
+        <div className="term-keybar" role="toolbar" aria-label="Terminal keys">
+          {KEYBAR_KEYS.map((k) => (
+            <button
+              key={k.aria}
+              type="button"
+              tabIndex={-1}
+              className={k.wide ? 'is-wide' : undefined}
+              aria-label={k.aria}
+              // pointerdown で即送信し、既定動作 (フォーカス移動) を止めて
+              // xterm の入力欄からフォーカスが外れない = ソフトキーボードが閉じないようにする。
+              onPointerDown={(e) => {
+                e.preventDefault();
+                sendInputRef.current?.(k.data);
+              }}
+              onMouseDown={(e) => e.preventDefault()}
+              // キーボード/支援技術からの活性化 (pointer を伴わない click) だけ拾う
+              onClick={(e) => {
+                if (e.detail === 0) sendInputRef.current?.(k.data);
+              }}
+              onContextMenu={(e) => e.preventDefault()}
+            >
+              {k.label}
+            </button>
+          ))}
+        </div>
+      )}
       {sessionMissing && (
         <div className="session-missing">
           <p>{t('sessionMissingPrefix')}<code>{sessionName}</code>{t('sessionMissingSuffix')}</p>
