@@ -74,6 +74,36 @@ export async function readTailLines(
   }
 }
 
+/**
+ * ファイル末尾 `bytes` バイトぶんの完全な行を返す (先頭の途中行は捨てる)。
+ * `fromStart` はファイル先頭まで読み切ったかどうか。
+ */
+async function readTailBytes(
+  filePath: string,
+  bytes: number,
+): Promise<{ lines: string[]; fromStart: boolean }> {
+  let fh: Awaited<ReturnType<typeof open>>;
+  try {
+    fh = await open(filePath, 'r');
+  } catch {
+    return { lines: [], fromStart: true };
+  }
+  try {
+    const { size } = await fh.stat();
+    const readStart = Math.max(0, size - bytes);
+    const readLen = size - readStart;
+    const buf = Buffer.alloc(readLen);
+    await fh.read(buf, 0, readLen, readStart);
+    const all = buf.toString('utf-8').split('\n');
+    const complete = readStart > 0 ? all.slice(1) : all;
+    return { lines: complete.filter((l) => l.trim()), fromStart: readStart === 0 };
+  } catch {
+    return { lines: [], fromStart: true };
+  } finally {
+    await fh.close();
+  }
+}
+
 type TranscriptLine = {
   type?: string;
   message?: { role?: string; content?: unknown };
@@ -193,25 +223,32 @@ export async function extractChatFromTranscript(
 ): Promise<Array<{ role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' }>> {
   if (!transcriptPath) return [];
 
-  let lines: string[];
   if (tailMode) {
     // Efficient tail read: only read the last portion of the file.
-    // Transcript JSONL lines are not 1:1 with visible chat items (tool_use,
-    // sidechain, meta lines are skipped), so request a margin so that
-    // tail=10 reliably yields 10 visible items on typical transcripts.
-    const minLines = Math.min(600, limit * 3);
-    lines = await readTailLines(transcriptPath, minLines);
-  } else {
-    let raw: string;
-    try {
-      raw = await readFile(transcriptPath, 'utf-8');
-    } catch {
-      return [];
+    // 行数ではなく「会話として取り出せた件数」が limit に届くまで読む範囲を広げる。
+    // 2.1.300 以降は api-request-blob (system prompt やツール結果の再送で 1 行が大きい)
+    // が末尾の大半を占め、数百 KB 読んでも発言が数件しか無いことがあるため。
+    for (let bytes = 256 * 1024; ; bytes *= 2) {
+      const { lines, fromStart } = await readTailBytes(transcriptPath, bytes);
+      const items = parseChatLines(lines);
+      if (items.length >= limit || fromStart) return items.slice(-limit);
     }
-    lines = raw.split('\n').filter((l) => l.trim());
   }
 
-  const items: Array<{ role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' }> = [];
+  let raw: string;
+  try {
+    raw = await readFile(transcriptPath, 'utf-8');
+  } catch {
+    return [];
+  }
+  return parseChatLines(raw.split('\n').filter((l) => l.trim())).slice(-limit);
+}
+
+type ChatLineItem = { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' };
+
+/** transcript の行列から会話項目を順序どおりに取り出す (limit はかけない)。 */
+function parseChatLines(lines: string[]): ChatLineItem[] {
+  const items: ChatLineItem[] = [];
   for (const line of lines) {
     if (!line.trim()) continue;
     let parsed: TranscriptLine;
@@ -265,7 +302,7 @@ export async function extractChatFromTranscript(
     items.push(item);
   }
   fillMissingTimestamps(items);
-  return items.slice(-limit);
+  return items;
 }
 
 /** timestamp を持たない項目に、直前 (無ければ直後) の項目の時刻を入れる。

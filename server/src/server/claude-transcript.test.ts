@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { extractChatFromTranscript, extractLastAssistantText, sanitizeChatText } from './claude/transcript.ts';
 
@@ -44,6 +46,25 @@ test('新形式: 最後の項目は tmux に出ている最終回答 (tail 読�
     assert.equal(chat[0].text, 'urlくれ');
     assert.match(chat[1].text, /^URL は次のとおりです。/);
     assert.equal(chat[1].agent, 'claude');
+  }
+});
+
+test('tail 読み: 末尾を大きな非会話行が占めていても limit 件まで遡って取り出す', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'headlenss-transcript-'));
+  try {
+    const path = join(dir, 'big.jsonl');
+    const turn = (i: number) => [
+      JSON.stringify({ type: 'user', timestamp: `2026-10-19T00:00:0${i}.000Z`, message: { role: 'user', content: `q${i}` } }),
+      JSON.stringify({ type: 'assistant', timestamp: `2026-10-19T00:00:0${i}.500Z`, message: { role: 'assistant', content: [{ type: 'text', text: `a${i}` }] } }),
+    ];
+    // 1 行 100KB の api-request-blob を 20 行 (= 約 2MB) 末尾に積む
+    const blob = JSON.stringify({ type: 'api-request-blob', hash: 'h', message: { role: 'system', content: [{ type: 'text', text: 'x'.repeat(100_000) }] } });
+    const lines = [...turn(1), ...turn(2), ...Array(20).fill(blob)];
+    writeFileSync(path, `${lines.join('\n')}\n`);
+    const chat = await extractChatFromTranscript(path, 3, true);
+    assert.deepEqual(chat.map((m) => m.text), ['a1', 'q2', 'a2']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
