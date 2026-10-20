@@ -80,7 +80,31 @@ type TranscriptLine = {
   role?: string;
   content?: unknown;
   isMeta?: boolean;
+  isSidechain?: boolean;
+  isCompactSummary?: boolean;
+  isVisibleInTranscriptOnly?: boolean;
+  timestamp?: string;
 };
+
+/**
+ * transcript の 1 行が「会話そのもの」(user / assistant の発言エントリ) かどうか。
+ *
+ * Claude Code 2.1.300 以降、transcript には API に送ったリクエスト本文を
+ * 内容ハッシュ単位で保存する `type: "api-request-blob"` 行が混ざるようになった。
+ * これは `message: { role, content }` を持つので role だけで判定すると発言に見えるが、
+ * 中身は「過去の発言の再送コピー」+「system-reminder 等の注入文脈」で、
+ * timestamp も isMeta も持たない。会話として数えると、過去の発言が重複し、
+ * しかも時刻が無いぶん末尾 (=最新) に並んでしまう。
+ *
+ * そこで `type` を持つ行は `user` / `assistant` だけを会話として扱う。
+ * `type` を持たない行 (旧来の/外部形式) は従来どおり role で判定する。
+ */
+function isConversationEntry(parsed: TranscriptLine): boolean {
+  if (typeof parsed.type === 'string') {
+    return parsed.type === 'user' || parsed.type === 'assistant';
+  }
+  return true;
+}
 
 function extractText(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -124,7 +148,8 @@ export function sanitizeChatText(text: string): string {
 
   let s = text;
   s = s.replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/g, '');
-  s = s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '');
+  // 新しい Claude Code は `<system-reminder id="...">` のように属性を付けることがある。
+  s = s.replace(/<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/g, '');
   s = s.replace(/<bash-input>([\s\S]*?)<\/bash-input>/g, (_, cmd: string) => `$ ${cmd.trim()}`);
   s = s.replace(/<bash-stdout>([\s\S]*?)<\/bash-stdout>/g, '$1');
   s = s.replace(/<bash-stderr>([\s\S]*?)<\/bash-stderr>/g, '$1');
@@ -145,6 +170,9 @@ const META_USER_TEXT_RE = /^(A session-scoped Stop hook is now active|Stop hook 
 
 function isNonMainAgentTranscriptEntry(parsed: TranscriptLine, text: string): boolean {
   if (parsed.isMeta === true) return true;
+  // /compact 後の「This session is being continued…」要約。transcript 専用で
+  // tmux の会話には出ない (画面には "Conversation compacted" だけが出る)。
+  if (parsed.isCompactSummary === true || parsed.isVisibleInTranscriptOnly === true) return true;
   if (TASK_NOTIFICATION_RE.test(text)) return true;
   if (LOCAL_COMMAND_STDOUT_RE.test(text)) return true;
   if (META_USER_TEXT_RE.test(text)) return true;
@@ -186,12 +214,13 @@ export async function extractChatFromTranscript(
   const items: Array<{ role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' }> = [];
   for (const line of lines) {
     if (!line.trim()) continue;
-    let parsed: TranscriptLine & { isSidechain?: boolean; timestamp?: string };
+    let parsed: TranscriptLine;
     try {
       parsed = JSON.parse(line) as typeof parsed;
     } catch {
       continue;
     }
+    if (!isConversationEntry(parsed)) continue;
     if (parsed.isSidechain === true) continue;
     const role = parsed.message?.role ?? parsed.role;
     if (role !== 'user' && role !== 'assistant') continue;
@@ -222,17 +251,36 @@ export async function extractChatFromTranscript(
     if (isNonMainAgentTranscriptEntry(parsed, text)) continue;
     const cleaned = sanitizeChatText(text);
     if (!cleaned) continue;
-    const ts = parsed.timestamp ? Date.parse(parsed.timestamp) : Date.now();
+    // 発言時刻は transcript エントリ自身の timestamp。取得時刻 (Date.now()) で埋めると
+    // 過去の発言が「今」の位置に並び替えられ、hook 由来の chat とのマージ順も壊れる。
+    // timestamp が欠けた行は後段で前後の発言の時刻から補う。
+    const ts = parsed.timestamp ? Date.parse(parsed.timestamp) : NaN;
     const item: { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex' } = {
       role: role as 'user' | 'assistant',
       text: cleaned,
-      ts: Number.isFinite(ts) ? ts : Date.now(),
+      ts,
     };
     // transcript 由来の assistant メッセージには agent: 'claude' を設定
     if (role === 'assistant') item.agent = 'claude';
     items.push(item);
   }
+  fillMissingTimestamps(items);
   return items.slice(-limit);
+}
+
+/** timestamp を持たない項目に、直前 (無ければ直後) の項目の時刻を入れる。
+ *  どれも時刻を持たない場合に限り取得時刻で埋める。 */
+function fillMissingTimestamps(items: Array<{ ts: number }>): void {
+  let prev = NaN;
+  for (const it of items) {
+    if (Number.isFinite(it.ts)) prev = it.ts;
+    else if (Number.isFinite(prev)) it.ts = prev;
+  }
+  let next = NaN;
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (Number.isFinite(items[i].ts)) next = items[i].ts;
+    else items[i].ts = Number.isFinite(next) ? next : Date.now();
+  }
 }
 
 /**
@@ -255,6 +303,9 @@ export async function extractLastAssistantText(transcriptPath: string): Promise<
     } catch {
       continue;
     }
+    // api-request-blob 等の再送コピーを「最新の発言」と誤読しない。
+    if (!isConversationEntry(parsed)) continue;
+    if (parsed.isSidechain === true) continue;
     const role = parsed.message?.role ?? parsed.role;
     if (role !== 'assistant') continue;
     const content = parsed.message?.content ?? parsed.content;
