@@ -49,7 +49,8 @@
 // エントリや、まだ dev server を起動していないエントリは自動的に落ちる。
 // (ファイル型の「実在確認」は web-preview.ts 側で行う。)
 
-import { readFile } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
+import { chmod, lstat, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 /** セッションのフォルダ直下に置く宣言ファイル名 */
@@ -286,6 +287,110 @@ export async function readDeclarations(sessionCwd: string): Promise<PluginEntry[
   const entries = parsePluginConf(text, path);
   confCache.set(sessionCwd, { at: Date.now(), entries });
   return entries;
+}
+
+/** 1 行ぶんの `名前 = 値` の「名前」。parsePluginConf と同じ切り出し方。宣言行でなければ null。 */
+function confLineName(rawLine: string): string | null {
+  const line = rawLine.split('#')[0].trim();
+  if (!line) return null;
+  const eq = line.indexOf('=');
+  if (eq <= 0) return null;
+  return line.slice(0, eq).trim() || null;
+}
+
+/**
+ * 宣言ファイルの本文から、名前が `name` の宣言行だけを取り除く。
+ *
+ * コメント行・空行・他の宣言行・改行コード (`\r\n` / `\n`) はそのまま残す。
+ * 同じ名前の行が複数ある場合 (重複で後ろが無視されていた行) もまとめて消す。
+ * 先頭の 1 行だけ消すと、無視されていた後ろの行が繰り上がって同じタブが復活するため。
+ */
+export function removeEntryFromConfText(text: string, name: string): { text: string; removed: number } {
+  const lines = text.split('\n');
+  const kept: string[] = [];
+  let removed = 0;
+  for (const line of lines) {
+    if (confLineName(line) === name) {
+      removed++;
+      continue;
+    }
+    kept.push(line);
+  }
+  return { text: kept.join('\n'), removed };
+}
+
+export type RemoveDeclarationResult = 'removed' | 'not-found' | 'not-regular-file';
+
+/** 同じ宣言ファイルへの書き込みを直列にする (読んで → 書く の間に別の削除が割り込まないように) */
+const writeLocks = new Map<string, Promise<unknown>>();
+
+/**
+ * セッションのフォルダ直下の宣言ファイルから、宣言 1 件 (名前で指定) を削除する。
+ *
+ * - 書き込む先は `<sessionCwd>/.headlenss-plugins.conf` だけ。他のファイルには触れない。
+ * - 宣言ファイルがシンボリックリンク等の通常ファイル以外なら書き換えない
+ *   (リンクを実ファイルで置き換えてしまうと、リンク先の共有設定が切れるため)。
+ * - 一時ファイルに書いてから rename で差し替える (途中で落ちても半端な内容が残らない)。
+ * - 宣言が 0 件になってもファイルは消さない。
+ * - `accept` を渡すと、その条件に合う宣言だけを削除対象にする (合わなければ not-found)。
+ */
+export async function removeDeclaration(
+  sessionCwd: string,
+  name: string,
+  accept: (e: PluginEntry) => boolean = () => true,
+): Promise<RemoveDeclarationResult> {
+  const confPath = resolve(sessionCwd, PLUGIN_CONF_NAME);
+  const prev = writeLocks.get(confPath) ?? Promise.resolve();
+  const run = prev.catch(() => {}).then(() => removeDeclarationUnlocked(sessionCwd, confPath, name, accept));
+  writeLocks.set(confPath, run);
+  try {
+    return await run;
+  } finally {
+    if (writeLocks.get(confPath) === run) writeLocks.delete(confPath);
+  }
+}
+
+async function removeDeclarationUnlocked(
+  sessionCwd: string,
+  confPath: string,
+  name: string,
+  accept: (e: PluginEntry) => boolean,
+): Promise<RemoveDeclarationResult> {
+  let mode: number;
+  try {
+    const st = await lstat(confPath);
+    if (!st.isFile()) return 'not-regular-file';
+    mode = st.mode & 0o7777;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return 'not-found';
+    throw e;
+  }
+  const text = await readFile(confPath, 'utf-8');
+  // 「いま有効な宣言」として存在するものだけを削除対象にする
+  const entry = parsePluginConf(text, confPath).find((e) => e.name === name);
+  if (!entry || !accept(entry)) return 'not-found';
+
+  const next = removeEntryFromConfText(text, name);
+  if (next.removed === 0) return 'not-found';
+
+  // 同じフォルダに一時ファイルを作って rename (同一ファイルシステム内なので原子的)。
+  // 名前は `.` 始まりなので、書き込み途中でもプレビュー配信には載らない。
+  const tmp = `${confPath}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+  try {
+    await writeFile(tmp, next.text, { encoding: 'utf-8', mode, flag: 'wx' });
+    await chmod(tmp, mode); // umask で削られたぶんを元の権限に揃える
+    await rename(tmp, confPath);
+  } catch (e) {
+    await unlink(tmp).catch(() => {});
+    throw e;
+  }
+  // G2 一覧はフック由来の cwd、Web のタブは tmux の pane の cwd をキーに引くので、
+  // 同じ宣言ファイルを指すキャッシュは全部捨てる (どちらにも即座に反映させる)。
+  for (const key of confCache.keys()) {
+    if (key === sessionCwd || resolve(key, PLUGIN_CONF_NAME) === confPath) confCache.delete(key);
+  }
+  return 'removed';
 }
 
 /**

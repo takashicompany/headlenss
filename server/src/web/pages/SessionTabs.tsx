@@ -16,6 +16,8 @@ export type WebTab = {
   /** 'file' = 作業フォルダの中の HTML (headlenss が配信) / 'url' = dev server などの外部 URL */
   kind: 'url' | 'file';
   url: string;
+  /** 同じ宣言がグラス (G2) の一覧の対象でもあるか。閉じる確認の文言の出し分けに使う */
+  g2?: boolean;
 };
 
 /** タブ一覧のポーリング間隔。エージェントが成果物を足したら程なく現れればよい。 */

@@ -32,7 +32,7 @@ import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import type { Context } from 'hono';
-import { readDeclarations, showsOnWeb, tmuxSessionPaths } from './g2-plugins.ts';
+import { readDeclarations, removeDeclaration, showsOnWeb, tmuxSessionPaths } from './g2-plugins.ts';
 import { getSessionCwd } from './tmux.ts';
 
 /** tmux.ts の validateName と同じ規則 (セッション名はそのまま URL に載る) */
@@ -128,6 +128,12 @@ export type WebTab = {
   kind: 'url' | 'file';
   /** iframe / 別タブに渡す URL。ファイル型は `/preview/...?v=<mtime>` */
   url: string;
+  /**
+   * 同じ宣言がグラス (G2) の一覧の対象にもなっているか (URL 型で無指定 or `g2` 指定)。
+   * タブを閉じる確認で「グラスの一覧からも消える」と伝えるかどうかに使う。
+   * 疎通確認はしないので、いまグラスの一覧に実際に出ているかとは別。
+   */
+  g2: boolean;
 };
 
 /** tmux セッション名 → 作業フォルダ。一覧の cwd より tmux の pane を信じる。 */
@@ -162,7 +168,7 @@ export async function buildWebTabs(sessionName: string, sessionCwd: string): Pro
   for (const e of entries) {
     if (!showsOnWeb(e)) continue;
     if (e.kind === 'url') {
-      tabs.push({ name: e.name, kind: 'url', url: e.url });
+      tabs.push({ name: e.name, kind: 'url', url: e.url, g2: e.targets === null || e.targets.g2 });
       continue;
     }
     const abs = await resolveInside(sessionCwd, e.relPath);
@@ -179,6 +185,7 @@ export async function buildWebTabs(sessionName: string, sessionCwd: string): Pro
       name: e.name,
       kind: 'file',
       url: `${PREVIEW_PREFIX}/${encodeURIComponent(sessionName)}/${encodeRelPath(e.relPath)}?v=${mtime}`,
+      g2: false,
     });
   }
   return tabs;
@@ -199,6 +206,47 @@ export async function handleWebTabs(c: Context): Promise<Response> {
     return [] as WebTab[];
   });
   return c.json({ tabs });
+}
+
+/**
+ * DELETE /api/sessions/:name/webtabs/:entryName
+ *
+ * タブ (= 宣言 1 件) を閉じる。そのセッションの作業フォルダ直下の
+ * .headlenss-plugins.conf から該当する宣言行を削除する破壊的操作。
+ * 宣言ファイルを共有している G2 の一覧からも消える。
+ */
+export async function handleDeleteWebTab(c: Context): Promise<Response> {
+  const name = c.req.param('name') ?? '';
+  if (!SESSION_NAME_RE.test(name)) {
+    return c.json({ error: 'invalid session name (use [a-zA-Z0-9_-], max 40 chars)' }, 400);
+  }
+  const cwd = await resolveSessionCwd(name);
+  if (!cwd) return c.json({ error: 'session not found' }, 404);
+  return deleteWebTabFromRoot(c, name, cwd, c.req.param('entryName') ?? '');
+}
+
+/** 削除の本体 (セッション名 → フォルダの解決を済ませたあと)。テストから tmux 抜きで叩く用。 */
+export async function deleteWebTabFromRoot(
+  c: Context,
+  sessionName: string,
+  root: string,
+  entryName: string,
+): Promise<Response> {
+  if (!entryName) return c.json({ error: 'entry name is empty' }, 400);
+  let result: Awaited<ReturnType<typeof removeDeclaration>>;
+  try {
+    // Web のタブに出ている宣言だけを対象にする (グラス専用の宣言はこの口からは消さない)
+    result = await removeDeclaration(root, entryName, showsOnWeb);
+  } catch (e) {
+    console.warn(`[web-preview] ${sessionName}: 宣言の削除に失敗: ${(e as Error).message}`);
+    return c.json({ error: (e as Error).message }, 500);
+  }
+  if (result === 'not-found') return c.json({ error: 'tab not found' }, 404);
+  if (result === 'not-regular-file') {
+    return c.json({ error: '.headlenss-plugins.conf is not a regular file (symlink?); edit it by hand' }, 409);
+  }
+  const tabs = await buildWebTabs(sessionName, root).catch(() => [] as WebTab[]);
+  return c.json({ ok: true, tabs });
 }
 
 function sendHeaders(absPath: string, size: number): Record<string, string> {

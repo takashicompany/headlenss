@@ -1,12 +1,12 @@
 import { strict as assert } from 'node:assert';
 import { after, before, test } from 'node:test';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { mkdir, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Hono } from 'hono';
-import { resetG2PluginCache } from './g2-plugins.ts';
-import { buildWebTabs, resolveInside, servePreviewFromRoot } from './web-preview.ts';
+import { readDeclarations, removeEntryFromConfText, resetG2PluginCache } from './g2-plugins.ts';
+import { buildWebTabs, deleteWebTabFromRoot, resolveInside, servePreviewFromRoot } from './web-preview.ts';
 
 // テスト用の作業フォルダ。実ファイル・実シンボリックリンクで確かめる
 // (パストラバーサル対策は realpath まで見るので、モックでは意味がない)。
@@ -94,7 +94,8 @@ test('buildWebTabs: URL 型はそのまま、ファイル型は /preview の URL
   await writeConf(['dev = http://h:5173', 'レポート = report/index.html'].join('\n'));
   const tabs = await buildWebTabs('mysession', root);
   assert.equal(tabs.length, 2);
-  assert.deepEqual(tabs[0], { name: 'dev', kind: 'url', url: 'http://h:5173' });
+  assert.deepEqual(tabs[0], { name: 'dev', kind: 'url', url: 'http://h:5173', g2: true });
+  assert.equal(tabs[1].g2, false); // ファイル型はグラスに出ない
   assert.equal(tabs[1].name, 'レポート');
   assert.equal(tabs[1].kind, 'file');
   assert.match(tabs[1].url, /^\/preview\/mysession\/report\/index\.html\?v=\d+$/);
@@ -108,9 +109,9 @@ test('buildWebTabs: g2 だけを明示した URL は出さない (グラス専�
     'auto   = http://h:5176',
   ].join('\n'));
   assert.deepEqual(await buildWebTabs('mysession', root), [
-    { name: 'both', kind: 'url', url: 'http://h:5174' },
-    { name: 'onlyWeb', kind: 'url', url: 'http://h:5175' },
-    { name: 'auto', kind: 'url', url: 'http://h:5176' },
+    { name: 'both', kind: 'url', url: 'http://h:5174', g2: true },
+    { name: 'onlyWeb', kind: 'url', url: 'http://h:5175', g2: false },
+    { name: 'auto', kind: 'url', url: 'http://h:5176', g2: true },
   ]);
 });
 
@@ -245,4 +246,109 @@ test('配信: HEAD は本文なしで Content-Length を返す', async () => {
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('content-length'), String(Buffer.byteLength('<h1>report</h1>')));
   assert.equal(await res.text(), '');
+});
+
+// ── タブを閉じる (宣言行の削除) ───────────────────────────────────────────
+
+test('removeEntryFromConfText: 対象の行だけ消え、コメント・空行・他の行・CRLF は残る', () => {
+  const text = '# 先頭コメント\r\nA = http://a.example:1 web\r\n\r\n# B の説明\r\nB = report/index.html # 行末コメント\r\nC = http://c.example:3\r\n';
+  const out = removeEntryFromConfText(text, 'B');
+  assert.equal(out.removed, 1);
+  assert.equal(out.text, '# 先頭コメント\r\nA = http://a.example:1 web\r\n\r\n# B の説明\r\nC = http://c.example:3\r\n');
+  // 名前の前方一致・部分一致では消さない / コメント内の同名は消さない
+  const t2 = 'AB = x.html\n# A = y.html\nA = z.html\n';
+  assert.equal(removeEntryFromConfText(t2, 'A').text, 'AB = x.html\n# A = y.html\n');
+  // 無い名前なら何も変えない
+  assert.deepEqual(removeEntryFromConfText(t2, 'Z'), { text: t2, removed: 0 });
+});
+
+test('removeEntryFromConfText: 重複していた後ろの行もまとめて消す (繰り上がって復活しない)', () => {
+  const out = removeEntryFromConfText('A = a.html\nB = b.html\nA = other.html\n', 'A');
+  assert.equal(out.removed, 2);
+  assert.equal(out.text, 'B = b.html\n');
+});
+
+/** deleteWebTabFromRoot を実際のルートと同じパターンで叩く (URL デコードも込みで確かめる) */
+function makeDeleteApp(): Hono {
+  const app = new Hono();
+  app.delete('/api/sessions/:name/webtabs/:entryName', (c) =>
+    deleteWebTabFromRoot(c, c.req.param('name'), root, c.req.param('entryName')),
+  );
+  return app;
+}
+
+const del = (entry: string) =>
+  makeDeleteApp().request(`/api/sessions/s/webtabs/${encodeURIComponent(entry)}`, { method: 'DELETE' });
+
+test('タブ削除: 該当行だけが conf から消え、一覧からも消える', async () => {
+  const conf =
+    '# 成果物\nレポート 1 = report/index.html\nブラウザ確認 = http://127.0.0.1:9 web\n# 末尾コメント\n';
+  await writeConf(conf);
+  const res = await del('レポート 1');
+  assert.equal(res.status, 200);
+  const json = (await res.json()) as { ok: boolean; tabs: { name: string }[] };
+  assert.equal(json.ok, true);
+  assert.deepEqual(json.tabs.map((t) => t.name), ['ブラウザ確認']);
+  assert.equal(
+    await readFile(join(root, '.headlenss-plugins.conf'), 'utf-8'),
+    '# 成果物\nブラウザ確認 = http://127.0.0.1:9 web\n# 末尾コメント\n',
+  );
+  // キャッシュを手で捨てなくても、読み直した結果に反映されている
+  assert.deepEqual((await readDeclarations(root)).map((e) => e.name), ['ブラウザ確認']);
+  // 一時ファイルが残っていない
+  const leftovers = (await readdir(root)).filter((f) => f.includes('.tmp-'));
+  assert.deepEqual(leftovers, []);
+});
+
+test('タブ削除: 最後の 1 件を消しても conf ファイル自体は残る', async () => {
+  await writeConf('# だけ残る\nレポート = report/index.html\n');
+  assert.equal((await del('レポート')).status, 200);
+  assert.equal(await readFile(join(root, '.headlenss-plugins.conf'), 'utf-8'), '# だけ残る\n');
+});
+
+test('タブ削除: 存在しないエントリ・コメント内の名前・壊れた行・グラス専用は 404 で、conf は変わらない', async () => {
+  const conf = '# 消えない = report/index.html\nこわれた行\nG2専用 = http://127.0.0.1:9 g2\nレポート = report/index.html\n';
+  await writeConf(conf);
+  for (const name of ['無い', '消えない', 'こわれた行', 'G2専用', 'レポー']) {
+    const res = await del(name);
+    assert.equal(res.status, 404, `404 であるべき: ${name}`);
+  }
+  assert.equal(await readFile(join(root, '.headlenss-plugins.conf'), 'utf-8'), conf);
+});
+
+test('タブ削除: conf が無いフォルダは 404 で、ファイルを作らない', async () => {
+  await unlink(join(root, '.headlenss-plugins.conf')).catch(() => {});
+  resetG2PluginCache();
+  assert.equal((await del('レポート')).status, 404);
+  assert.equal((await readdir(root)).includes('.headlenss-plugins.conf'), false);
+});
+
+test('タブ削除: エントリ名にパスを書いても、書き込むのはフォルダ直下の conf だけ', async () => {
+  // フォルダの外に「conf らしきもの」を置いておき、触られないことを確かめる
+  const outsideConf = join(outside, '.headlenss-plugins.conf');
+  await writeFile(outsideConf, 'レポート = report/index.html\n');
+  const conf = 'レポート = report/index.html\n';
+  await writeConf(conf);
+  for (const name of ['../outside/.headlenss-plugins.conf', '../../etc/passwd', '/etc/passwd', '..']) {
+    const res = await del(name);
+    assert.equal(res.status, 404, `404 であるべき: ${name}`);
+  }
+  assert.equal(await readFile(join(root, '.headlenss-plugins.conf'), 'utf-8'), conf);
+  assert.equal(await readFile(outsideConf, 'utf-8'), 'レポート = report/index.html\n');
+  await unlink(outsideConf);
+});
+
+test('タブ削除: conf がシンボリックリンクなら書き換えずに 409 (リンク先も無傷)', async () => {
+  const target = join(outside, 'shared.conf');
+  await writeFile(target, 'レポート = report/index.html\n');
+  await unlink(join(root, '.headlenss-plugins.conf')).catch(() => {});
+  await symlink(target, join(root, '.headlenss-plugins.conf'));
+  resetG2PluginCache();
+  try {
+    assert.equal((await del('レポート')).status, 409);
+    assert.equal(await readFile(target, 'utf-8'), 'レポート = report/index.html\n');
+  } finally {
+    await unlink(join(root, '.headlenss-plugins.conf'));
+    await unlink(target);
+  }
 });

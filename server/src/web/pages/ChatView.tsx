@@ -8,7 +8,7 @@ import {
 } from 'react-ios-keyboard-viewport';
 import { extractImagesFromClipboard, filterImageFiles, uploadImage } from '../uploads.ts';
 import { useLanguage } from '../i18n.tsx';
-import { useWebTabs } from './SessionTabs.tsx';
+import { useWebTabs, type WebTab } from './SessionTabs.tsx';
 import { PreviewActions, PreviewStage, Tabstrip, useFrameReload } from './PreviewStage.tsx';
 
 type ChatMessage = { role: 'user' | 'assistant'; text: string; ts: number; synthetic?: boolean; origin?: 'ui' | 'external'; agent?: 'claude' | 'codex' };
@@ -696,6 +696,35 @@ export function ChatView({
     void refreshWebTabs();
   }, [tab, bumpReload, refreshWebTabs]);
 
+  // タブの × = 宣言ファイルから該当行を削除する (破壊的なので必ず確認を挟む)。
+  // 文言はグラスにも出ている宣言かどうかで出し分ける。
+  const closeWebTab = useCallback(
+    async (target: WebTab) => {
+      const msg = t(target.g2 ? 'previewCloseConfirmG2' : 'previewCloseConfirmWeb').replace('{name}', target.name);
+      if (!window.confirm(msg)) return;
+      try {
+        const res = await fetch(
+          `/api/sessions/${encodeURIComponent(sessionName)}/webtabs/${encodeURIComponent(target.name)}`,
+          { method: 'DELETE' },
+        );
+        if (!res.ok) {
+          const body = (await res.json().catch(() => ({}))) as { error?: string };
+          window.alert(t('previewCloseFailed') + (body.error ?? `HTTP ${res.status}`));
+          void refreshWebTabs();
+          return;
+        }
+      } catch (e) {
+        window.alert(t('previewCloseFailed') + (e as Error).message);
+        return;
+      }
+      // 開いていた iframe も閉じる。表示中だったならチャットのタブに戻す
+      setOpenedTabs((prev) => prev.filter((n) => n !== target.name));
+      if (tab === target.name) onSwitchTab(null);
+      void refreshWebTabs();
+    },
+    [t, sessionName, tab, onSwitchTab, refreshWebTabs],
+  );
+
   return (
     <div className={`page-session chat-view${webTabs.length > 0 ? ' chat-view--tabbed' : ''}`}>
       <header className="session-header">
@@ -1135,7 +1164,13 @@ export function ChatView({
 
       {/* タブ帯は画面のいちばん下 (親指で届く位置)。登録が無ければ出さない */}
       {webTabs.length > 0 && (
-        <Tabstrip tabs={webTabs} activeTab={tab} onSelect={onSwitchTab} stripRef={tabstripRef} />
+        <Tabstrip
+          tabs={webTabs}
+          activeTab={tab}
+          onSelect={onSwitchTab}
+          onClose={(tb) => void closeWebTab(tb)}
+          stripRef={tabstripRef}
+        />
       )}
     </div>
   );

@@ -150,12 +150,15 @@ export function Tabstrip({
   tabs,
   activeTab,
   onSelect,
+  onClose,
   stripRef,
 }: {
   tabs: WebTab[];
   /** null = チャットのタブを開いている */
   activeTab: string | null;
   onSelect: (name: string | null) => void;
+  /** 登録タブの × (宣言の削除)。確認は呼び出し側で行う */
+  onClose: (tab: WebTab) => void;
   /** 帯の実高さを測るため (「一番下へ」ボタンの位置に使う) */
   stripRef?: Ref<HTMLDivElement>;
 }) {
@@ -173,18 +176,33 @@ export function Tabstrip({
       </button>
       {tabs.map((tb) => {
         const on = tb.name === activeTab;
+        // × はタブの中の小さいボタン。タブの選択とは別のボタンにして、× を押しても
+        // タブが切り替わらないようにする (button の入れ子は不正なので外側は div)。
         return (
-          <button
-            key={tb.name}
-            type="button"
-            role="tab"
-            aria-selected={on}
-            title={tb.name}
-            className={`tab${on ? ' tab--on' : ''}`}
-            onClick={() => onSelect(tb.name)}
-          >
-            {tb.name}
-          </button>
+          <div key={tb.name} className={`tab tab--closable${on ? ' tab--on' : ''}`}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={on}
+              title={tb.name}
+              className="tab__label"
+              onClick={() => onSelect(tb.name)}
+            >
+              {tb.name}
+            </button>
+            <button
+              type="button"
+              className="tab__close"
+              title={t('previewClose')}
+              aria-label={`${t('previewClose')}: ${tb.name}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onClose(tb);
+              }}
+            >
+              ×
+            </button>
+          </div>
         );
       })}
     </div>

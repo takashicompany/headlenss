@@ -29,7 +29,7 @@ import {
 } from './session-status.ts';
 import { pruneScreenBlockObservations, resolveScreenBlocked } from './screen-block.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
-import { handleWebTabs, servePreview } from './web-preview.ts';
+import { handleDeleteWebTab, handleWebTabs, servePreview } from './web-preview.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIST = resolve(__dirname, '../../dist/web');
@@ -590,6 +590,8 @@ app.post('/api/sessions/:name/input', async (c) => {
 // Web UI 用に返す (URL 型 = dev server / PWA、ファイル型 = 作業フォルダの中の HTML)。
 // G2 の一覧 (/api/claude/sessions の g2Plugins) はグラス対象の URL 型だけなので、そちらとは別口。
 app.get('/api/sessions/:name/webtabs', handleWebTabs);
+// タブを閉じる = 宣言ファイルから該当行を削除する (破壊的。G2 の一覧からも消える)
+app.delete('/api/sessions/:name/webtabs/:entryName', handleDeleteWebTab);
 
 app.route('/api', claudeRouter);
 app.route('/api', codexRouter);
