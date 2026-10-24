@@ -228,6 +228,18 @@ const STRINGS = {
   g2NoticeRecFailAsr:  { en: 'Rec start failed (ASR)',               ja: '録音開始に失敗 (音声認識)' },
   g2NoticeRecFailMic:  { en: 'Rec start failed (mic)',               ja: '録音開始に失敗 (マイク)' },
   g2NoticeRecFail:     { en: 'Rec start failed',                     ja: '録音開始に失敗' },
+  // お気に入り (★) の付け外し。長押しは押した手応えが無いので、何が起きたかを必ず出す。
+  g2NoticeStarred:     { en: 'Starred: {name}',                      ja: '★ を付けました: {name}' },
+  g2NoticeUnstarred:   { en: 'Unstarred: {name}',                    ja: '★ を外しました: {name}' },
+  // ★ の切替が効く画面 (一覧 / セッションを開いている画面) の外でメニュー項目が
+  // 届いた時の案内。対象セッションが決まらないので何もできない、を伝える。
+  g2NoticeFavoriteNA:  { en: 'No session selected',                   ja: 'セッションが選ばれていません' },
+
+  // ─── G2 OS 長押しメニューの独自項目 (32 UTF-8 バイト以内) ────────────
+  // 「登録 / 解除」で出し分けないのは、menuObject が create/rebuild にしか載らず
+  // カーソル行ごとに文言を変えると 1 行動かすたびにページ再構築が要るため。
+  // 何が起きたかは実行後にフッタの一時通知で知らせる。
+  menuToggleFavorite:  { en: '★ Toggle favorite',                    ja: '★ お気に入り切替' },
 } as const
 
 export type StringKey = keyof typeof STRINGS

@@ -1,8 +1,11 @@
 import {
   CreateStartUpPageContainer,
+  MenuContainerProperty,
+  MenuItemProperty,
   RebuildPageContainer,
   TextContainerProperty,
   TextContainerUpgrade,
+  utf8ByteLength,
 } from '@evenrealities/even_hub_sdk'
 import type { EvenAppBridge } from '@evenrealities/even_hub_sdk'
 
@@ -35,6 +38,61 @@ export const LENS_LINE_HEIGHT = 27
 
 /** ブリッジ送信 1 回あたりの待ち上限 (ms)。 */
 const BRIDGE_SEND_TIMEOUT_MS = 5000
+
+/**
+ * OS の長押しメニュー (第 1 階層) に出す項目。
+ *
+ * menuObject は createStartUpPageContainer / rebuildPageContainer にしか載らない
+ * (textContainerUpgrade では差し替えられない) ので、内容を変えるにはページごと
+ * 組み直す必要がある。呼び出し側はそのコストを踏まえて「変わった時だけ」渡すこと。
+ * null / 空配列を渡すと menuObject を省略し、OS のデフォルトメニューに戻る。
+ */
+export type LensMenuItem = {
+  /** 0 は予約済み。同一メニュー内で一意な正の整数。 */
+  itemID: number
+  /** レンズに出る表示名。プロトコル上 32 UTF-8 バイトまで。 */
+  itemName: string
+}
+
+/** 表示名のプロトコル上限 (UTF-8 バイト)。 */
+const MENU_ITEM_NAME_MAX_BYTES = 32
+/** 1 つのメニューに置ける項目数の上限 (ファームウェア制約)。 */
+const MENU_MAX_ITEMS = 10
+
+/**
+ * メニュー項目を SDK の検証に必ず通る形へ丸める。
+ *
+ * なぜ落とさず丸めるか: 検証に落ちた menuObject を渡すと SDK は native を呼ぶ前に
+ * ページ全体を弾く (create は invalid、rebuild は false を返す)。つまり「メニューの
+ * 文言が 1 文字長い」だけでレンズに何も描かれなくなる。翻訳の差し替えで表示名が
+ * 伸びても本文の描画だけは死守する。
+ */
+function sanitizeMenuItems(items: LensMenuItem[]): MenuItemProperty[] {
+  const seen = new Set<number>()
+  const out: MenuItemProperty[] = []
+  for (const item of items) {
+    if (out.length >= MENU_MAX_ITEMS) {
+      logFn(`menu: 項目数が上限 (${MENU_MAX_ITEMS}) を超えたので以降を捨てます`)
+      break
+    }
+    if (!Number.isInteger(item.itemID) || item.itemID <= 0 || seen.has(item.itemID)) {
+      logFn(`menu: itemID が不正/重複のため捨てます (${item.itemID})`)
+      continue
+    }
+    seen.add(item.itemID)
+    let name = item.itemName
+    if (utf8ByteLength(name) > MENU_ITEM_NAME_MAX_BYTES) {
+      // 末尾から 1 文字ずつ削る (サロゲートペアを割らないよう Array.from で扱う)
+      const chars = Array.from(name)
+      while (chars.length > 0 && utf8ByteLength(chars.join('')) > MENU_ITEM_NAME_MAX_BYTES) chars.pop()
+      name = chars.join('')
+      logFn(`menu: 表示名が ${MENU_ITEM_NAME_MAX_BYTES} バイトを超えたので詰めました -> ${JSON.stringify(name)}`)
+    }
+    if (!name) continue
+    out.push(new MenuItemProperty({ itemID: item.itemID, itemName: name }))
+  }
+  return out
+}
 
 let bridge: EvenAppBridge | null = null
 let startupRendered = false
@@ -78,10 +136,14 @@ export function markPageAlreadyBuilt(): void {
   returnRebuildFallbackArmed = true
 }
 
-function scheduleReturnRedraw(config: {
+/** create / rebuild に渡すページ構成。menuObject を省略すると OS のデフォルトメニューに戻る。 */
+type PageConfig = {
   containerTotalNum: number
   textObject?: TextContainerProperty[]
-}): void {
+  menuObject?: MenuContainerProperty
+}
+
+function scheduleReturnRedraw(config: PageConfig): void {
   const seqAt = drawSeq
   window.setTimeout(() => {
     if (!bridge) return
@@ -187,13 +249,14 @@ export function resetPageState(): void {
   returnRebuildFallbackArmed = false
 }
 
-async function rebuildPage(config: {
-  containerTotalNum: number
-  textObject?: TextContainerProperty[]
-}): Promise<void> {
+async function rebuildPage(config: PageConfig): Promise<void> {
   if (!bridge) return
   const mainContent = config.textObject?.find((t) => t.containerID === 2)?.content ?? ''
   const previewLine = mainContent.split('\n')[0].slice(0, 40)
+  // どんな長押しメニューを載せて送ったかを毎回残す。メニューは create/rebuild でしか
+  // 差し替わらないので、「今レンズに出ているメニュー」はこの行でしか外から追えない。
+  const menuNames = config.menuObject?.menuItems?.map((m) => m.itemName ?? '') ?? []
+  console.log(`[renderer] menu=${JSON.stringify(menuNames)}`)
   drawSeq++
   // プラグインからの復帰直後: create は使えないので rebuild で全置き換えする。
   // 復帰フラグが古くて実は新規セッションだった場合、rebuild は拒否されるので
@@ -275,9 +338,24 @@ function footerContainer(footer: string): TextContainerProperty {
   })
 }
 
-export async function showScreen(header: string, content: string, footer: string): Promise<void> {
+/**
+ * ページ全体を組み直してレンズへ送る。
+ *
+ * @param menu OS 長押しメニューの項目。null / 空なら menuObject を省略し、
+ *             その画面では OS のデフォルトメニューに戻る (独自項目で上書きしない)。
+ */
+export async function showScreen(
+  header: string,
+  content: string,
+  footer: string,
+  menu: LensMenuItem[] | null = null,
+): Promise<void> {
+  const menuItems = menu && menu.length > 0 ? sanitizeMenuItems(menu) : []
   await rebuildPage({
     containerTotalNum: 4,
+    // 空の menuObject を渡すと「項目 0 個のメニュー」になりかねないので、
+    // 出す物が無い時はキーごと省略する (= デフォルトメニュー復帰)。
+    ...(menuItems.length > 0 ? { menuObject: new MenuContainerProperty({ menuItems }) } : {}),
     textObject: [
       evtContainer(),
       headerContainer(header),

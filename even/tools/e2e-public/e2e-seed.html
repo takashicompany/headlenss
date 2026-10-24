@@ -34,6 +34,8 @@
   }
   try { localStorage.setItem('headlenss_settings_v1', JSON.stringify(settings)) } catch (e) {}
   document.getElementById('out').textContent = 'seeded: ' + JSON.stringify(settings, null, 2)
-  location.replace('/')
+  // ?e2e=1 を残す。dev server + このフラグの時だけ、アプリがイベント注入口
+  // (src/e2e-input.ts) を開く。長押しはシミュレータの /api/input では送れないため。
+  location.replace('/?e2e=1')
 </script>
 </body>

@@ -233,3 +233,105 @@ test('空文の送信は追跡しない', () => {
   assert.equal(createDelivery(S, '   \n  ', T0), null);
   assert.equal(getDeliveryWarning(S, T0 + DELIVERY_ACK_TIMEOUT_MS), undefined);
 });
+
+// ───────── 入力欄に他の本文が残っていた場合 (実測バグの再現) ─────────
+//
+// 実測 (visionote / 2026-09-02):
+//   1 通目 (142 文字) は受理されて confirmed になったのに、その本文が
+//   エージェントの入力欄に残ったままだった。次に 2 通目 (11 文字) を送ると、
+//   エージェントは「1 通目 + CR + 2 通目」を 1 つのプロンプトとして受理し、
+//   フックの本文は 154 文字になった。完全一致しか見ていなかったため 2 通目は
+//   永久に確認されず、届いているのに「送信未確認」の警告が出続けた。
+
+test('入力欄に残っていた本文ごと受理されても、送った本文が含まれていれば確認できる', () => {
+  const stale = '前の送信が入力欄に残っていた本文';
+  const id = sent('なんでそうなったの', T0);
+  // フックが運ぶのは入力欄全体。CR は正規化で空白になる。
+  const res = confirmDelivery(
+    { tmuxName: S, text: `${stale}\rなんでそうなったの`, sessionId: 'cc1', turnId: 't1' },
+    T0 + 100,
+  );
+  assert.equal(res.origin, 'ui');
+  assert.equal(res.deliveryId, id);
+  assert.equal(getDeliveryState(S, id), 'confirmed');
+  assert.equal(getDeliveryWarning(S, T0 + DELIVERY_ACK_TIMEOUT_MS + 1_000), undefined);
+});
+
+test('送った本文が先頭に来る合成 (後からユーザが書き足した) でも確認できる', () => {
+  const id = sent('先に送った本文', T0);
+  const res = confirmDelivery(
+    { tmuxName: S, text: '先に送った本文\nユーザが後から書き足した分', sessionId: 'cc1', turnId: 't1' },
+    T0 + 100,
+  );
+  assert.equal(res.origin, 'ui');
+  assert.equal(getDeliveryState(S, id), 'confirmed');
+});
+
+test('複数の送信が 1 つのプロンプトにまとめて受理されたら、全部まとめて確認する', () => {
+  const first = sent('ひとつめ', T0, { queued: true });
+  const second = sent('ふたつめ', T0 + 500, { queued: true });
+  const res = confirmDelivery(
+    { tmuxName: S, text: 'ひとつめ\nふたつめ', sessionId: 'cc1', turnId: 't1' },
+    T0 + 1_000,
+  );
+  assert.equal(res.origin, 'ui');
+  assert.equal(getDeliveryState(S, first), 'confirmed');
+  assert.equal(getDeliveryState(S, second), 'confirmed');
+  assert.equal(getDeliveryWarning(S, T0 + DELIVERY_QUEUED_TTL_MS + 1), undefined);
+});
+
+test('まとめて受理されたうち、期限切れになっていた分は confirmed_late で拾う', () => {
+  const old = sent('古い方', T0);
+  // 8 秒で unconfirmed に落ちる
+  assert.deepEqual(getDeliveryWarning(S, T0 + DELIVERY_ACK_TIMEOUT_MS), { sentAt: T0 });
+  const res = confirmDelivery({ tmuxName: S, text: '書きかけ 古い方', sessionId: 'cc1', turnId: 't1' }, T0 + 20_000);
+  assert.equal(res.origin, 'ui');
+  assert.equal(getDeliveryState(S, old), 'confirmed_late');
+  assert.equal(getDeliveryWarning(S, T0 + 20_001), undefined);
+});
+
+test('同じ文面を 2 通送って ACK に 1 回しか現れなければ、確認するのは 1 通だけ', () => {
+  const first = sent('おなじ文面', T0);
+  const second = sent('おなじ文面', T0 + DELIVERY_DUP_WINDOW_MS + 1_000);
+  confirmDelivery({ tmuxName: S, text: '書きかけ おなじ文面', sessionId: 'cc1', turnId: 't1' }, T0 + DELIVERY_DUP_WINDOW_MS + 1_100);
+  assert.equal(getDeliveryState(S, first), 'confirmed');
+  assert.equal(getDeliveryState(S, second), 'awaiting_ack', '2 通目はまだ確認待ちのまま');
+  // 2 通目は届いていないので、期限が来れば警告が立つ (誤報を消すために本物まで消さない)
+  assert.deepEqual(
+    getDeliveryWarning(S, T0 + DELIVERY_DUP_WINDOW_MS + 1_000 + DELIVERY_ACK_TIMEOUT_MS),
+    { sentAt: T0 + DELIVERY_DUP_WINDOW_MS + 1_000 },
+  );
+});
+
+test('本文の一部にたまたま含まれるだけ (語の切れ目でない) では確認しない', () => {
+  const id = sent('やる', T0);
+  const res = confirmDelivery({ tmuxName: S, text: 'これはやるべきではない', sessionId: 'cc1', turnId: 't1' }, T0 + 100);
+  assert.equal(res.origin, 'external');
+  assert.equal(getDeliveryState(S, id), 'awaiting_ack');
+  assert.deepEqual(getDeliveryWarning(S, T0 + DELIVERY_ACK_TIMEOUT_MS), { sentAt: T0 });
+});
+
+test('届いていない送信は、無関係な本文の ACK が来ても未確認のまま警告が立つ', () => {
+  const id = sent('この本文は pane に飲まれた', T0);
+  confirmDelivery({ tmuxName: S, text: '利用者が直接打った別の本文', sessionId: 'cc1', turnId: 't1' }, T0 + 100);
+  assert.equal(getDeliveryState(S, id), 'awaiting_ack');
+  assert.deepEqual(getDeliveryWarning(S, T0 + DELIVERY_ACK_TIMEOUT_MS), { sentAt: T0 });
+});
+
+// ───────── レース: 注入報告より先に ACK が来る ─────────
+
+test('合成された ACK が markDeliveryInjected より先に届いても確認できる', () => {
+  const id = createDelivery(S, '後から送った本文', T0);
+  assert.ok(id);
+  // sendKeys 完了前 (= created のまま) にフックが着弾する
+  const res = confirmDelivery(
+    { tmuxName: S, text: '入力欄の残り\r後から送った本文', sessionId: 'cc1', turnId: 't1' },
+    T0 + 5,
+  );
+  assert.equal(res.origin, 'ui');
+  assert.equal(getDeliveryState(S, id), 'confirmed');
+  // 遅れて来た注入報告で巻き戻さない
+  markDeliveryInjected(S, id, { queued: false }, T0 + 10);
+  assert.equal(getDeliveryState(S, id), 'confirmed');
+  assert.equal(getDeliveryWarning(S, T0 + DELIVERY_ACK_TIMEOUT_MS + 1_000), undefined);
+});
