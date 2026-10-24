@@ -23,6 +23,9 @@ type Session = {
   agent?: 'claude' | 'codex';
   codexHookHealth?: CodexHookHealth;
   codexNeedsHookAttention?: boolean;
+  /** 対話ウィザード等が tmux の画面を占有していて、送ったメッセージが会話に届かない。
+   *  status は idle/busy のまま (正しい) なので、警告はこのフラグだけが根拠になる。 */
+  screenBlocked?: boolean;
   lastChat?: { role: 'user' | 'assistant'; text: string; ts: number; agent?: 'claude' | 'codex'; origin?: 'ui' | 'external' };
 };
 
@@ -413,6 +416,9 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
                       {cc && <span className={`cc-indicator cc-${status}`}> • {cc}</span>}
                       {agentOnly && <span className="agent-indicator"> • {agentOnly}</span>}
                       {codexHookLabel && <span className="codex-hook-warning"> • {codexHookLabel}</span>}
+                      {s.screenBlocked && (
+                        <span className="screen-blocked-warning" title={t('screenBlockedBody')}> • ⚠ {t('screenBlocked')}</span>
+                      )}
                     </span>
                   </button>
                   <button className="session-action" onClick={() => rename(s.name)} aria-label={t('renameSession')} title={t('renameSession')}>

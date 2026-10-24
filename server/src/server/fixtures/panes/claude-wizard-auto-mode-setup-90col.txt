@@ -1,0 +1,115 @@
+  の技術調査をサブエージェントに並列で任せます。                                          
+
+  (今回は理解・確認レベルの調査なのでClaude
+  Codeのみで進めます。設計フェーズに入る際にCodexへ依頼します)                            
+
+● 3 background agents launched (↓ to manage)                                              
+   ├ Agent (Hit and BlowをWeb調査)                                      
+   ├ Explore (make15の技術スタック調査)                                                   
+   └ Explore (even-jpフォルダの調査)              
+                                   
+● 3つの調査を並列で開始しました:    
+
+  1. ヒットアンドブローのルール調査 — Web調査(アソビ大全51版の仕様含む)
+  2. make15の技術調査 — 使用技術とEven G2向けの仕組み                                     
+  3. even-jpフォルダの調査 — プロジェクト概要とG2連携パターン                             
+
+  完了通知が届き次第、結果をまとめて報告します。                                          
+                                                                                      
+✻ Waiting for 3 background agents to finish                   
+
+● Agent "make15の技術スタック調査" finished · 1m 24s                                      
+
+● make15の調査が完了しました。残り2件(ヒットアンドブローのWeb調査、even-jpの調査)が終わり 
+  次第まとめて報告します。
+
+✻ Waiting for 2 background agents to finish                                           
+
+● Agent "even-jpフォルダの調査" finished · 1m 55s                                         
+
+● even-jpの調査も完了しました。残りはヒットアンドブローのWeb調査のみです。完了次第、3件ま 
+  とめて報告します。
+
+✻ Waiting for 1 background agent to finish                                            
+
+● Agent "Hit and BlowをWeb調査" finished · 5m 46s                                         
+
+● 3件の調査がすべて完了しました。まとめます。                                             
+
+  1. ヒットアンドブローの仕様                                                             
+
+  基本ルール(数字版 / Bulls and Cows)                                                     
+  - 出題者が決めた秘密の数字(通常4桁・重複なし)を推理して当てる
+  - 推理ごとに「ヒット=数字も位置も一致した個数」「ブロー=数字は含まれるが位置違いの個数」
+  が返る                                                                                  
+  - 全桁ヒットで正解。4桁重複なしなら理論上最大7手で解ける                                
+  - 根拠: https://en.wikipedia.org/wiki/Bulls_and_Cows
+
+  アソビ大全51版「ヒット&ブロー」                                                       
+  - 数字ではなく6色のピン(赤・青・黄・緑・白・ピンク)から4つの並びを当てるマスターマインド
+  形式                                                                                    
+  - 判定は赤ピン=ヒット、白ピン=ブロー(個数のみで位置は分からない)                        
+  - 推理は合計8回まで。「同じ色あり/なし」のオプションあり        
+  - 1〜2人用。2人(またはCPU戦)では同じ答えを交互に推理し、先に4ヒットを出した方が勝ち。相
+  手の推理と判定結果も見えるのが駆け引き要素                                             
+  - 根拠: https://www.nintendo.com/jp/switch/as7ta/games/                                 
+  (公式・人数/ジャンル)、8回制限や交互進行は https://gamefaqs.gamespot.com/switch/286602-c
+  lubhouse-games-51-worldwide-classics/faqs/78437/hit-and-blow
+  等の複数攻略記事で一致(公式ページには回数の明記なし)                                    
+
+  仕様上の注意点: 「同じ色あり」の場合、ブローは「色ごとに出現数の小さい方の合計 −
+  ヒット数」で数えるのが標準(マスターマインド判定)。重複ありにするかどうかで判定ロジックの
+  仕様が変わります。                                                                      
+
+  2. make15 の技術(ワークスホルダー配下)
+
+  Even G2向け2048系パズル「Make⑮」。TypeScript +
+  Vite、フレームワークなし、@evenrealities/even_hub_sdk でグラスと通信する構成です。      
+
+  - 構成: スマホ側WebView(設定・デバッグ)+
+  グラス側描画をブリッジ経由で行う。画面は576×288px                                       
+  - 描画: テキストコンテナ(Unicode文字で盤面描画)+ 1-bit
+  PNG画像。実機のコンテナ上限はテキスト8+画像4(シミュレーターはバグで4)
+  - 入力: タップ(クリック/ダブルクリック/前後スワイプ)+
+  IMUによる首振りジェスチャ(キャリブレーション+ヒステリシス実装済み)                      
+  - 開発フロー: npm run dev → QRでグラス接続、evenhub pack で .ehpk 化、GitHub
+  Pagesへデプロイ、headlenss連携済み                                                      
+  - handover.md に実機とシミュレーターの差異など重要な知見あり(2026-07-28更新)
+
+  3. even-jp の調査                                                                     
+
+  Even G2向け日本語プラグイン「イーブン」(ニュース/プラグイン一覧/Discordチャット)+     
+  Cloudflare Workersバックエンドのモノレポ。技術スタックはmake15とほぼ同じ(TS + Vite +
+  even_hub_sdk)で、こちらの方がSDKバージョンが新しい(^0.0.11)。
+
+  ヒットアンドブロー開発で特に参考になる点:
+  - app.json の権限whitelist(network/マイク)の書き方
+  - レンズ表示は物理上限1〜7行という制約(settings.ts)                                   
+  - G2マイク → Speechmatics STTの音声入力パターン(音声で数字/色をコールする遊び方も可能)
+  - docs/community-plugins.md の実機検証チェックリスト                                  
+
+  ---                                                                                     
+  次のステップの提案: ゲーム仕様(色版 or 数字版、1人用CPU対戦の有無、重複あり/なし、G2上で
+  の入力方式=タップ/首振り/音声)を決める設計フェーズに入る際は、グローバルルールに従いCode
+  xにも設計依頼を投げます。どう進めるか指示をください。                                  
+                                                                                          
+✻ Brewed for 6m 41s                                       
+
+❯ /auto-mode-setup                                                                        
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  Set up auto mode for your environment?                                       
+
+  Claude Code reads this project, your recent Claude sessions, and optionally your shell
+  history and other repositories. Claude analyzes this data and customizes auto mode to
+  make better decisions.
+
+    How you use Claude here    ◀ Mixed ▶
+  ❯ Also scan shell history    [ ]
+    Also scan your other repos [ ]
+
+    Continue
+
+  ←/→ to change usage · Enter to continue · Esc to cancel
+
+

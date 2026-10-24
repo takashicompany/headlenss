@@ -17,6 +17,12 @@ type Handlers = {
   onAudio: (pcm: Uint8Array) => void
   onForegroundEnter?: () => void
   onForegroundExit?: () => void
+  /**
+   * 異常終了 / OS 側からの終了通知。foreground exit と同じ後始末が要る
+   * (マイクや WebSocket を握ったまま消えるのを防ぐ)。
+   * 未指定なら onForegroundExit へ落とす。
+   */
+  onAppExit?: (kind: string) => void
   onLog?: (msg: string) => void
 }
 
@@ -93,7 +99,14 @@ export function onEvenHubEvent(event: EvenHubEvent): void {
       handlers.onForegroundExit?.()
       break
     case OsEventTypeList.ABNORMAL_EXIT_EVENT:
-    case OsEventTypeList.SYSTEM_EXIT_EVENT:
+    case OsEventTypeList.SYSTEM_EXIT_EVENT: {
+      // 黙殺していたが、この経路で終わるとマイクも WebSocket も握ったまま残る。
+      // foreground exit と同じ後始末を必ず通す。
+      const kind = eventType === OsEventTypeList.ABNORMAL_EXIT_EVENT ? 'abnormal exit' : 'system exit'
+      if (handlers.onAppExit) handlers.onAppExit(kind)
+      else handlers.onForegroundExit?.()
+      break
+    }
     case OsEventTypeList.IMU_DATA_REPORT:
       // 黙殺
       break

@@ -9,6 +9,7 @@ import type { EvenAppBridge } from '@evenrealities/even_hub_sdk'
 const DISPLAY_WIDTH = 576
 const DISPLAY_HEIGHT = 288
 const HEADER_HEIGHT = 32                                // ヘッダ (現在の phase タイトル)
+const HEADER_PADDING = 4                                // ヘッダの内側余白 (headerContainer と共有)
 const FOOTER_HEIGHT = 40                                // フッタ (操作ガイド)
 // 左眼で main container の上端 border (1px) が裁ち落とされる現象への対策で、
 // main を MAIN_TOP_INSET px だけ下にずらす。height はその分減らし、footer の位置は変えない。
@@ -26,6 +27,9 @@ const MAIN_BORDER = 1
 export const MAIN_INNER_WIDTH = DISPLAY_WIDTH - 2 * (MAIN_PADDING + MAIN_BORDER)
 /** main コンテナの実テキスト描画高さ (px)。 */
 export const MAIN_INNER_HEIGHT = CONTENT_HEIGHT - 2 * (MAIN_PADDING + MAIN_BORDER)
+/** header (containerID:4) の実テキスト描画幅 (px)。padding を四辺から引いた内側。
+ *  これより広いヘッダはレンズ側で裁ち落とされる (末尾から見えなくなる)。 */
+export const HEADER_INNER_WIDTH = DISPLAY_WIDTH - 2 * HEADER_PADDING
 /** LVGL の行の高さ (px, 固定)。@evenrealities/pretext の計測値準拠。 */
 export const LENS_LINE_HEIGHT = 27
 
@@ -95,23 +99,68 @@ function scheduleReturnRedraw(config: {
 }
 
 /**
+ * 時間切れで待つのをやめた送信の会計を、呼び出し元 (main.ts) に知らせるためのフック。
+ *
+ * なぜ要るか: withBridgeTimeout が reject しても SDK 側の処理は止まらない。
+ * 「こちらが待つのをやめただけで、まだ SDK に居座っているフレーム」が何本あるかは
+ * ここでしか分からないので、その数を外へ出す。呼び出し元はこれを使って
+ * 「詰まっている間は新規送信を見送る」背圧を掛ける。
+ *
+ *  onTimeout    … 時間切れで待つのをやめた (未決着が 1 本増えた)
+ *  onLateSettle … 諦めた後になって SDK 側が決着した (未決着が 1 本減った)
+ */
+export type BridgeStallHooks = {
+  onTimeout: (op: string) => void
+  onLateSettle: (op: string, ok: boolean) => void
+}
+let stallHooks: BridgeStallHooks = { onTimeout: () => {}, onLateSettle: () => {} }
+export function setRendererStallHooks(hooks: BridgeStallHooks): void {
+  stallHooks = hooks
+}
+
+/**
  * ブリッジ送信に上限時間を付ける。
  *
  * SDK 側の Promise が解決しないまま返ってこないと、呼び出し元 (main.ts) の
  * 送信ロックが解放されず、以降レンズが二度と更新されなくなる。
  * 時間切れ時は reject して呼び出し元にロックを解放させる。SDK 側の処理自体は
  * 止められないので、あくまで「こちらが待つのをやめる」ための保険。
+ *
+ * 待つのをやめた後も元の Promise は追い続け、遅れて決着したら報告する。
+ * 「まだ SDK に何本居座っているか」が分からないと、呼び出し元は詰まりの最中も
+ * 新規送信を積み続けてしまう (背圧が効かない)。
  */
 async function withBridgeTimeout<T>(op: string, p: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
+  // この送信の時間切れを会計に載せたか。1 回の送信は高々 1 本しか未決着にならない。
+  //
+  // なぜフラグが要るか: SDK の one-shot タイマーは ホストの __tickShadowTimers と
+  // 実タイマーの両方から発火しうる (timer-guard.ts 参照)。素直に書くと 1 本の送信で
+  // onTimeout が 2 回呼ばれ、未決着カウントが実際の 2 倍に膨らむ。決着しない送信では
+  // 減ることも無いので、送信 1 本で抑制の閾値 (2 本) に到達し、以後ずっと送信を
+  // 見送り続ける = レンズが更新されなくなる。
+  //
+  // timer-guard.ts で入口を塞いではいるが、あれは読み込み順に依存する対処なので、
+  // 会計が壊れると被害が大きいこの一点だけは自前でも冪等にしておく。
+  let counted = false
   try {
     return await Promise.race([
       p,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`bridge ${op} timed out after ${BRIDGE_SEND_TIMEOUT_MS}ms`)),
-          BRIDGE_SEND_TIMEOUT_MS,
-        )
+        timer = setTimeout(() => {
+          if (!counted) {
+            counted = true
+            stallHooks.onTimeout(op)
+            // 諦めた本数を後で戻せるよう、元の Promise の決着だけは見届ける。
+            // (never settle なら永久に減らないが、それが実態なので会計としては正しい。
+            //  飢餓しないよう、呼び出し元はバックオフ後に必ず 1 本試す。)
+            p.then(
+              () => stallHooks.onLateSettle(op, true),
+              () => stallHooks.onLateSettle(op, false),
+            )
+          }
+          reject(new Error(`bridge ${op} timed out after ${BRIDGE_SEND_TIMEOUT_MS}ms`))
+        }, BRIDGE_SEND_TIMEOUT_MS)
       }),
     ])
   } finally {
@@ -208,7 +257,7 @@ function headerContainer(text: string): TextContainerProperty {
     width: DISPLAY_WIDTH,
     height: HEADER_HEIGHT,
     isEventCapture: 0,
-    paddingLength: 4,
+    paddingLength: HEADER_PADDING,
   })
 }
 
@@ -293,6 +342,9 @@ export async function updateHeader(header: string): Promise<void> {
 export async function updateFooter(footer: string): Promise<void> {
   if (!bridge) return
   drawSeq++ // 差分描画もガード再描画のスキップ判定に数える (数えないと復帰後に古いフレームで上書きされる)
+  // header/content と同じ書式で出す。3 コンテナの送信本数を同じ物差しで数えられるようにする
+  // (どのコンテナが実際に BLE へ流れたかは、この 3 行の時系列でしか外から確かめられない)。
+  console.log(`[renderer] textContainerUpgrade #3 (footer: "${footer.slice(0, 40)}")`)
   await withBridgeTimeout(
     'textContainerUpgrade #3',
     bridge.textContainerUpgrade(

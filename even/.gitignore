@@ -4,3 +4,4 @@ dist
 qr_dev.png
 .DS_Store
 tools/e2e-out
+.headlenss-plugins.conf

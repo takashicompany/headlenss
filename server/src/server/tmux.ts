@@ -319,6 +319,47 @@ export async function sendKeys(name: string, text: string, submit = false): Prom
   }
 }
 
+/** bracketed paste に使う一時バッファ名の連番 (ユーザのバッファと衝突させない)。 */
+let pasteBufferSeq = 0;
+
+/**
+ * 本文を「貼り付け」として流し込む (bracketed paste)。
+ *
+ * なぜ必要か (issue #73):
+ *   `send-keys -l` は本文を 1 文字ずつのキーイベントとして pane に流す。Codex TUI は
+ *   「短い間隔で連続到達した文字列は貼り付け」とみなす判定を持っており、その判定が
+ *   続いている間に届いた復帰 (C-m) を「貼り付け内の改行」として composer に入れてしまう。
+ *   TUI 側は流し込まれた文字を自分のペースで処理するため (長文だと数秒〜十数秒かかる)、
+ *   送信側が待ち時間を延ばしても C-m は判定の途中に着弾する。実測でも 500ms / 2000ms 待って
+ *   なお送信されず、本文だけが composer に残った。
+ *
+ *   bracketed paste で包むと、本文は「1 個の貼り付けイベント」として渡り、終端
+ *   (ESC[201~) の後に来る C-m は貼り付けの一部になりようがない = 確実に送信になる。
+ *
+ * 実装:
+ *   tmux の `paste-buffer -p` に任せる。`-p` は「pane 内のアプリが bracketed paste を
+ *   要求している時だけ」ESC[200~ / ESC[201~ で包む。要求していない相手 (素の cat 等) には
+ *   素のテキストがそのまま届くので、対応していない TUI に化けたエスケープが流れ込む心配がない。
+ *   バッファは専用の名前で作り、`-d` で貼り付け後に破棄する (失敗時も明示的に消す)。
+ */
+export async function sendTextAsPaste(name: string, text: string): Promise<void> {
+  if (text.length === 0) return;
+  const target = await agentTarget(name);
+  const buffer = `headlenss-paste-${process.pid}-${++pasteBufferSeq}`;
+  await exec('tmux', ['set-buffer', '-b', buffer, '--', text], { timeout: TMUX_EXEC_TIMEOUT_MS });
+  try {
+    await exec('tmux', ['paste-buffer', '-p', '-d', '-b', buffer, '-t', target], {
+      timeout: TMUX_EXEC_TIMEOUT_MS,
+    });
+  } catch (e) {
+    // 貼り付けに失敗したらバッファが残るので明示的に片付ける (名前が溜まり続けるのを防ぐ)。
+    try {
+      await exec('tmux', ['delete-buffer', '-b', buffer], { timeout: TMUX_EXEC_TIMEOUT_MS });
+    } catch { /* ignore */ }
+    throw e;
+  }
+}
+
 export async function sendKey(name: string, key: string): Promise<void> {
   if (!/^[A-Za-z0-9_+-]+$/.test(key)) throw new Error('invalid key');
   const target = await agentTarget(name);
