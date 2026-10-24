@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
@@ -19,12 +20,37 @@ const CONFIG_DIR = process.env.XDG_CONFIG_HOME
   : resolve(homedir(), '.config/headlenss');
 const SNAPSHOT_PATH = resolve(CONFIG_DIR, 'sessions.json');
 
+/**
+ * Codex セッションの会話表示を再起動越しに復元するための最小情報。
+ *
+ * なぜ必要か: Codex の会話中身は「フックが通知した transcriptPath」からしか読めず、
+ * その値はメモリ上の store にしか無い。サーバを再起動すると store が空になるため、
+ * 次の Codex フックが届くまで会話が空表示になっていた (実機で再現)。
+ * Claude 側は cwd + ccSessionId から transcript を再検出できるのでここには入れない。
+ */
+type CodexSnapshot = {
+  ccSessionId: string;
+  tmuxPane: string;
+  cwd: string;
+  transcriptPath: string;
+};
+
 type SnapshotEntry = {
   tmuxSessionName: string;
   cwd: string;
   hasClaude: boolean;
+  /** source='codex' の store エントリがあった時だけ付く (省略可能な追加フィールド)。 */
+  codex?: CodexSnapshot;
 };
 
+/**
+ * version は 1 のまま据え置く。
+ * codex は「あれば使う」だけの追加フィールドで、
+ *   - 旧バージョンが書いた codex 無しのファイルを新コードが読める (前方互換)
+ *   - 新コードが書いたファイルを旧バージョンが読める (codex を無視するだけ = 後方互換)
+ * の双方が成り立つため。version を上げると、切り戻した旧コードが
+ * `version !== 1` で全エントリを捨て、tmux セッションの復元ごと失う。
+ */
 type SnapshotFile = {
   version: 1;
   savedAt: number;
@@ -68,6 +94,25 @@ async function readTmuxSnapshot(): Promise<Map<string, string> | null> {
 }
 
 /**
+ * store から Codex セッションの復元情報を集める (会話表示に要る最小限)。
+ * transcriptPath が無いものは復元しても意味が無いので落とす。
+ * export しているのはテスト用 (save 経路は tmux を叩くのでユニットテストで回せない)。
+ */
+export function collectCodexSnapshots(): Map<string, CodexSnapshot> {
+  const byName = new Map<string, CodexSnapshot>();
+  for (const s of claudeStore.listSessions()) {
+    if (s.source !== 'codex' || !s.transcriptPath) continue;
+    byName.set(s.tmuxSessionName, {
+      ccSessionId: s.ccSessionId,
+      tmuxPane: s.tmuxPane,
+      cwd: s.cwd,
+      transcriptPath: s.transcriptPath,
+    });
+  }
+  return byName;
+}
+
+/**
  * 現在の tmux 状態 + claude セッション情報をスナップショットファイルに書き出す。
  * tmux 異常時は既存ファイルを上書きしない (空で潰さない)。書き込みは tmp → rename で原子化。
  */
@@ -107,13 +152,17 @@ export async function saveSnapshot(): Promise<void> {
   // 過去にあった「初回登録時の cwd を維持」設計は、Web UI から cwd 未指定で
   // 立てた瞬間に HOME が固定化され、後からユーザが正しい場所に cd しても反映
   // されない問題を起こしたため撤回した (8693827 を revert)。
+  const codexByName = collectCodexSnapshots();
   const sessions: SnapshotEntry[] = [];
   for (const [name, currentCwd] of tmuxMap) {
-    sessions.push({
+    const entry: SnapshotEntry = {
       tmuxSessionName: name,
       cwd: currentCwd,
       hasClaude: claudeNames.has(name),
-    });
+    };
+    const codex = codexByName.get(name);
+    if (codex) entry.codex = codex;
+    sessions.push(entry);
   }
 
   const file: SnapshotFile = {
@@ -132,17 +181,56 @@ export async function saveSnapshot(): Promise<void> {
   }
 }
 
+/** codex フィールドの形を検証する。壊れていれば undefined (エントリ自体は捨てない)。 */
+function parseCodexSnapshot(raw: unknown): CodexSnapshot | undefined {
+  const c = raw as Partial<CodexSnapshot> | undefined;
+  if (!c || typeof c !== 'object') return undefined;
+  if (typeof c.transcriptPath !== 'string' || !c.transcriptPath) return undefined;
+  return {
+    ccSessionId: typeof c.ccSessionId === 'string' ? c.ccSessionId : '',
+    tmuxPane: typeof c.tmuxPane === 'string' ? c.tmuxPane : '',
+    cwd: typeof c.cwd === 'string' ? c.cwd : '',
+    transcriptPath: c.transcriptPath,
+  };
+}
+
+/**
+ * スナップショット JSON を SnapshotEntry[] にする。
+ * codex を持たない旧形式もそのまま読める (codex は undefined になるだけ)。
+ * export しているのはテスト用。
+ */
+export function parseSnapshot(raw: string): SnapshotEntry[] {
+  let parsed: SnapshotFile;
+  try {
+    parsed = JSON.parse(raw) as SnapshotFile;
+  } catch {
+    return [];
+  }
+  if (parsed?.version !== 1 || !Array.isArray(parsed.sessions)) return [];
+  const entries: SnapshotEntry[] = [];
+  for (const e of parsed.sessions) {
+    if (
+      typeof e?.tmuxSessionName !== 'string' ||
+      typeof e?.cwd !== 'string' ||
+      typeof e?.hasClaude !== 'boolean'
+    ) {
+      continue;
+    }
+    const entry: SnapshotEntry = {
+      tmuxSessionName: e.tmuxSessionName,
+      cwd: e.cwd,
+      hasClaude: e.hasClaude,
+    };
+    const codex = parseCodexSnapshot(e.codex);
+    if (codex) entry.codex = codex;
+    entries.push(entry);
+  }
+  return entries;
+}
+
 async function loadSnapshot(): Promise<SnapshotEntry[]> {
   try {
-    const raw = await readFile(SNAPSHOT_PATH, 'utf-8');
-    const parsed = JSON.parse(raw) as SnapshotFile;
-    if (parsed.version !== 1 || !Array.isArray(parsed.sessions)) return [];
-    return parsed.sessions.filter(
-      (e): e is SnapshotEntry =>
-        typeof e?.tmuxSessionName === 'string' &&
-        typeof e?.cwd === 'string' &&
-        typeof e?.hasClaude === 'boolean',
-    );
+    return parseSnapshot(await readFile(SNAPSHOT_PATH, 'utf-8'));
   } catch {
     return [];
   }
@@ -182,9 +270,15 @@ async function restoreSessionsImpl(): Promise<void> {
     `[persist] restoring ${entries.length} session(s) from ${SNAPSHOT_PATH}`,
   );
 
+  // tmux セッションとして存在する (= 既に居た or 今作れた) 名前。
+  // Codex の store 復元はここに載った名前だけに限る (存在しない tmux の
+  // 幽霊エントリを store に足さない)。
+  const liveNames = new Set<string>();
+
   for (const entry of entries) {
     if (existing.has(entry.tmuxSessionName)) {
       console.log(`[persist] skip ${entry.tmuxSessionName} (already running)`);
+      liveNames.add(entry.tmuxSessionName);
       continue;
     }
     console.log(
@@ -195,11 +289,57 @@ async function restoreSessionsImpl(): Promise<void> {
         cwd: entry.cwd || undefined,
         startClaude: entry.hasClaude,
       });
+      liveNames.add(entry.tmuxSessionName);
     } catch (e) {
       console.warn(
         `[persist] restore ${entry.tmuxSessionName} failed: ${(e as Error).message}`,
       );
     }
+  }
+
+  restoreCodexStoreEntries(entries, liveNames);
+}
+
+/**
+ * スナップショットの codex 情報を store に戻す。
+ *
+ * これが無いと、サーバ再起動後は次の Codex フックが届くまで会話表示が空になる。
+ * 復元するのは「表示のための材料」だけで、status は idle・chat は空のまま
+ * (会話本体は transcript から読む)。
+ *
+ * 復元しない条件:
+ *   - tmux セッションが存在しない (liveNames に無い)
+ *   - transcript ファイルが実在しない (消えた古いセッションを復活させない)
+ *   - 既に store にエントリがある (復元中に届いたフックを上書きしない)
+ *
+ * 「実は今 Claude が動いている pane」への誤表示は、復元された source='codex' の
+ * store を live owner と突き合わせる既存ガード (claude/router.ts の isStoreStale)
+ * が引き続き抑止する。ここでは store を足すだけで、その判定には手を入れない。
+ */
+export function restoreCodexStoreEntries(
+  entries: readonly SnapshotEntry[],
+  liveNames: ReadonlySet<string>,
+): void {
+  for (const entry of entries) {
+    const codex = entry.codex;
+    if (!codex) continue;
+    if (!liveNames.has(entry.tmuxSessionName)) continue;
+    if (!existsSync(codex.transcriptPath)) {
+      console.log(
+        `[persist] skip codex restore ${entry.tmuxSessionName} (transcript missing)`,
+      );
+      continue;
+    }
+    if (claudeStore.getSession(entry.tmuxSessionName)) continue;
+    claudeStore.upsertSession({
+      ccSessionId: codex.ccSessionId,
+      tmuxPane: codex.tmuxPane,
+      tmuxSessionName: entry.tmuxSessionName,
+      cwd: codex.cwd || entry.cwd,
+      source: 'codex',
+      transcriptPath: codex.transcriptPath,
+    });
+    console.log(`[persist] codex store restored ${entry.tmuxSessionName}`);
   }
 }
 
