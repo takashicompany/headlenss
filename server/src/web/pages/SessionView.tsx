@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import { extractImagesFromClipboard, filterImageFiles, uploadImage } from '../uploads.ts';
+import { UPLOAD_ACCEPT, extractUploadableFromClipboard, filterUploadableFiles, uploadErrorMessage, uploadFile } from '../uploads.ts';
 import { useLanguage } from '../i18n.tsx';
 
 // 新WSプロトコル (server/pty.ts と対応):
@@ -79,10 +79,11 @@ export function SessionView({
     try {
       for (const f of files) {
         try {
-          const r = await uploadImage(f);
+          const r = await uploadFile(f);
           sendInputRef.current?.(`@${r.path} `);
         } catch (e) {
-          setUploadError(`${t('uploadFailedPrefix')}: ${(e as Error).message}`);
+          const msg = uploadErrorMessage(e, (mb) => t('uploadTooLarge').replace('{mb}', String(mb)));
+          setUploadError(`${t('uploadFailedPrefix')}: ${msg}`);
         }
       }
     } finally {
@@ -269,7 +270,7 @@ export function SessionView({
     const onContainerPaste = (e: ClipboardEvent) => {
       const cd = e.clipboardData;
       if (!cd) return;
-      const images = extractImagesFromClipboard(cd.items);
+      const images = extractUploadableFromClipboard(cd.items);
       if (images.length === 0) return;
       e.preventDefault();
       e.stopPropagation();
@@ -286,7 +287,7 @@ export function SessionView({
     };
     const onDrop = (e: DragEvent) => {
       if (!e.dataTransfer) return;
-      const images = filterImageFiles(e.dataTransfer.files);
+      const images = filterUploadableFiles(e.dataTransfer.files);
       if (images.length === 0) return;
       e.preventDefault();
       void handleImageFiles(images);
@@ -376,12 +377,12 @@ export function SessionView({
         <input
           ref={fileInputRef}
           type="file"
-          accept="image/*"
+          accept={UPLOAD_ACCEPT}
           multiple
           style={{ display: 'none' }}
           onChange={(e) => {
             if (e.target.files) {
-              void handleImageFiles(filterImageFiles(e.target.files));
+              void handleImageFiles(filterUploadableFiles(e.target.files));
             }
             e.target.value = '';
           }}

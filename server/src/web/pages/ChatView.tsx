@@ -6,7 +6,7 @@ import {
   useFixedStyleWithIOsKeyboard,
   useIOsKeyboardHeight,
 } from 'react-ios-keyboard-viewport';
-import { extractImagesFromClipboard, filterImageFiles, uploadImage } from '../uploads.ts';
+import { UPLOAD_ACCEPT, extractUploadableFromClipboard, filterUploadableFiles, uploadErrorMessage, uploadFile } from '../uploads.ts';
 import { useLanguage } from '../i18n.tsx';
 import { useWebTabs, type WebTab } from './SessionTabs.tsx';
 import { PreviewActions, PreviewStage, Tabstrip, useFrameReload } from './PreviewStage.tsx';
@@ -48,13 +48,17 @@ type CodexHookHealth = {
 
 /** 表示用前処理: `@/tmp/headlenss-uploads/<file>` を見つけたら markdown image
  *  記法 `![](/api/uploads/<file>)` に置き換え、チャットバブル内でインライン
- *  画像として表示できるようにする。
+ *  画像として表示できるようにする。動画は <img> で表示できないのでリンクにする。
  *  Claude Code が読む元の文字列(transcript / hook 由来)は path のままなので、
  *  画像参照の意味は壊さない。 */
+const VIDEO_EXT_RE = /\.(mp4|mov|webm|m4v|mkv|3gp|avi|mpeg|mpg)$/i;
 function inlineUploadedImages(text: string): string {
   return text.replace(
     /@(\/tmp\/headlenss-uploads\/([a-zA-Z0-9._-]+))/g,
-    (_match, _full: string, filename: string) => `![](/api/uploads/${filename})`,
+    (_match, _full: string, filename: string) =>
+      VIDEO_EXT_RE.test(filename)
+        ? `[🎬 ${filename}](/api/uploads/${filename})`
+        : `![](/api/uploads/${filename})`,
   );
 }
 
@@ -520,10 +524,11 @@ export function ChatView({
     try {
       for (const f of files) {
         try {
-          const r = await uploadImage(f);
+          const r = await uploadFile(f);
           insertAtCursor(`@${r.path} `);
         } catch (e) {
-          setError(`${t('uploadFailedPrefix')} (${f.name}): ${(e as Error).message}`);
+          const msg = uploadErrorMessage(e, (mb) => t('uploadTooLarge').replace('{mb}', String(mb)));
+          setError(`${t('uploadFailedPrefix')} (${f.name}): ${msg}`);
         }
       }
     } finally {
@@ -532,11 +537,25 @@ export function ChatView({
   }, [insertAtCursor, t]);
 
   const onPaste = useCallback(async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const images = extractImagesFromClipboard(e.clipboardData.items);
-    if (images.length > 0) {
+    const files = extractUploadableFromClipboard(e.clipboardData.items);
+    if (files.length > 0) {
       e.preventDefault();
-      await handleImageFiles(images);
+      await handleImageFiles(files);
     }
+  }, [handleImageFiles]);
+
+  // 入力欄へのドラッグ&ドロップ (画像・動画)
+  const onDragOver = useCallback((e: React.DragEvent<HTMLTextAreaElement>) => {
+    if (Array.from(e.dataTransfer.items).some((it) => it.kind === 'file')) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    }
+  }, []);
+  const onDrop = useCallback((e: React.DragEvent<HTMLTextAreaElement>) => {
+    const files = filterUploadableFiles(e.dataTransfer.files);
+    if (files.length === 0) return;
+    e.preventDefault();
+    void handleImageFiles(files);
   }, [handleImageFiles]);
 
   // pending への応答送信
@@ -1124,12 +1143,12 @@ export function ChatView({
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/*"
+            accept={UPLOAD_ACCEPT}
             multiple
             style={{ display: 'none' }}
             onChange={(e) => {
               if (e.target.files) {
-                void handleImageFiles(filterImageFiles(e.target.files));
+                void handleImageFiles(filterUploadableFiles(e.target.files));
               }
               e.target.value = '';
             }}
@@ -1140,6 +1159,8 @@ export function ChatView({
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKeyDown}
             onPaste={onPaste}
+            onDragOver={onDragOver}
+            onDrop={onDrop}
             placeholder={uploading ? t('uploadingEllipsis') : t('messageInputPlaceholder')}
             rows={1}
             disabled={sending}

@@ -11,7 +11,7 @@ const STRINGS = {
   // ── 共通 ──
   back:                   { en: '← Back',  ja: '← 戻る' },
   viewMode:               { en: 'View mode', ja: '表示モード' },
-  attachImage:            { en: 'Attach image', ja: '画像を添付' },
+  attachImage:            { en: 'Attach image or video', ja: '画像・動画を添付' },
 
   // ── SessionList ──
   appSubtitle:            { en: 'tmux sessions', ja: 'tmux セッション' },
@@ -124,6 +124,7 @@ const STRINGS = {
   // ── ChatView: errors ──
   sendErrorPrefix:        { en: 'Send error', ja: '送信エラー' },
   uploadFailedPrefix:     { en: 'Upload failed', ja: 'アップロード失敗' },
+  uploadTooLarge:         { en: 'File is too large (max {mb} MB)', ja: 'ファイルが大きすぎます (上限 {mb}MB)' },
   respondFailedPrefix:    { en: 'Failed to send response', ja: '応答送信失敗' },
   unansweredQuestions:    { en: 'There are unanswered questions', ja: '未回答の質問があります' },
 
@@ -131,15 +132,15 @@ const STRINGS = {
   uploadingEllipsis:      { en: 'Uploading…', ja: 'アップロード中…' },
   messageInputPlaceholder:{ en: 'Type a message (PC: Enter to send / Shift+Enter for newline; mobile: use the send button)',
                             ja: 'メッセージを入力 (PCはEnter送信/Shift+Enter改行、スマホは送信ボタン)' },
-  attachImageTitlePaste:  { en: 'Attach image (paste also works)', ja: '画像を添付 (ペーストもOK)' },
+  attachImageTitlePaste:  { en: 'Attach image or video (paste, drag & drop also work)', ja: '画像・動画を添付 (ペースト・ドラッグ&ドロップもOK)' },
 
   // ── Split view ──
   splitView:              { en: 'Split view', ja: '分割表示' },
   splitDividerTitle:      { en: 'Drag to resize / double-click to reset', ja: 'ドラッグで幅を調整 / ダブルクリックでリセット' },
 
   // ── SessionView ──
-  attachImageTitleDnd:    { en: 'Attach image (paste, drag & drop also work)',
-                            ja: '画像を添付 (ペースト・ドラッグ&ドロップもOK)' },
+  attachImageTitleDnd:    { en: 'Attach image or video (paste, drag & drop also work)',
+                            ja: '画像・動画を添付 (ペースト・ドラッグ&ドロップもOK)' },
   fitToScreen:            { en: 'Fit to screen', ja: 'この画面に合わせる' },
   fitToScreenTitle:       { en: 'Re-fit the display to this screen size',
                             ja: 'この画面サイズに合わせて表示し直す' },

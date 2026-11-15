@@ -30,6 +30,7 @@ import {
 import { pruneScreenBlockObservations, resolveScreenBlocked } from './screen-block.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
 import { handleDeleteWebTab, handleWebTabs, servePreview } from './web-preview.ts';
+import { EXT_TO_MIME, MIME_TO_EXT, UploadTooLargeError, getUploadMaxBytes, readBodyWithLimit } from './uploads.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIST = resolve(__dirname, '../../dist/web');
@@ -596,24 +597,13 @@ app.delete('/api/sessions/:name/webtabs/:entryName', handleDeleteWebTab);
 app.route('/api', claudeRouter);
 app.route('/api', codexRouter);
 
-// ───────── 画像アップロード (Web UI → Claude Code) ─────────
+// ───────── 画像・動画アップロード (Web UI → Claude Code) ─────────
 //
 // 来たバイナリを tmp に保存して path を返すだけ。形式チェックや圧縮は Claude Code 側に任せる。
 // (拡張子は Content-Type / X-Filename ヘッダから決める。不明なら .bin)
+// 1 件あたりのサイズ上限あり (既定 200MB、超過は 413)。上限と MIME 表は ./uploads.ts。
 const UPLOAD_DIR = resolve(tmpdir(), 'headlenss-uploads');
 const UPLOAD_TTL_MS = 60 * 60 * 1000;
-
-const MIME_TO_EXT: Record<string, string> = {
-  'image/png': 'png',
-  'image/jpeg': 'jpg',
-  'image/jpg': 'jpg',
-  'image/webp': 'webp',
-  'image/gif': 'gif',
-  'image/heic': 'heic',
-  'image/avif': 'avif',
-  'image/bmp': 'bmp',
-  'image/svg+xml': 'svg',
-};
 
 async function ensureUploadDir(): Promise<void> {
   await mkdir(UPLOAD_DIR, { recursive: true });
@@ -637,7 +627,16 @@ ensureUploadDir().catch(() => { /* ignore */ });
 setInterval(() => { void cleanupOldUploads(); }, 30 * 60 * 1000);
 
 app.post('/api/uploads', async (c) => {
-  const buf = Buffer.from(await c.req.arrayBuffer());
+  const limit = getUploadMaxBytes();
+  let buf: Buffer;
+  try {
+    buf = await readBodyWithLimit(c.req.raw, limit);
+  } catch (e) {
+    if (e instanceof UploadTooLargeError) {
+      return c.json({ error: 'file too large', code: 'too_large', maxBytes: limit }, 413);
+    }
+    throw e;
+  }
   if (buf.length === 0) return c.json({ error: 'empty body' }, 400);
   const ct = (c.req.header('content-type') ?? '').split(';')[0].trim().toLowerCase();
   // 拡張子の決定優先順: Content-Type → X-Filename ヘッダ → 'bin'
@@ -655,20 +654,8 @@ app.post('/api/uploads', async (c) => {
   return c.json({ path, bytes: buf.length });
 });
 
-// アップロード済画像の配信 (chat UI で `@/tmp/headlenss-uploads/...` を
-// インライン画像表示するために必要)。
-const EXT_TO_MIME: Record<string, string> = {
-  png: 'image/png',
-  jpg: 'image/jpeg',
-  jpeg: 'image/jpeg',
-  webp: 'image/webp',
-  gif: 'image/gif',
-  heic: 'image/heic',
-  avif: 'image/avif',
-  bmp: 'image/bmp',
-  svg: 'image/svg+xml',
-};
-
+// アップロード済ファイルの配信 (chat UI で `@/tmp/headlenss-uploads/...` を
+// インライン画像表示 / 動画リンクにするために必要)。
 app.get('/api/uploads/:filename', (c) => {
   const filename = c.req.param('filename');
   // path traversal 防止: filename は単一パス要素のみ許可
