@@ -38,6 +38,7 @@ import { fetchTargetHtml, isDocumentReplaced, isProxyInjected, performTakeover }
 import {
   HeadlenssClient,
   PendingConflictError,
+  PromptSendError,
   RespondInterruptedError,
   type AgentSource,
   type ChatItem,
@@ -195,7 +196,7 @@ const logEl = document.getElementById('log') as HTMLPreElement
 //   boot → (設定済) → rootlist ──click──> idle (selected session)
 //                                     ↑doubleClick (戻る)
 //   idle ──click──> recording ──click──> pending ──↑scroll──> sending ──> idle
-//                                              └──↓scroll──> idle (破棄)
+//                                              └──↓scroll──> pending (末尾を削除)
 //   idle (pending有) ──click──> cc-message ──click──> cc-response ──> (応答送信) idle
 //                                        ↑doubleClick (戻る)┘
 //                          idle <──doubleClick (応答キャンセル)
@@ -204,6 +205,7 @@ type Phase =
   | 'recording' | 'finalizing' | 'pending' | 'sending'
   | 'cc-message'   // Claude Code の承認/質問の本文を全文読む画面 (cc-response の手前)
   | 'cc-response'  // Claude Code の承認/質問待ちに応答する画面
+  | 'cc-review'    // 音声で作った回答を、送信/次の質問へ進む前に確認する画面
   | 'error'
 
 const TMUX_OUTPUT_LINES = 200          // (legacy) capture-pane 用 — 現状未使用
@@ -276,10 +278,32 @@ const BLOCKING_PHASE_ESCAPE_MS = 3000
 // 確定待ちのテキストを「録音1回ぶん = 1文」単位で配列管理する。
 // pending 中に追加クリック → 新たな録音 → 末尾に append。
 // 下スクロールで末尾の1文だけ削除。
-let pendingSentences: string[] = []
-function pendingDisplayText(): string { return pendingSentences.join('\n') }
-function pendingSendText(): string    { return pendingSentences.join(' ') }
-function pendingHasContent(): boolean { return pendingSentences.some((s) => s.trim().length > 0) }
+type PromptDraft = {
+  sessionName: string
+  serverBaseUrl: string
+  sentences: string[]
+  delivery: 'draft' | 'failed' | 'unknown'
+  retryArmed: boolean
+}
+// 下書きは録音開始時の宛先に束縛する。スマホでセッション/URLを切り替えても移し替えない。
+let promptDraft: PromptDraft | null = null
+function ensurePromptDraft(): PromptDraft {
+  return promptDraft ??= {
+    sessionName: settings.sessionName,
+    serverBaseUrl: settings.serverBaseUrl,
+    sentences: [], delivery: 'draft', retryArmed: false,
+  }
+}
+function pendingSentences(): string[] { return promptDraft?.sentences ?? [] }
+function pendingDisplayText(): string { return pendingSentences().join('\n') }
+function pendingSendText(): string    { return pendingSentences().join(' ') }
+function pendingHasContent(): boolean { return pendingSentences().some((s) => s.trim().length > 0) }
+function promptTargetName(): string   { return promptDraft?.sessionName ?? settings.sessionName }
+function promptRestPhase(): 'pending' | 'idle' {
+  if (pendingHasContent()) return 'pending'
+  promptDraft = null // 空の録音を中止した後、古い宛先だけを次の録音へ持ち越さない。
+  return 'idle'
+}
 let tmuxOutput = ''     // (legacy) tmux 出力 — 現状ダッシュボードとレンズには使わない
 let outputPollTimer: ReturnType<typeof setInterval> | null = null
 let outputFetchOkLogged = false
@@ -369,6 +393,11 @@ function isFavoriteSession(s: ClaudeSessionInfo): boolean {
 
 /** OS 長押しメニューに出す「お気に入り切替」の itemID。0 は予約済みなので 1 から。 */
 const LENS_MENU_ID_TOGGLE_FAVORITE = 1
+const LENS_MENU_ID_PROMPT_SEND = 2
+const LENS_MENU_ID_PROMPT_EDIT = 3
+const LENS_MENU_ID_PROMPT_DISCARD = 4
+const LENS_MENU_ID_REVIEW_RECORD = 5
+const LENS_MENU_ID_REVIEW_CHOICES = 6
 
 /**
  * OS 長押しメニューの「★ お気に入り切替」が作用する対象のセッション名。
@@ -382,6 +411,7 @@ const LENS_MENU_ID_TOGGLE_FAVORITE = 1
 function favoriteTargetSession(): string | null {
   if (phase === 'boot' || phase === 'unconfigured' || phase === 'error') return null
   if (phase === 'rootlist') return currentRootRow()?.session.tmuxSessionName ?? null
+  if (phase === 'pending' || phase === 'sending' || (phase === 'recording' && !recordingIsForRespond())) return promptTargetName() || null
   return settings.sessionName || null
 }
 
@@ -389,12 +419,9 @@ function favoriteTargetSession(): string | null {
  * 今の画面で OS の長押しメニューに載せる独自項目。null なら menuObject を付けず、
  * OS のデフォルトメニューをそのまま使う。
  *
- * 対象セッションがある画面には一律で出す (一覧でもセッションを開いた後でも同じ
- * 操作でお気に入りを切り替えられる)。付ける画面をこれ以上絞らないのは、
- * menuObject が create/rebuild にしか載らないため: 画面ごとに出し分けると
- * その境界を跨ぐたびにページ全体の再構築が要る。とくに録音の開始/停止は
- * phase が短時間に何度も変わるので、そこに rebuild を挟むと表示が遅れる。
- * 対象が無い画面 (起動中 / 設定前 / エラー) だけ外して OS 標準に戻す。
+ * お気に入りは対象セッションがある画面に一律で出す。下書き/回答確認では
+ * その画面の操作も追加する。menuObject は create/rebuild にしか載らないので、
+ * 画面の境界でのみ項目を変え、本文のスクロールでは組み替えない。
  *
  * 「登録 / 解除」でラベルを出し分けない理由も同じ。カーソル行ごとに文言を変えると
  * 一覧でカーソルを 1 行動かすたびに再構築が要る。項目は「切替」の 1 つに固定し、
@@ -402,7 +429,20 @@ function favoriteTargetSession(): string | null {
  */
 function lensMenuItems(): LensMenuItem[] | null {
   if (favoriteTargetSession() === null) return null
-  return [{ itemID: LENS_MENU_ID_TOGGLE_FAVORITE, itemName: t('menuToggleFavorite') }]
+  const items = [{ itemID: LENS_MENU_ID_TOGGLE_FAVORITE, itemName: t('menuToggleFavorite') }]
+  if (phase === 'pending') {
+    items.push(
+      { itemID: LENS_MENU_ID_PROMPT_SEND, itemName: t(promptDraft?.retryArmed ? 'menuPromptResend' : promptDraft?.delivery === 'draft' ? 'menuPromptSend' : 'menuPromptRetry') },
+      { itemID: LENS_MENU_ID_PROMPT_EDIT, itemName: t('menuPromptEdit') },
+      { itemID: LENS_MENU_ID_PROMPT_DISCARD, itemName: t('menuPromptDiscard') },
+    )
+  } else if (phase === 'cc-review') {
+    items.push(
+      { itemID: LENS_MENU_ID_REVIEW_RECORD, itemName: t('menuReviewRecord') },
+      { itemID: LENS_MENU_ID_REVIEW_CHOICES, itemName: t('menuReviewChoices') },
+    )
+  }
+  return items
 }
 
 /** 送信済みメニューとの比較用の指紋。null (メニュー無し) も 1 つの状態として区別する。 */
@@ -425,8 +465,31 @@ let chatLinesCache: string[] = []
 // 無操作中は内容が変わらないので、指紋一致で丸ごと省ける。
 let chatLinesCacheKey = ''
 let currentAgentSource: AgentSource | undefined = undefined
-// サーバから来た Agent の動作状態 (idle / busy / waiting-*)。chat 末尾の待機行に使う。
+// サーバから来た Agent の動作状態 (idle / busy / waiting-*)。常時表示ヘッダに使う。
 let claudeChatStatus: string | undefined = undefined
+// 新着返信を観測してから idle になった時だけ「返信あり」。単なる busy→idle は完了扱いしない。
+let replyFeedback = { session: '', lastReply: '', lastStatus: '', changed: false, ready: false }
+function updateReplyFeedback(session: string, chat: ChatItem[], status: string | undefined): void {
+  const reply = [...chat].reverse().find((item) => item.role === 'assistant' && item.text.trim())
+  const key = reply ? `${reply.ts}\n${reply.text}` : ''
+  if (replyFeedback.session !== session) {
+    replyFeedback = { session, lastReply: key, lastStatus: status ?? '', changed: false, ready: false }
+    return
+  }
+  if (status === 'busy' && replyFeedback.lastStatus !== 'busy') replyFeedback.changed = false
+  if (key && key !== replyFeedback.lastReply) replyFeedback.changed = true
+  if (status === 'busy') replyFeedback.ready = false
+  if (status === 'waiting-permission' || status === 'waiting-question') {
+    replyFeedback.ready = false
+    replyFeedback.changed = false
+  }
+  if (status === 'idle' && replyFeedback.changed) {
+    replyFeedback.ready = true
+    replyFeedback.changed = false
+  }
+  replyFeedback.lastReply = key
+  replyFeedback.lastStatus = status ?? ''
+}
 // 送ったのに届いた確証が得られていない直近の送信 (サーバが未確認の間だけ載せてくる)。
 // 確認できたらサーバ側で消えるので、こちらは受け取った値をそのまま持つだけでよい。
 let claudeDeliveryWarning: DeliveryWarning | null = null
@@ -456,13 +519,14 @@ type RespondAnswer =
  * 集約する = 「全部残る」か「全部消える」しか作れない形にする。
  *
  * 不変条件 (assertRespondFlowInvariant で実行時にも守る):
- *   - phase が cc-message / cc-response なら respondFlow は必ず非 null
- *   - respondFlow が非 null なら、phase は cc-message / cc-response、または
+ *   - phase が cc-message / cc-response / cc-review なら respondFlow は必ず非 null
+ *   - respondFlow が非 null なら、phase は cc-message / cc-response / cc-review、または
  *     Type something の録音中 (recording=true) か POST 中 (inFlightSince≠null)
  */
 type RespondFlow = {
   /** どの用件に答えているか。ポーリング結果との突き合わせに使う。 */
   pendingId: string
+  sessionName: string
   /** 複数質問時、現在表示中の質問 index */
   qIdx: number
   /** cc-response 画面のカーソル位置 (現在質問の行 index) */
@@ -473,6 +537,9 @@ type RespondFlow = {
   answers: Record<number, RespondAnswer>
   /** Type something の音声入力中 (録音 / 確定待ち) か。録音の用途フラグを兼ねる。 */
   recording: boolean
+  /** 未確定の音声回答。確認タップまでは answers に入れない。 */
+  reviewText: string | null
+  reviewScrollOffset: number
   /**
    * 応答 POST を開始した時刻 (performance.now)。null = 送信中でない。
    * 送信は数百ms〜秒単位かかる (サーバが tmux にキーを注入して確認するまで) ので、
@@ -512,6 +579,8 @@ function releaseStuckInFlightGuard(flow: RespondFlow): void {
   log(`応答の送信が ${RESPOND_INFLIGHT_GUARD_MS}ms 決着しないため入力ガードを解除しました (送信結果は不明)`)
   if (respondFlow === flow) {
     showRespondError(t('respondUnknownResult'))
+    paintStatus()
+    updateRecordButton()
     void refreshG2(true)
   }
 }
@@ -540,7 +609,7 @@ function respondInputBlocked(): boolean {
  * 自動 (ユーザ操作以外) の切替はこれが true の間だけ保留する。
  */
 function isRespondFlowActive(): boolean {
-  return respondFlow !== null || phase === 'cc-message' || phase === 'cc-response'
+  return respondFlow !== null || phase === 'cc-message' || phase === 'cc-response' || phase === 'cc-review'
 }
 /** 今の録音が cc-response の Type something 用か (通常の tmux 送信用なら false)。 */
 function recordingIsForRespond(): boolean {
@@ -621,15 +690,20 @@ function statusForCurrentPhase(): { dot: string; text: string } {
       return { dot: 'ready', text: `${t('g2Sessions')} (${claudeSessions.length})` }
     case 'cc-message':
     case 'cc-response':
-      return { dot: 'busy', text: t('g2ClaudeAck') }
+      return {
+        dot: respondFlow?.error ? 'err' : 'busy',
+        text: flowIsInFlight(respondFlow) ? t('respondSending') : respondFlow?.error ?? t('g2ClaudeAck'),
+      }
+    case 'cc-review':
+      return { dot: 'busy', text: t('reviewAnswer') }
     case 'recording':
       return { dot: 'rec', text: `${t('g2Recording')} ${getRecordingSeconds().toFixed(1)}s` }
     case 'finalizing':
       return { dot: 'busy', text: t('g2Finalizing') }
     case 'pending':
-      return { dot: 'busy', text: t('g2PendingHint') }
+      return { dot: 'busy', text: t(promptDraft?.delivery === 'unknown' ? 'promptUnknown' : promptDraft?.delivery === 'failed' ? 'promptFailed' : 'g2PendingHint') }
     case 'sending':
-      return { dot: 'busy', text: `${t('g2Sending')} ${settings.sessionName || '—'}` }
+      return { dot: 'busy', text: `${t('g2Sending')} ${promptTargetName() || '—'}` }
     case 'error':
       return { dot: 'err', text: serverErrorMsg || 'Error' }
     case 'unconfigured':
@@ -669,7 +743,8 @@ function recomputePhase(): void {
     phase === 'pending' ||
     phase === 'sending' ||
     phase === 'cc-message' ||
-    phase === 'cc-response'
+    phase === 'cc-response' ||
+    phase === 'cc-review'
   ) return
   if (!isReady()) {
     phase = 'unconfigured'
@@ -782,7 +857,8 @@ function claudeStatusMark(s: ClaudeSessionInfo): string {
 function updatePendingUI(): void {
   if (phase === 'pending') {
     pendingSection.hidden = false
-    pendingTextEl.textContent = pendingDisplayText() || '(empty)'
+    pendingTextEl.textContent = `${promptTargetName()}\n${pendingDisplayText() || t('promptEmpty')}`
+    confirmBtn.textContent = t(promptDraft?.retryArmed ? 'menuPromptResend' : promptDraft?.delivery === 'draft' ? 'menuPromptSend' : 'menuPromptRetry')
   } else {
     pendingSection.hidden = true
   }
@@ -818,6 +894,11 @@ function buildG2Content(): string {
   if (phase === 'cc-response') {
     return buildCcResponseView()
   }
+  if (phase === 'cc-review') {
+    const lines = answerReviewLines()
+    const offset = Math.min(respondFlow?.reviewScrollOffset ?? 0, Math.max(0, lines.length - CC_LIST_VISIBLE))
+    return lines.slice(offset, offset + CC_LIST_VISIBLE).join('\n')
+  }
 
   // それ以外の状態は状態 + 内容を表示
   const lines: string[] = []
@@ -833,13 +914,10 @@ function buildG2Content(): string {
     // 「処理中」と見せると実態 (何も処理していない) と齟齬があるので empty 表示にする。
     lines.push('▌ ' + (liveTranscript || '(empty)'))
   } else if (phase === 'pending') {
-    // 件数表示 (1件なら省略、複数なら "Pending (3 sentences)" のように)
-    const n = pendingSentences.length
-    lines.push(n > 1 ? `Pending (${n} sentences)` : 'Pending')
-    lines.push('')
-    lines.push(pendingDisplayText() || '(empty)')
+    if (promptDraft?.delivery === 'unknown') lines.push(t('promptUnknownHint'), '')
+    lines.push(pendingDisplayText() || t('promptEmpty'))
   } else if (phase === 'sending') {
-    lines.push(`Sending → ${settings.sessionName}`)
+    lines.push(`${t('g2HeadSending')} → ${promptTargetName()}`)
     lines.push('')
     lines.push(pendingSendText().slice(0, 200))
   } else if (phase === 'unconfigured') {
@@ -1074,6 +1152,51 @@ function buildCcMessageView(): string {
   const start = Math.max(0, Math.min(flowMsgScroll(), Math.max(0, all.length - CC_LIST_VISIBLE)))
   if (respondFlow) respondFlow.msgScrollOffset = start
   return all.slice(start, start + CC_LIST_VISIBLE).join('\n')
+}
+
+/** 質問本文と未確定の回答を両方読む。確認タップ以外では送信しない。 */
+function answerReviewLines(): string[] {
+  const lines = [...ccMessageLines(), '', t('reviewAnswerText')]
+  for (const paragraph of (respondFlow?.reviewText ?? '').split('\n')) {
+    lines.push(...wrapText(paragraph, CHAT_WRAP_PX))
+  }
+  return lines
+}
+
+function scrollAnswerReview(delta: number): void {
+  if (phase !== 'cc-review' || !respondFlow) return
+  respondFlow.reviewScrollOffset = Math.max(0, Math.min(
+    Math.max(0, answerReviewLines().length - CC_LIST_VISIBLE),
+    respondFlow.reviewScrollOffset + delta * scrollLinesPerGesture(),
+  ))
+  void refreshG2(true)
+}
+
+function backToAnswerChoices(): void {
+  if (phase !== 'cc-review' || !respondFlow) return
+  respondFlow.reviewText = null
+  phase = 'cc-response'
+  paintStatus()
+  updateRecordButton()
+  void refreshG2(true)
+}
+
+async function recordAnswerAgain(): Promise<void> {
+  if (phase !== 'cc-review' || !respondFlow || respondInputBlocked()) return
+  const flow = respondFlow
+  flow.recording = true
+  await startRecording()
+  if (currentPhase() !== 'recording' && respondFlow === flow) flow.recording = false
+}
+
+function confirmReviewedAnswer(): void {
+  if (phase !== 'cc-review' || respondInputBlocked()) return
+  const flow = respondFlow
+  if (!flow?.reviewText || flow.pendingId !== claudePending?.id || flow.sessionName !== settings.sessionName) return
+  flow.answers[flow.qIdx] = { kind: 'type-something', text: flow.reviewText }
+  flow.reviewText = null
+  phase = 'cc-response'
+  advanceToNextQuestionOrSubmit()
 }
 
 /** Claude Code 承認/質問への応答画面 */
@@ -1450,26 +1573,6 @@ function lensWindow(text: string, n: number): string {
   return lines.slice(start, end).join('\n')
 }
 
-/**
- * 現在の status に対応する chat 末尾の待機行。idle / 不明なら null。
- * サーバも同義の英語行を chat に合成してくるが、そちらは synthetic として捨て、
- * 表示はここで作る (言語設定に追従させるため)。ドットのアニメーションは再現しない。
- */
-function chatStatusLine(): string | null {
-  // 回答待ちが実在する間は、その告知をヘッダのバナー (buildG2Header) に一本化する。
-  // 本文末尾にも出すと、同じことをスクロールしても消えないヘッダと本文の 2 か所で
-  // 言うことになり、狭い窓が 1 行無駄になる。busy (考え中) は従来どおり本文に出す。
-  if (claudePending && (claudeChatStatus === 'waiting-permission' || claudeChatStatus === 'waiting-question')) {
-    return null
-  }
-  switch (claudeChatStatus) {
-    case 'busy':               return t('chatStatusThinking')
-    case 'waiting-permission': return t('chatStatusWaitPerm')
-    case 'waiting-question':   return t('chatStatusWaitQ')
-    default:                   return null
-  }
-}
-
 // 送達未確認の注意行 (レンズ幅で折り返し済み)。文言が変わらない限り測り直さない。
 let deliveryWarnLinesCache: string[] = []
 let deliveryWarnLinesCacheKey = ''
@@ -1498,15 +1601,12 @@ let chatDisplayCache: string[] = []
 let chatDisplayCacheSource: string[] | null = null
 let chatDisplayCacheStatus: string | null = null
 
-/** 末尾に足す行 (待機行 → 送達未確認の注意)。注意は最下段 = いちばん目に入る位置に置く。 */
+/** 送達未確認の注意は本文末尾に置く。Agent の状態はヘッダに常時表示する。 */
 function chatTailLines(): string[] {
-  const status = chatStatusLine()
-  const warn = deliveryWarningLines()
-  if (!status) return warn
-  return warn.length === 0 ? [status] : [status, ...warn]
+  return deliveryWarningLines()
 }
 
-/** 表示用の chat 行配列 = 整形済みキャッシュ + (あれば) 末尾の待機行 / 注意行 */
+/** 表示用の chat 行配列 = 整形済みキャッシュ + (あれば) 末尾の注意行 */
 function chatLinesForDisplay(): string[] {
   const tail = chatTailLines()
   const key = tail.join('\n')
@@ -1711,6 +1811,7 @@ function clearG2Notice(redraw = true): void {
 }
 
 function buildG2Footer(): string {
+  if (flowIsInFlight(respondFlow) && isRespondFlowActive()) return t('respondSending')
   // 一時通知は操作案内より優先する。数秒か次の操作で自動的に消える。
   if (g2Notice !== null) return g2Notice
   switch (phase) {
@@ -1735,6 +1836,11 @@ function buildG2Footer(): string {
       // multi-select 中の Submit 行を強調するため、multi-select 質問のときは別文言
       if (currentRespondQuestionIsMulti()) return t('g2FootCcRespMulti')
       return t('g2FootCcResponse')
+    case 'cc-review': {
+      const total = answerReviewLines().length
+      const end = Math.min(total, (respondFlow?.reviewScrollOffset ?? 0) + CC_LIST_VISIBLE)
+      return `${t('g2FootReview')}${total > CC_LIST_VISIBLE ? ` (${end}/${total})` : ''}`
+    }
     case 'recording': {
       // cc-response の Type something で録音中なら専用文言
       const base = recordingIsForRespond() ? t('g2FootCcRespRec') : t('g2FootRecOff')
@@ -1742,7 +1848,9 @@ function buildG2Footer(): string {
       return recordingScrollOffset > 0 ? `${base}  (-${recordingScrollOffset})` : base
     }
     case 'finalizing':    return t('g2FootFinalizing')
-    case 'pending':       return t('g2FootPending')
+    case 'pending':
+      if (promptDraft?.retryArmed) return t('promptRetryConfirm')
+      return t(promptDraft?.delivery === 'draft' ? 'g2FootPending' : 'g2FootPromptRetry')
     case 'sending':       return t('g2FootSending')
     case 'unconfigured':  return t('g2FootSetup')
     case 'idle':
@@ -1758,44 +1866,6 @@ function buildG2Footer(): string {
   }
 }
 
-// idle ヘッダ末尾に出す状態表示 (画面ブロック警告 / 回答待ち) の点滅位相。
-// true = 状態を出すコマ、false = セッション名だけのコマ。
-//
-// 周期タイマーは持たない。1.5 秒ポーリング由来の再描画では必ず「表示」に戻し、
-// その 750ms 後に one-shot タイマーで「非表示」へ落として 1 回だけ描き直す。
-// これで表示 0.75 秒 ⇔ 非表示 0.75 秒になる (ポーリング間隔の半分)。
-//
-// 点滅させる対象が何であれ位相は 1 系統しか持たない。ブロックと回答待ちが同時に
-// 成立しても出すのは片方だけ (headBlinkBadge) なので、位相が競合することはない。
-let headBlinkOn = true
-/** 非表示フェーズへ落とす one-shot タイマー。同時に 1 本だけ。 */
-let headBlinkOffTimer: ReturnType<typeof setTimeout> | null = null
-const HEAD_BLINK_OFF_MS = 750
-
-/** 点滅の one-shot タイマーを捨てる。位相は「表示」に戻す (中途半端な消灯で固まらせない)。 */
-function clearHeadBlink(): void {
-  if (headBlinkOffTimer) clearTimeout(headBlinkOffTimer)
-  headBlinkOffTimer = null
-  headBlinkOn = true
-}
-
-/**
- * 表示フェーズを描いた直後に呼ぶ。750ms 後に非表示フェーズへ落として 1 枚だけ描き直す。
- * 発火時点で前提 (点滅対象がある / idle を見ている / レンズが headlenss のもの) が
- * 崩れていたら何もしない。張り直しは常に前の 1 本を捨ててから行う。
- */
-function scheduleHeadBlinkOff(): void {
-  if (headBlinkOffTimer) clearTimeout(headBlinkOffTimer)
-  headBlinkOffTimer = setTimeout(() => {
-    headBlinkOffTimer = null
-    // プラグイン遷移中はレンズが headlenss の画面ではない。ここで描くと被る。
-    if (pluginNavBlocksG2Render) return
-    if (phase !== 'idle' || headBlinkBadge() === null) return
-    headBlinkOn = false
-    void refreshG2(true)
-  }, HEAD_BLINK_OFF_MS)
-}
-
 /** 今開いているセッションが画面ブロック中か (一覧の最新の取得結果から見る) */
 function currentSessionBlocked(): boolean {
   const name = settings.sessionName
@@ -1803,19 +1873,26 @@ function currentSessionBlocked(): boolean {
   return claudeSessions.some((s) => s.tmuxSessionName === name && s.screenBlocked === true)
 }
 
-/**
- * idle ヘッダでセッション名の後ろに出し、点滅させる状態表示。null = 点滅させるものが無い。
- *
- * 画面ブロックと回答待ちは同時に成立しうるが、出すのは常に片方だけにする。
- * 2 つ並べると 56 文字にセッション名が残らないうえ、先に手を打つべきなのは
- * 「送っても届かない」ブロックの方なので、ブロックを優先する。
- */
-function headBlinkBadge(): string | null {
+/** スクロール位置に関係なく、状態はヘッダに常時出す。 */
+function agentStatusBadge(): string {
   if (currentSessionBlocked()) return t('g2HeadBlocked')
-  if (claudePending) {
-    return claudePending.kind === 'question' ? t('g2HeadWaitQ') : t('g2HeadWaitPerm')
+  if (claudePending) return t(claudePending.kind === 'question' ? 'g2HeadWaitQ' : 'g2HeadWaitPerm')
+  if (claudeChatStatus === 'waiting-question') return t('g2HeadWaitQ')
+  if (claudeChatStatus === 'waiting-permission') return t('g2HeadWaitPerm')
+  if (claudeChatStatus === 'busy') return t('g2HeadWorking')
+  if (claudeChatLoading) return t('chatLoading')
+  if (replyFeedback.session === settings.sessionName && replyFeedback.ready && claudeChatStatus === 'idle') {
+    return t('g2HeadReplyReady')
   }
-  return null
+  return t('g2HeadAgentIdle')
+}
+
+/** 状態の幅を先に確保し、長いセッション名だけを切り詰める。 */
+function sessionStatusHeader(name: string, status: string): string {
+  const sep = '  '
+  const star = isFavoriteName(name) ? FAVORITE_MARK : ''
+  const avail = HEADER_INNER_WIDTH - measuredWidth(star + sep + status)
+  return `${star}${truncateToPx(name, avail).s}${sep}${status}`
 }
 
 /** G2 レンズ最上段に表示する「現在の画面/フェーズ」のタイトル文字列 */
@@ -1825,13 +1902,15 @@ function buildG2Header(): string {
     case 'unconfigured': return t('g2HeadSetup')
     case 'rootlist':     return t('g2HeadRoot')
     // 時間制限が無いのでカウントダウンはしない。代わりに経過秒をカウントアップする。
-    case 'recording':    return `${t('g2HeadRecording')}  ${getRecordingSeconds().toFixed(1)}s`
+    case 'recording':    return sessionStatusHeader(recordingIsForRespond() ? settings.sessionName : promptTargetName(), `${t('g2HeadRecording')} ${getRecordingSeconds().toFixed(1)}s`)
     case 'finalizing':   return t('g2HeadFinalizing')
     case 'pending': {
-      const n = pendingSentences.length
-      return n > 1 ? `${t('g2HeadPending')} (${n})` : t('g2HeadPending')
+      const status = t(promptDraft?.delivery === 'unknown' ? 'promptUnknown' : promptDraft?.delivery === 'failed' ? 'promptFailed' : 'g2HeadPending')
+      const count = pendingSentences().length
+      return sessionStatusHeader(promptTargetName(), count > 1 ? `${status} (${count})` : status)
     }
-    case 'sending':      return `${t('g2HeadSending')} → ${settings.sessionName || ''}`.slice(0, 56)
+    case 'sending':      return sessionStatusHeader(promptTargetName(), t('g2HeadSending'))
+    case 'cc-review':    return sessionStatusHeader(respondFlow?.sessionName ?? settings.sessionName, `${t('reviewAnswer')} (${flowQIdx() + 1}/${claudePending?.questions?.length ?? 1})`)
     // メッセージ閲覧と選択肢は同じ用件の 2 画面なのでヘッダは共通。
     // 本文の窓 (7 行) を本題だけに使いたいので、ツール名・質問番号・multi バッジは
     // スクロールしない ここ で出す。
@@ -1849,31 +1928,7 @@ function buildG2Header(): string {
       return `${t('g2HeadCcResponse')}${num}${badge}`.slice(0, 56)
     }
     case 'error':        return t('g2HeadError')
-    case 'idle': {
-      // お気に入りなら名前の前に ★ を出す。一覧と同じ印なので、開いたまま
-      // 「これは ★ を付けてあるセッションか」がヘッダだけで分かる。
-      // ★ は点滅させない: 状態表示 (badge) と違って ★ は継続的な属性なので、
-      // 消えるコマがあると「付いているのか外れたのか」が読めなくなる。
-      const star = isFavoriteName(settings.sessionName) ? FAVORITE_MARK : ''
-      // 画面が塞がっている / 回答待ちがあるなら、スクロールしても消えないヘッダで知らせる
-      // (フッタは操作の案内なので変えない)
-      const badge = headBlinkBadge()
-      if (badge) {
-        // 並びは「★セッション名　(印) 状態」。状態は必ず出したいので、ヘッダの実描画幅に
-        // 収まらないぶんはセッション名側を切り詰める。文字数ではなく px で測るのは、
-        // レンズが裁ち落とすのが px 幅だから (全角名だと文字数では収まって見えても
-        // 状態が画面外へ押し出される)。★ の幅もここで先に引く (引かないと ★ の
-        // ぶんだけ状態表示が画面外へ出る)。
-        // 切り詰めは点滅の両フェーズに同じだけ掛ける。非表示コマだけ名前が伸びると
-        // 名前そのものがちらついて読みにくいため。
-        const sep = '　'
-        const avail = HEADER_INNER_WIDTH - measuredWidth(star + sep + badge)
-        const name = truncateToPx(settings.sessionName || '', avail).s
-        // 56 は他のヘッダと揃えた最後の歯止め (px で切った後は通常ここに掛からない)
-        return (headBlinkOn ? `${star}${name}${sep}${badge}` : `${star}${name}`).slice(0, 56)
-      }
-      return settings.sessionName ? `${star}${settings.sessionName}` : t('appName')
-    }
+    case 'idle': return sessionStatusHeader(settings.sessionName, agentStatusBadge())
     default:             return t('appName')
   }
 }
@@ -2256,7 +2311,7 @@ async function executeFullRender(force: boolean, frame: G2Frame | null = null): 
     // header / content / footer を同期的に一括ビルド (同一 phase スナップショット)。
     // 呼び出し側が既に組んだスナップショットがあればそれを使う (二重ビルドの解消)。
     const { header, content, footer } = frame ?? buildG2Frame()
-    // ヘッダも出す: 点滅 (headBlinkOn) のように「同じ phase で送信内容だけが変わる」
+    // ヘッダも出す: Agent の状態更新のように「同じ phase で送信内容だけが変わる」
     // 挙動は、この行の時系列でしか外から確かめられない。
     console.log(`[refreshG2] firing (phase=${phase}, force=${force}) header=${JSON.stringify(header)}`)
     // 本文とフッタは devMode の時だけ。「レンズに何が出ているか」はグラスを掛けずに
@@ -2479,7 +2534,7 @@ async function reloadSessions(verbose = false): Promise<void> {
     lastSessions = await client.listSessions(ctrl.signal)
     if (verbose) log(`sessions: ${lastSessions.map((s) => s.name).join(', ') || '(none)'}`)
     if (lastSessions.length > 0 && !lastSessions.some((s) => s.name === settings.sessionName)) {
-      if (isRespondFlowActive()) {
+      if (isRespondFlowActive() || promptDraft !== null) {
         // 応答フローの最中は自動切替を保留する。
         // なぜ: 回答を組んでいる最中に足元のセッションを差し替えると、作りかけの回答が
         // 捨てられて操作が消える。一覧に無いセッションを見ているだけなら実害は小さいので、
@@ -2616,6 +2671,7 @@ async function refreshClaudeData(): Promise<void> {
     // 表示行数を測る前に、末尾の待機行を決める材料 (status と pending) を両方入れ替える。
     // 片方だけ新しい中間状態で測ると、待機行の有無が実際とは違う判定になり、
     // pending の出現/消滅のたびに読んでいる位置が 1 行ずれる。
+    updateReplyFeedback(targetSession, chat, chatResponse.status)
     claudeChatStatus = chatResponse.status
     claudeDeliveryWarning = chatResponse.deliveryWarning ?? null
     claudePending = pending
@@ -2649,21 +2705,10 @@ async function refreshClaudeData(): Promise<void> {
     } else {
       setOutputDisplay(`(no chat yet for "${targetSession}")`, 'muted')
     }
-    if (phase === 'idle' || phase === 'cc-message' || phase === 'cc-response') {
+    if (phase === 'idle' || phase === 'cc-message' || phase === 'cc-response' || phase === 'cc-review') {
       // ポーリング由来の再描画は「表示が変わる時だけ」。変わらないのに 1.5 秒ごとに
       // 全面送信 (3 フレーム) を掛け続けると、レンズ側の消化が追いつかない環境では
       // それだけで滞留が育つ (g2FrameWouldChange 参照)。
-      // ヘッダ末尾の状態表示 (画面ブロック警告 / 回答待ち) は点滅させる。ポーリング由来の
-      // この描画は必ず「表示」に戻し、下で張る one-shot タイマーが 750ms 後に「非表示」を
-      // 1 枚描く。
-      // 副作用として、点滅中はヘッダが毎回変わる = g2FrameWouldChange が常に
-      // 「変化あり」になり、1.5 秒ごとの full render + その 0.75 秒後に 1 枚が出る。
-      // 該当のセッションを開いている間だけの話なので許容する。
-      // 対象が消えていれば位相を「表示」に戻し、待機中のタイマーも捨てる
-      // (次に点滅するとき必ず表示から始める)。
-      const blinking = headBlinkBadge() !== null
-      if (blinking) headBlinkOn = true
-      else clearHeadBlink()
       // ただし送信が途絶えて久しい場合は、取りこぼし対策として dedup を捨てて 1 回通す。
       if (isForcedResyncDue()) {
         console.log('[refreshG2] forced resync: no send for a while')
@@ -2675,8 +2720,6 @@ async function refreshClaudeData(): Promise<void> {
         const frame = buildG2Frame()
         if (g2FrameWouldChange(frame)) void refreshG2(true, frame)
       }
-      // 表示フェーズを描いた後に消灯を予約する (点滅対象があるのを見ている間だけ)
-      if (blinking && phase === 'idle') scheduleHeadBlinkOff()
       // chat を実際に取得して描画している = ユーザは見ている前提なので既読化
       markAsRead(targetSession)
     }
@@ -2699,7 +2742,7 @@ function startOutputPolling(): void {
     if (phase === 'recording' || phase === 'finalizing' || phase === 'pending' || phase === 'sending') return
     if (phase === 'rootlist') {
       void reloadClaudeSessions()
-    } else if (phase === 'idle' || phase === 'cc-message' || phase === 'cc-response') {
+    } else if (phase === 'idle' || phase === 'cc-message' || phase === 'cc-response' || phase === 'cc-review') {
       void reloadClaudeSessions()
       void refreshClaudeData()
     }
@@ -2829,8 +2872,6 @@ function stopAllBackgroundWork(): void {
   hideToastNow()
   // 実行中の取得も打ち切る (完了時に描画へ回るため)
   abortInFlightRefresh()
-  // 点滅の消灯タイマーも捨てる。残すとプラグインのページに headlenss のヘッダが 1 枚被る
-  clearHeadBlink()
   // 一時通知の自動消灯も同じ理由で捨てる (ここで描き直させない)
   clearG2Notice(false)
   // レンズ送信の待機枠も捨てる。残しておくと in-flight が捌けた瞬間に headlenss の
@@ -3182,6 +3223,18 @@ function stopRecordingTimer(): void {
 }
 
 function updateRecordButton(): void {
+  if (flowIsInFlight(respondFlow)) {
+    recordBtn.disabled = true
+    recordBtn.textContent = t('respondSending')
+    recordBtn.classList.remove('recording')
+    return
+  }
+  if (phase === 'cc-review') {
+    recordBtn.disabled = flowIsInFlight(respondFlow)
+    recordBtn.textContent = t('reviewConfirm')
+    recordBtn.classList.remove('recording')
+    return
+  }
   if (phase === 'finalizing' || phase === 'sending') {
     recordBtn.disabled = true
     recordBtn.textContent = phase === 'finalizing' ? 'Finalizing…' : 'Sending…'
@@ -3227,13 +3280,15 @@ async function startRecording(): Promise<void> {
     log('cannot record: G2 bridge not available')
     return
   }
-  if (!settings.speechmaticsApiKey || !settings.serverBaseUrl || !settings.sessionName) {
+  const target = recordingIsForRespond() ? settings : promptDraft ?? settings
+  if (!settings.speechmaticsApiKey || !target.serverBaseUrl || !target.sessionName) {
     log('startRecording blocked: not configured')
     // タップしたのに何も起きない状態にしない。理由の切り分けはスマホ側で行う。
     showG2Notice(t('g2NoticeRecFail'))
     void refreshG2(true)
     return
   }
+  if (!recordingIsForRespond()) ensurePromptDraft()
 
   // 前の録音の ASR 接続が残っていることがある (停止経路が途中で折れた等)。
   // 残したまま新しい接続を張ると、古い接続の partial が新しい表示を上書きする。
@@ -3293,9 +3348,9 @@ async function startRecording(): Promise<void> {
         resetRespondFlow('pending-gone', flow)
         return
       }
-      phase = 'cc-response'
+      phase = flow.reviewText !== null ? 'cc-review' : 'cc-response'
     } else {
-      phase = 'idle'
+      phase = promptRestPhase()
     }
     paintStatus()
     updateRecordButton()
@@ -3384,6 +3439,7 @@ async function stopRecordingToPending(): Promise<void> {
   // 紛れ込む。用途・対象フロー・セッション名 (世代) をここで固定する。
   const startedSession = settings.sessionName
   const recordingFlow = respondFlow?.recording ? respondFlow : null
+  const recordingDraft = recordingFlow ? null : promptDraft
   const startedRt = rtSession
   const startedEpoch = recoveryEpoch
   /**
@@ -3401,7 +3457,7 @@ async function stopRecordingToPending(): Promise<void> {
       }
       return true
     }
-    if (settings.sessionName === startedSession) return false
+    if (recordingDraft ? promptDraft === recordingDraft : settings.sessionName === startedSession) return false
     log(`録音停止 (${where}): セッションが切り替わったので結果を破棄します`)
     // 自分が始めた ASR 接続だけを片付ける (切替後に始まった新しい録音は触らない)
     if (startedRt && rtSession === startedRt) {
@@ -3412,7 +3468,7 @@ async function stopRecordingToPending(): Promise<void> {
     // ということなので、ここで畳む。放置すると「確定中」表示のまま操作を一切
     // 受け付けない画面に閉じ込められる (切替側が phase を戻さない経路がある)。
     if (phase === 'finalizing') {
-      phase = pendingSentences.length > 0 ? 'pending' : 'idle'
+      phase = promptRestPhase()
       paintStatus()
       updateRecordButton()
       updatePendingUI()
@@ -3458,27 +3514,24 @@ async function stopRecordingToPending(): Promise<void> {
           resetRespondFlow('pending-gone', recordingFlow)
           return
         }
-        // cc-response の type-something 回答として記録、cc-response に戻る
+        // 音声回答は未確定のまま確認画面へ。停止操作だけでは次の質問/送信へ進めない。
         if (text) {
-          flow.answers[flow.qIdx] = { kind: 'type-something', text }
+          flow.reviewText = text
+          flow.reviewScrollOffset = 0
           log(`respond type-something: "${text.slice(0, 40)}"`)
         } else {
           log('respond type-something: empty, cancel')
         }
-        phase = 'cc-response'
+        phase = flow.reviewText !== null ? 'cc-review' : 'cc-response'
         paintStatus()
         updateRecordButton()
         void refreshG2(true)
-        // 入力済なら自動で次の質問へ進む
-        if (text) {
-          advanceToNextQuestionOrSubmit()
-        }
         return
       }
       // 通常 (tmux 用) フロー
       if (text) {
-        pendingSentences.push(text)
-        log(`pending: appended sentence #${pendingSentences.length}`)
+        recordingDraft?.sentences.push(text)
+        log(`pending: appended sentence #${pendingSentences().length}`)
       }
       phase = 'pending'
       paintStatus()
@@ -3543,7 +3596,7 @@ async function stopRecordingToPending(): Promise<void> {
       blockingPhaseSince = 0
       if (phase === 'finalizing') {
         diag('録音停止が finalizing のまま抜けました — 畳んで操作を受け付けます')
-        phase = pendingSentences.length > 0 ? 'pending' : 'idle'
+        phase = promptRestPhase()
         paintStatus()
         updateRecordButton()
         updatePendingUI()
@@ -3554,14 +3607,17 @@ async function stopRecordingToPending(): Promise<void> {
   }
 }
 
-/** pending → サーバ送信 → idle */
+/** 送達不明の再送は二段階。下書きも宛先も成功が分かるまで残す。 */
 async function confirmAndSend(): Promise<void> {
-  if (phase !== 'pending') return
-  if (!pendingHasContent()) {
-    // 空のまま送信を試みても何もしない。idle へ自動復帰せず pending に留まる。
-    // ターミナル画面 (idle) へ戻すのはダブルタップ (discardPending) 経由のみ。
+  if (phase !== 'pending' || !pendingHasContent() || !promptDraft) return
+  const draft = promptDraft
+  if (draft.delivery === 'unknown' && !draft.retryArmed) {
+    draft.retryArmed = true
+    updatePendingUI()
+    void refreshG2(true)
     return
   }
+  draft.retryArmed = false
   const text = pendingSendText()
   const startedEpoch = recoveryEpoch
   phase = 'sending'
@@ -3572,49 +3628,57 @@ async function confirmAndSend(): Promise<void> {
   void refreshG2(true)
 
   const t0 = performance.now()
+  let sent = false
+  let delivery: PromptDraft['delivery'] = 'unknown'
   try {
-    await client.sendKeys(settings.sessionName, {
-      text,
-      submit: true,
-    })
-    log(`sendKeys ok → ${settings.sessionName} (${pendingSentences.length} sentences)`)
-    addHistoryEntry({
-      text,
-      session: settings.sessionName,
-      ok: true,
-      durationMs: performance.now() - t0,
-    })
+    // client の base も設定変更で変わりうるので、保存した宛先専用の client を使う。
+    await new HeadlenssClient(draft.serverBaseUrl).sendKeys(draft.sessionName, { text, submit: true })
+    sent = true
+    addHistoryEntry({ text, session: draft.sessionName, ok: true, durationMs: performance.now() - t0 })
   } catch (e) {
     const errorMsg = (e as Error).message
-    log(`sendKeys error: ${errorMsg}`)
-    addHistoryEntry({
-      text,
-      session: settings.sessionName,
-      ok: false,
-      durationMs: performance.now() - t0,
-      errorMsg,
-    })
+    delivery = e instanceof PromptSendError && !e.deliveryUnknown ? 'failed' : 'unknown'
+    log(`sendKeys ${delivery}: ${errorMsg}`)
+    addHistoryEntry({ text, session: draft.sessionName, ok: false, durationMs: performance.now() - t0, errorMsg })
   } finally {
-    // 強制脱出でこの送信が既に打ち切られていたら、今の画面には触らない。
-    if (recoveryEpoch === startedEpoch) {
+    // 強制脱出後の遅い返事は、編集/再送された下書きや新しい画面を上書きしない。
+    if (recoveryEpoch === startedEpoch && promptDraft === draft) {
       blockingPhaseSince = 0
-      pendingSentences = []
-      phase = 'idle'
-      resetScroll()
-      recomputePhase()
-      // 送信直後に出力ミラーを取り直し (反映を見える化)
-      void refreshClaudeData()
-    } else {
-      log('送信: 強制リセット後なので画面は触りません')
+      if (sent) {
+        promptDraft = null
+        if (replyFeedback.session === draft.sessionName && settings.serverBaseUrl === draft.serverBaseUrl) {
+          replyFeedback.ready = false
+          replyFeedback.changed = false
+        }
+        phase = 'idle'
+        resetScroll()
+        showG2Notice(t('promptSent').replace('{name}', draft.sessionName))
+        recomputePhase()
+        void refreshClaudeData()
+      } else {
+        draft.delivery = delivery
+        phase = 'pending'
+      }
+      paintStatus()
+      updateRecordButton()
+      updatePendingUI()
+      void refreshG2(true)
     }
   }
+}
+
+/** 編集は既存の音声追加/末尾削除を使う。送達不明の注意は編集後も残す。 */
+async function editPromptDraft(): Promise<void> {
+  if (phase !== 'pending') return
+  if (promptDraft) promptDraft.retryArmed = false
+  await startRecording()
 }
 
 /** pending → 全部破棄 → idle (⊕⊕ で呼ばれる) */
 function discardPending(): void {
   if (phase !== 'pending') return
-  log(`pending discarded (${pendingSentences.length} sentences dropped)`)
-  pendingSentences = []
+  log(`pending discarded (${pendingSentences().length} sentences dropped)`)
+  promptDraft = null
   phase = 'idle'
   recomputePhase()
 }
@@ -3626,9 +3690,10 @@ function discardPending(): void {
  */
 function removeLastSentence(): void {
   if (phase !== 'pending') return
-  if (pendingSentences.length === 0) return  // 既に空: そのまま pending に留まる
-  const removed = pendingSentences.pop()
-  log(`pending: removed last sentence "${(removed ?? '').slice(0, 40)}" (remaining ${pendingSentences.length})`)
+  if (pendingSentences().length === 0) return  // 既に空: そのまま pending に留まる
+  if (promptDraft) promptDraft.retryArmed = false
+  const removed = pendingSentences().pop()
+  log(`pending: removed last sentence "${(removed ?? '').slice(0, 40)}" (remaining ${pendingSentences().length})`)
   updatePendingUI()
   paintStatus()
   void refreshG2(true)
@@ -3647,7 +3712,7 @@ async function abortRecording(): Promise<void> {
   // 'finalizing' 中の rtSession は停止処理が使っている最中なので触らない。
   const orphanRt = !wasRecording && phase !== 'finalizing' ? rtSession : null
   if (!wasRecording && !micIsHeld() && !orphanRt) return
-  if (wasRecording) log(`recording aborted (kept ${pendingSentences.length} sentences)`)
+  if (wasRecording) log(`recording aborted (kept ${pendingSentences().length} sentences)`)
   else if (orphanRt) log('録音画面ではないが ASR 接続が残っているので破棄します')
   else log('録音画面ではないがマイクが握られたままなので解放します')
 
@@ -3682,12 +3747,12 @@ async function abortRecording(): Promise<void> {
           log('録音中止: 戻り先の用件が消えていたので idle に戻ります')
           resetRespondFlow('pending-gone')
         } else {
-          phase = 'cc-response'
+          phase = flow.reviewText !== null ? 'cc-review' : 'cc-response'
           paintStatus()
           void refreshG2(true)
         }
       } else {
-        phase = pendingSentences.length > 0 ? 'pending' : 'idle'
+        phase = promptRestPhase()
         paintStatus()
         void refreshG2(true)
       }
@@ -3703,7 +3768,7 @@ async function abortRecording(): Promise<void> {
     // 例外で抜けても 'recording' に固着させない。
     if (phase === 'recording') {
       diag('録音中止が recording のまま抜けました — 畳んで操作を受け付けます')
-      phase = pendingSentences.length > 0 ? 'pending' : 'idle'
+      phase = promptRestPhase()
       paintStatus()
       updatePendingUI()
       void refreshG2(true)
@@ -3740,10 +3805,11 @@ function forceResetBlockedPhase(): void {
   liveTranscript = ''
   durationEl.textContent = '0.0s'
   if (phase === 'sending') {
-    // 送信は既にサーバへ出ている。ここで文を残すと同じ内容を二重に送りうるので、
-    // 決着した時と同じ扱い (破棄) にする。
-    log(`送信中の強制脱出: ${pendingSentences.length} 文を破棄します`)
-    pendingSentences = []
+    // 待つのをやめても送信は取り消せない。本文を残し、再送は明示確認を必須にする。
+    if (promptDraft) {
+      promptDraft.delivery = 'unknown'
+      promptDraft.retryArmed = false
+    }
   }
   const flow = respondFlow
   if (flow?.recording) {
@@ -3751,10 +3817,10 @@ function forceResetBlockedPhase(): void {
     if (!claudePending || claudePending.id !== flow.pendingId) {
       resetRespondFlow('pending-gone')
     } else {
-      phase = 'cc-response'
+      phase = flow.reviewText !== null ? 'cc-review' : 'cc-response'
     }
   } else {
-    phase = pendingSentences.length > 0 ? 'pending' : 'idle'
+    phase = promptRestPhase()
   }
   paintStatus()
   updateRecordButton()
@@ -3771,7 +3837,7 @@ async function toggleRecording(): Promise<void> {
     const stuck = blockingPhaseSince > 0 ? Date.now() - blockingPhaseSince : 0
     if (stuck < BLOCKING_PHASE_ESCAPE_MS) return
     forceResetBlockedPhase()
-    // 畳んだ後の phase で、このタップを改めて処理する (下へ落ちる)。
+    return // 脱出した同じタップで追加録音や送信を始めない。
   }
   // 応答 POST 中のタップは無視 (同じ用件へ 2 通目を送らせない)
   if (respondInputBlocked()) return
@@ -3779,7 +3845,7 @@ async function toggleRecording(): Promise<void> {
     await stopRecordingToPending()
   } else if (phase === 'pending') {
     // 追加録音 — 既存 pendingSentences は保持されたまま新しい文を末尾に追加する
-    await startRecording()
+    await editPromptDraft()
     return
   } else if (phase === 'rootlist') {
     activateSelectedFromRoot()
@@ -3802,6 +3868,8 @@ async function toggleRecording(): Promise<void> {
     updateRecordButton()
   } else if (phase === 'cc-response') {
     await handleCcResponseClick()
+  } else if (phase === 'cc-review') {
+    confirmReviewedAnswer()
   } else {
     settingsDetails.open = true
   }
@@ -4172,6 +4240,9 @@ function enterRespondFlow(pending: Pending): void {
   clearRespondError()
   respondFlow = {
     pendingId: pending.id,
+    sessionName: settings.sessionName,
+    reviewText: null,
+    reviewScrollOffset: 0,
     qIdx: 0,
     cursor: 0,
     msgScrollOffset: 0,
@@ -4192,6 +4263,9 @@ function rebindRespondFlow(pending: Pending): void {
   if (respondFlow?.recording) discardRespondRecording()
   respondFlow = {
     pendingId: pending.id,
+    sessionName: settings.sessionName,
+    reviewText: null,
+    reviewScrollOffset: 0,
     qIdx: 0,
     cursor: 0,
     msgScrollOffset: 0,
@@ -4218,13 +4292,13 @@ function rebindRespondFlow(pending: Pending): void {
  */
 function resetRespondFlow(reason: string, endedFlow?: RespondFlow): void {
   const flow = respondFlow
-  const wasActive = flow !== null || endedFlow != null || phase === 'cc-message' || phase === 'cc-response'
+  const wasActive = flow !== null || endedFlow != null || phase === 'cc-message' || phase === 'cc-response' || phase === 'cc-review'
   clearRespondError()
   if (flow?.recording || endedFlow?.recording) discardRespondRecording()
   respondFlow = null
   if (!wasActive) return
   log(`応答フローを終了しました (${reason})`)
-  if (phase === 'cc-message' || phase === 'cc-response' || phase === 'recording' || phase === 'finalizing') {
+  if (phase === 'cc-message' || phase === 'cc-response' || phase === 'cc-review' || phase === 'recording' || phase === 'finalizing') {
     phase = 'idle'
   }
   paintStatus()
@@ -4275,6 +4349,8 @@ function showRespondError(message: string): void {
     respondErrorTimer = null
     if (!respondFlow?.error) return
     respondFlow.error = null
+    paintStatus()
+    updateRecordButton()
     void refreshG2(true)
   }, RESPOND_ERROR_SHOW_MS)
 }
@@ -4286,7 +4362,7 @@ function showRespondError(message: string): void {
  * idle へ落として自己回復する。
  */
 function assertRespondFlowInvariant(where: string): void {
-  const inRespondPhase = phase === 'cc-message' || phase === 'cc-response'
+  const inRespondPhase = phase === 'cc-message' || phase === 'cc-response' || phase === 'cc-review'
   if (inRespondPhase && !respondFlow) {
     log(`[bug] 応答画面なのに respondFlow が無い (${where}) — idle に戻します`)
     phase = 'idle'
@@ -4310,8 +4386,11 @@ function assertRespondFlowInvariant(where: string): void {
 function resetRespondStateForSessionChange(): void {
   claudePending = null
   resetRespondFlow('session-change')
-  // 前のセッション向けに張った消灯タイマーを持ち越さない
-  clearHeadBlink()
+  replyFeedback = { session: '', lastReply: '', lastStatus: '', changed: false, ready: false }
+  claudeChatStatus = undefined
+  claudeChatLoading = true
+  clearG2Notice(false)
+  void refreshG2(true)
 }
 
 /**
@@ -4341,14 +4420,18 @@ function reconcileRespondPending(): void {
 async function sendPendingResponseAndFinish(): Promise<void> {
   const flow = respondFlow
   if (!claudePending || !flow) return
-  const sessionName = settings.sessionName
-  if (!sessionName) return
+  const sessionName = flow.sessionName
+  if (!sessionName || settings.sessionName !== sessionName || flow.pendingId !== claudePending.id) return
   // 応答は「この用件に対する回答」であることを id で明示する。サーバ側で現在の
   // pending と食い違っていたら 409 が返るので、取り違えた回答が通ることはない。
   const pendingId = claudePending.id
   if (flowIsInFlight(flow)) return   // 同じ用件への 2 通目 (再タップ) は出さない
   flow.inFlightSince = performance.now()
   flow.error = null
+  clearG2Notice(false)
+  paintStatus()
+  updateRecordButton()
+  void refreshG2(true) // 入力をロックした瞬間に Sending を出す。
   // fetch が決着しないままになった場合の脱出口。時間切れで入力ガードだけ先に解く。
   // タイマーはこの送信専用に持つ (グローバルに 1 本だと、遅れて決着した古い送信の
   // 後始末が、次の送信の脱出口を消してしまう)。
@@ -4414,8 +4497,11 @@ async function sendPendingResponseAndFinish(): Promise<void> {
       if (outcome === 'failed' || outcome === 'interrupted') {
         // 回答も cc-response 画面もそのまま残す。フッターに案内を出すだけ。
         showRespondError(outcome === 'interrupted' ? t('respondInterrupted') : t('respondFailedRetry'))
+        paintStatus()
+        updateRecordButton()
         void refreshG2(true)
       } else {
+        showG2Notice(t(outcome === 'sent' ? 'respondSent' : 'respondChanged'))
         completeRespondFlow(pendingId)
       }
     }
@@ -4906,6 +4992,7 @@ async function boot(): Promise<void> {
         else if (phase === 'recording') recordingScrollBack()
         else if (phase === 'cc-message') ccMsgScrollBack()
         else if (phase === 'cc-response') moveRespondCursor(-1)
+        else if (phase === 'cc-review') scrollAnswerReview(-1)
       },
       onScrollDown: () => {
         clearG2Notice()  // 一時通知は次の操作で消す
@@ -4916,6 +5003,7 @@ async function boot(): Promise<void> {
         else if (phase === 'recording') recordingScrollForward()
         else if (phase === 'cc-message') ccMsgScrollForward()
         else if (phase === 'cc-response') moveRespondCursor(1)
+        else if (phase === 'cc-review') scrollAnswerReview(1)
       },
       onClick: () => {
         clearG2Notice()  // 一時通知は次の操作で消す
@@ -4929,6 +5017,11 @@ async function boot(): Promise<void> {
         clearG2Notice()  // 一時通知は次の操作で消す
         if (respondInputBlocked()) return
         if (itemID === LENS_MENU_ID_TOGGLE_FAVORITE) toggleFavoriteFromMenu()
+        else if (itemID === LENS_MENU_ID_PROMPT_SEND && phase === 'pending') void confirmAndSend()
+        else if (itemID === LENS_MENU_ID_PROMPT_EDIT && phase === 'pending') void editPromptDraft()
+        else if (itemID === LENS_MENU_ID_PROMPT_DISCARD && phase === 'pending') discardPending()
+        else if (itemID === LENS_MENU_ID_REVIEW_RECORD && phase === 'cc-review') void recordAnswerAgain()
+        else if (itemID === LENS_MENU_ID_REVIEW_CHOICES && phase === 'cc-review') backToAnswerChoices()
         else log(`未知のメニュー項目: itemID=${itemID}`)
       },
       // 二重クリック: 各 phase での「戻る/キャンセル」操作
@@ -4946,6 +5039,7 @@ async function boot(): Promise<void> {
         else if (phase === 'recording') void abortRecording()  // 録音中止 (新しい文は追加しない)
         else if (phase === 'pending') discardPending()         // pending 全破棄 → idle
         else if (phase === 'cc-response') backToCcMessage()  // 選択肢画面 → 本文閲覧画面へ戻る
+        else if (phase === 'cc-review') backToAnswerChoices()
         else if (phase === 'cc-message') resetRespondFlow('cancel')  // 応答キャンセル → idle へ
         else if (
           phase === 'rootlist' ||

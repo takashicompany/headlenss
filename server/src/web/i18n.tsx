@@ -21,6 +21,10 @@ const STRINGS = {
                             ja: '半角の英数字・ハイフン (-)・アンダースコア (_) のみ使えます。最大 40 文字です。(日本語やスペースは使えません)' },
   loading:                { en: 'loading...', ja: '読み込み中...' },
   noSessions:             { en: 'no sessions yet', ja: 'セッションがありません' },
+  // 一覧の初回取得も再取得も、失敗したら空一覧と見せない。
+  serverUnreachable:      { en: "Can't reach the server — retrying", ja: 'サーバに届きません — 再試行しています' },
+  reconnecting:           { en: 'reconnecting', ja: '再接続中' },
+  dismissError:           { en: 'Dismiss', ja: '閉じる' },
   windowUnit:             { en: 'window', ja: 'ウィンドウ' },
   windowUnitPlural:       { en: 'windows', ja: 'ウィンドウ' },
   attached:               { en: 'attached', ja: '接続中' },
