@@ -21,11 +21,12 @@ const response = (status = 200, body = {}) => ({
 })
 const settle = async () => { for (let i = 0; i < 12; i++) await Promise.resolve() }
 
-function app() {
+function app({ polling = false, realAsr = false } = {}) {
   const frames = [], requests = [], timers = new Map(), elements = new Map()
   const control = {
     fetch: async () => { throw new Error('Unexpected fetch (network is disabled)') },
     transcript: 'Use the local cache.', recordings: 0,
+    bytes: 1024, seconds: 1, micResult: { ok: true }, sockets: [],
   }
   const element = () => ({
     value: '', textContent: '', innerHTML: '', dataset: {}, style: {},
@@ -45,8 +46,8 @@ function app() {
     },
     localStorage: { getItem: () => null, setItem() {} },
     location: { search: '', href: 'http://lens.invalid/' }, navigator: { userAgent: 'test' },
-    fetch: (url, options) => {
-      requests.push({ url, body: JSON.parse(options.body) })
+    fetch: (url, options = {}) => {
+      requests.push({ url, body: options.body ? JSON.parse(options.body) : undefined, signal: options.signal })
       return control.fetch(url, options)
     },
     frames, exports: {},
@@ -59,20 +60,34 @@ function app() {
     '@evenrealities/pretext': { getTextWidth: (s) => [...s].length * 10 },
     './renderer': { MAIN_INNER_WIDTH: 558, HEADER_INNER_WIDTH: 568 },
     './audio': {
-      getPcmByteLength: () => 1024, getRecordingSeconds: () => 1,
+      getPcmByteLength: () => control.bytes, getRecordingSeconds: () => control.seconds,
       resetPcmCounter() {}, startRecordingClock() {}, stopRecordingClock() {}, trackPcmFrame() {},
     },
     './mic': {
-      openMic: async () => ({ ok: true }), closeMic: async () => true,
+      openMic: async () => control.micResult, closeMic: async () => { control.closes = (control.closes ?? 0) + 1; return true },
       micIsHeld: () => false, micHealth: () => ({}), resetMicState() {},
     },
     './events': {}, './favorites': {}, './plugin-launch': {}, './plugin-takeover': {},
     './timer-guard': { installOneShotTimerGuard() {} },
-    './speechmatics-rt': { SpeechmaticsRT: class {
-      async start() { control.recordings++ }
-      async stop() { return control.transcript }
+    './speechmatics-rt': { recoverAsrText: (text, reason) => text.trim()
+      ? { kind: 'recovered-partial', text: text.trim(), reason } : { kind: 'failure', text: '', reason }, SpeechmaticsRT: class {
+      async start(opts) { control.recordings++; control.asr = opts; if (control.startError) throw control.startError }
+      async stop() { if (control.stopError) throw control.stopError; return control.outcome ?? (control.transcript.trim()
+        ? { kind: 'final', text: control.transcript.trim() } : { kind: 'failure', text: '', reason: 'no-speech' }) }
+      fullTranscript() { return control.partial ?? '' }
       abort() {}
     } },
+  }
+  if (realAsr) delete mocks['./speechmatics-rt']
+  context.WebSocket = class {
+    static OPEN = 1
+    readyState = 0
+    sent = []
+    constructor() { control.sockets.push(this) }
+    send(data) { if (this.failSend) throw new Error('socket send failed'); this.sent.push(data) }
+    close() { this.readyState = 3 }
+    open() { this.readyState = 1; this.onopen?.() }
+    message(message, transcript) { this.onmessage?.({ data: JSON.stringify({ message, metadata: { transcript } }) }) }
   }
   const modules = new Map()
   function compile(name) {
@@ -81,8 +96,8 @@ function app() {
       // Bootstrap is the only excluded entrypoint; tests drive the same flow functions
       // normally called by its installed gesture handlers.
       source = source.slice(0, source.lastIndexOf('\nboot().catch('))
-      source = source.replaceAll('import.meta.env.DEV', 'false')
     }
+    source = source.replaceAll('import.meta.env.DEV', 'false')
     return ts.transpileModule(source, { compilerOptions: {
       module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020,
     } }).outputText
@@ -90,7 +105,7 @@ function app() {
   function requireModule(name) {
     if (Object.hasOwn(mocks, name)) return mocks[name]
     if (!modules.has(name)) {
-      assert.ok(['./i18n', './settings', './server-client'].includes(name), `Unexpected module ${name}`)
+      assert.ok(['./i18n', './settings', './server-client', './speechmatics-rt'].includes(name), `Unexpected module ${name}`)
       const exports = {}
       modules.set(name, exports)
       vm.runInContext(`(function(require, exports) { ${compile(name)}\n})`, context)(requireModule, exports)
@@ -105,9 +120,10 @@ function app() {
     settings = { ...settings, sessionName: 'original', serverBaseUrl: 'http://original.invalid', speechmaticsApiKey: 'test' };
     bridge = {}; serverProbeOk = true; phase = 'idle';
     refreshG2 = async () => { frames.push(buildG2Frame()) };
-    refreshClaudeData = async () => {};
     applyClientBase();
+    serverProbeOk = true;
   `)
+  if (!polling) run('refreshClaudeData = async () => {}; claudeChatLoading = false')
   const draft = () => run(`ensurePromptDraft().sentences.push('Keep this prompt'); phase = 'pending'`)
   function question(count = 1, multi = false) {
     const questions = Array.from({ length: count }, (_, i) => ({
@@ -352,5 +368,312 @@ test('new menu labels fit the protocol limit in both languages', () => {
     }
     a.question(); a.run("phase = 'cc-review'")
     for (const item of a.run('lensMenuItems()')) assert.ok(Buffer.byteLength(item.itemName) <= 32)
+  }
+})
+
+test('ASR interruption preserves words as an unsent draft at the original destination', async () => {
+  const a = app(); a.draft()
+  await a.run('startRecording()'); await settle()
+  a.run("settings.sessionName = 'other'")
+  a.control.asr.onDead({ kind: 'recovered-partial', text: 'Words before disconnect', reason: 'socket closed' })
+  await settle()
+  assert.equal(a.run('phase'), 'pending')
+  assert.equal(a.run('promptDraft.sessionName'), 'original')
+  assert.match(a.run('pendingSendText()'), /Keep this prompt Words before disconnect/)
+  assert.match(a.run('buildG2Content()'), /Connection lost.*review partial text/)
+  assert.ok(a.control.closes > 0)
+  assert.equal(a.requests.length, 0)
+  a.modules.get('./i18n').setLanguage('ja')
+  assert.match(a.run('buildG2Content()'), /接続が切れました/)
+})
+
+test('recovered answer goes to review and never advances or submits by itself', async () => {
+  const a = app(); a.question(2)
+  await a.run('handleCcResponseClick()'); await settle()
+  a.control.asr.onDead({ kind: 'recovered-partial', text: 'My partial answer', reason: 'error' })
+  await settle()
+  assert.equal(a.run('phase'), 'cc-review')
+  assert.equal(a.run('respondFlow.reviewPartial'), true)
+  assert.equal(a.run('respondFlow.qIdx'), 0)
+  assert.equal(a.run('respondFlow.answers[0]'), undefined)
+  assert.match(a.run('answerReviewLines().join(String.fromCharCode(10))'), /Connection lost.*review partial text/)
+  assert.equal(a.requests.length, 0)
+  a.run('confirmReviewedAnswer()')
+  assert.equal(a.run('respondFlow.qIdx'), 1)
+  assert.equal(a.run('respondFlow.answers[0].text'), 'My partial answer')
+  assert.equal(a.requests.length, 0)
+})
+
+test('stop exceptions recover available words; empty results show No speech captured', async () => {
+  const a = app()
+  await a.run('startRecording()'); await settle()
+  a.control.stopError = new Error('broken stop'); a.control.partial = 'Keep the partial'
+  await a.run('stopRecordingToPending()')
+  assert.equal(a.run('phase'), 'pending')
+  assert.equal(a.run('pendingSendText()'), 'Keep the partial')
+  assert.equal(a.run('promptDraft.recoveredPartial'), true)
+  a.run('discardPending()'); a.control.stopError = null; a.control.transcript = ''
+  await a.run('startRecording()'); await settle()
+  await a.run('stopRecordingToPending()')
+  assert.equal(a.run('phase'), 'idle')
+  assert.match(a.run('buildG2Footer()'), /No speech captured/)
+  assert.equal(a.requests.length, 0)
+})
+
+test('startup, microphone, and empty mid-recording failures have distinct feedback', async () => {
+  const a = app(); a.control.startError = new Error('handshake failed')
+  await a.run('startRecording()'); await settle()
+  assert.match(a.run('buildG2Footer()'), /Rec start failed \(ASR\)/)
+  a.control.startError = null; a.control.bytes = 0; a.control.micResult = { ok: false, reason: 'failed' }
+  await a.run('startRecording()'); await settle()
+  assert.match(a.run('buildG2Footer()'), /Rec start failed \(mic\)/)
+  assert.equal(a.run('recordingReady'), false)
+  a.control.bytes = 1024; a.control.micResult = { ok: true }
+  await a.run('startRecording()'); await settle()
+  a.control.asr.onDead({ kind: 'failure', text: '', reason: 'connection closed' })
+  await settle()
+  assert.match(a.run('buildG2Footer()'), /Recording interrupted.*No speech captured/)
+  assert.equal(a.run('phase'), 'idle')
+})
+
+async function beginRealAsr(a) {
+  a.control.fetch = async () => response(200, { key_value: 'test-token' })
+  await a.run('startRecording()'); await settle()
+  const socket = a.control.sockets.at(-1)
+  socket.open(); socket.message('RecognitionStarted'); await settle()
+  return socket
+}
+
+for (const failure of ['timeout', 'close', 'error', 'send-throw']) {
+  test(`real ASR stop ${failure} returns recovered partial text, not a final result`, async () => {
+    const a = app({ realAsr: true }); const socket = await beginRealAsr(a)
+    socket.message('AddTranscript', 'Saved '); socket.message('AddPartialTranscript', 'words')
+    if (failure === 'send-throw') socket.failSend = true
+    const stopped = a.run('stopRecordingToPending()'); await settle()
+    if (failure === 'timeout') {
+      const [id, timer] = [...a.timers].find(([, t]) => t.ms === 8000)
+      a.timers.delete(id); timer.fn()
+    } else if (failure === 'close') socket.onclose({ code: 1006 })
+    else if (failure === 'error') socket.message('Error')
+    await stopped
+    assert.equal(a.run('phase'), 'pending')
+    assert.equal(a.run('pendingSendText()'), 'Saved words')
+    assert.equal(a.run('promptDraft.recoveredPartial'), true)
+    assert.equal(socket.onmessage, null)
+    assert.ok(a.requests.every(r => !r.url.includes('/input')))
+  })
+}
+
+test('real ASR clean final and live disconnect are distinguished', async () => {
+  const a = app({ realAsr: true }); const socket = await beginRealAsr(a)
+  socket.message('AddTranscript', 'A final answer')
+  const stopped = a.run('stopRecordingToPending()'); await settle()
+  socket.message('EndOfTranscript'); await stopped
+  assert.equal(a.run('promptDraft.recoveredPartial'), false)
+  a.run('discardPending()')
+  const next = await beginRealAsr(a)
+  next.message('AddPartialTranscript', 'Unfinished words')
+  next.onclose({ code: 1006 }); await settle()
+  assert.equal(a.run('pendingSendText()'), 'Unfinished words')
+  assert.equal(a.run('promptDraft.recoveredPartial'), true)
+})
+
+test('stale recovered answer cannot enter a replacement pending request', async () => {
+  const a = app(); a.question()
+  await a.run('handleCcResponseClick()'); await settle()
+  const stopped = a.run("stopRecordingToPending({kind:'recovered-partial',text:'Old answer',reason:'lost'})")
+  a.run("claudePending = {...claudePending, id:'replacement'}; rebindRespondFlow(claudePending)")
+  await stopped
+  assert.equal(a.run('respondFlow.pendingId'), 'replacement')
+  assert.equal(a.run('respondFlow.reviewText'), null)
+  assert.equal(a.run('promptDraft'), null)
+  assert.equal(a.requests.length, 0)
+})
+
+test('draft deletion is undoable once, including the last chunk and an intervening addition', async () => {
+  const a = app(); a.draft()
+  assert.match(a.run('buildG2Footer()'), /2Tap:Discard/)
+  a.run('removeLastSentence()')
+  assert.equal(a.run('phase'), 'pending')
+  assert.equal(a.run('pendingSendText()'), '')
+  assert.ok(a.run("lensMenuItems().some(i => i.itemName === 'Undo last deletion')"))
+  await a.run('startRecording()'); await settle(); await a.run('stopRecordingToPending()')
+  a.run('undoLastDeletion()')
+  assert.equal(a.run('pendingSendText()'), 'Keep this prompt Use the local cache.')
+  a.run('undoLastDeletion()')
+  assert.equal(a.run('pendingSentences().length'), 2)
+  assert.ok(!a.run('lensMenuItems().some(i => i.itemID === LENS_MENU_ID_PROMPT_UNDO)'))
+  a.run('removeLastSentence(); discardPending(); ensurePromptDraft()')
+  assert.equal(a.run('promptDraft.lastDeletion'), null)
+})
+
+test('question details keep option labels paired with measured wrapped descriptions', () => {
+  const a = app(); a.question(2)
+  a.run(`claudePending.questions[0].options = [
+    {label:'Local', description:'Private storage without a network. '.repeat(12)},
+    {label:'Remote', description:'Shared access with a connection.'}
+  ]; claudePending.id = 'described'; rebindRespondFlow(claudePending)`)
+  const lines = a.run('ccMessageLines()')
+  assert.ok(lines.indexOf('Local') < lines.findIndex(l => l.includes('Private storage')))
+  assert.ok(lines.indexOf('Remote') < lines.findIndex(l => l.includes('Shared access')))
+  assert.ok(lines.every(l => [...l].length * 10 <= a.run('CHAT_WRAP_PX')))
+  a.run('ccMsgScrollForward()')
+  assert.ok(a.run('flowMsgScroll()') > 0)
+  a.run('respondFlow.qIdx = 1')
+  assert.ok(!a.run('ccMessageLines().join(String.fromCharCode(10))').includes('Private storage'))
+})
+
+const cachedChat = Array.from({ length: 16 }, (_, i) => ({ role: 'assistant', text: `Message ${i}: ` + 'readable history '.repeat(8), ts: i + 1 }))
+function healthyFetch(chat = cachedChat) {
+  return async url => {
+    if (url.endsWith('/api/health')) return response(200, { ok: true })
+    if (url.endsWith('/pending')) return response(200, { pending: null })
+    if (url.includes('/chat')) return response(200, { chat, status: 'idle' })
+    return response(200, { sessions: [] })
+  }
+}
+
+test('one poll failure leaves the screen intact; repeated failures retain cached chat and offer Retry', async () => {
+  const a = app({ polling: true }); a.control.fetch = healthyFetch()
+  await a.run('refreshClaudeData()'); a.run('scrollOffset = 7')
+  const before = a.run('buildG2Content()')
+  a.control.fetch = async () => { throw new Error('offline') }
+  await a.run('refreshClaudeData()')
+  assert.equal(a.run('serverOffline'), false)
+  assert.equal(a.run('buildG2Content()'), before)
+  await a.run('refreshClaudeData()'); await a.run('refreshClaudeData()')
+  assert.equal(a.run('serverOffline'), true)
+  assert.equal(a.run('phase'), 'idle')
+  assert.equal(a.run('scrollOffset'), 7)
+  assert.equal(a.run('buildG2Content()'), before)
+  assert.match(a.run('buildG2Header()'), /Disconnected/)
+  assert.match(a.run('buildG2Footer()'), /Offline · last update/)
+  assert.ok(a.run('lensMenuItems().some(i => i.itemID === LENS_MENU_ID_RETRY_CONNECTION)'))
+  a.control.fetch = healthyFetch()
+  await a.run('retryConnection()')
+  assert.equal(a.run('serverOffline'), false)
+  assert.equal(a.run('settings.sessionName'), 'original')
+  assert.equal(a.run('scrollOffset'), 7)
+  assert.equal(a.run('buildG2Content()'), before)
+  assert.equal(a.run('healthRetryTimer'), null)
+})
+
+test('setup and disconnected are distinct, with bounded automatic health backoff', async () => {
+  const a = app({ polling: true })
+  a.run("settings.serverBaseUrl = ''; applyClientBase(); recomputePhase()")
+  assert.equal(a.run('phase'), 'unconfigured')
+  assert.equal(a.run('buildG2Header()'), 'Not configured')
+  a.run("settings.serverBaseUrl = 'http://offline.invalid'; applyClientBase()")
+  a.control.fetch = async () => { throw new Error('offline') }
+  await a.run('probeServer()')
+  assert.equal(a.run('phase'), 'disconnected')
+  assert.equal(a.run('buildG2Header()'), 'Disconnected')
+  assert.ok(a.run('lensMenuItems().some(i => i.itemID === LENS_MENU_ID_RETRY_CONNECTION)'))
+  for (const delay of [2000, 4000, 8000, 16000, 30000, 30000]) {
+    const id = a.run('healthRetryTimer'), timer = a.timers.get(id)
+    assert.equal(timer.ms, delay)
+    a.timers.delete(id); timer.fn(); await settle()
+  }
+  a.control.fetch = healthyFetch()
+  await a.run('retryConnection()')
+  assert.equal(a.run('phase'), 'rootlist')
+  assert.equal(a.run('serverOffline'), false)
+  assert.equal(a.run('healthRetryTimer'), null)
+})
+
+test('hung polls have a deadline and do not accumulate or accept late data', async () => {
+  const a = app({ polling: true }); const request = deferred()
+  a.control.fetch = () => request.promise
+  const first = a.run('refreshClaudeData()')
+  await a.run('refreshClaudeData()'); await a.run('refreshClaudeData()')
+  assert.equal(a.requests.length, 2)
+  const [id, timer] = [...a.timers].find(([, t]) => t.ms === 10000)
+  a.timers.delete(id); timer.fn(); await first
+  assert.equal(a.run('refreshAbortCtrl'), null)
+  assert.equal(a.run('pollFailures.chat'), 1)
+  assert.ok(a.requests.every(r => r.signal.aborted))
+  request.resolve(response(200, { chat: cachedChat, pending: null })); await settle()
+  assert.equal(a.run('claudeChat.length'), 0)
+})
+
+test('old server recovery cannot update the new server; concurrent retries share one probe', async () => {
+  const a = app({ polling: true }); const request = deferred()
+  a.control.fetch = () => request.promise
+  const retry = a.run('retryConnection()')
+  await a.run('retryConnection()')
+  assert.equal(a.requests.length, 1)
+  a.run("settings.serverBaseUrl = 'http://new.invalid'; applyClientBase()")
+  request.resolve(response(200, { ok: true })); await retry
+  assert.equal(a.run('serverProbeOk'), false)
+  assert.equal(a.run('listUpdatedAt'), 0)
+  assert.equal(a.requests.length, 1)
+})
+
+test('health success alone keeps cached chat marked offline until data recovers', async () => {
+  const a = app({ polling: true }); a.control.fetch = healthyFetch()
+  await a.run('refreshClaudeData()'); const updated = a.run('chatUpdatedAt')
+  a.run("notePollFailure('chat'); notePollFailure('chat'); notePollFailure('chat')")
+  const healthy = healthyFetch()
+  a.control.fetch = url => url.includes('/chat') ? Promise.reject(new Error('chat unavailable')) : healthy(url)
+  await a.run('retryConnection()')
+  assert.equal(a.run('serverOffline'), true)
+  assert.equal(a.run('serverProbeOk'), false)
+  assert.equal(a.run('chatUpdatedAt'), updated)
+  assert.match(a.run('buildG2Footer()'), /Offline/)
+  assert.ok(a.run('healthRetryTimer !== null'))
+})
+
+test('hung health probes expire and late results cannot mark the server connected', async () => {
+  const a = app({ polling: true }); const request = deferred()
+  a.control.fetch = () => request.promise
+  const retry = a.run('retryConnection()')
+  const [id, timer] = [...a.timers].find(([, t]) => t.ms === 8000)
+  a.timers.delete(id); timer.fn(); await retry
+  assert.equal(a.run('probeInFlight'), false)
+  assert.equal(a.run('serverOffline'), true)
+  assert.equal(a.requests[0].signal.aborted, true)
+  request.resolve(response(200, { ok: true })); await settle()
+  assert.equal(a.run('serverProbeOk'), false)
+  assert.equal(a.requests.length, 1)
+})
+
+test('recovering with appended messages preserves the visible reading window', async () => {
+  const a = app({ polling: true }); a.control.fetch = healthyFetch()
+  await a.run('refreshClaudeData()'); a.run('scrollOffset = 8')
+  const before = a.run('buildG2Content()')
+  a.run("notePollFailure('chat'); notePollFailure('chat'); notePollFailure('chat')")
+  a.control.fetch = healthyFetch([...cachedChat, {role:'assistant',text:'A new message after recovery.',ts:20}])
+  await a.run('retryConnection()')
+  assert.equal(a.run('buildG2Content()'), before)
+  assert.ok(a.run('scrollOffset') > 8)
+  assert.equal(a.run('settings.sessionName'), 'original')
+})
+
+for (const question of [false, true]) {
+  test(`escaping a stuck ASR finalization keeps ${question ? 'the answer in review' : 'the prompt draft'}`, async () => {
+    const a = app({ realAsr: true })
+    if (question) { a.question(); a.run('respondFlow.recording = true') }
+    const socket = await beginRealAsr(a)
+    socket.message('AddPartialTranscript', 'Words worth keeping')
+    const stopped = a.run('stopRecordingToPending()'); await settle()
+    a.run('blockingPhaseSince = Date.now() - 4000')
+    await a.run('toggleRecording()'); await stopped
+    assert.equal(a.run('phase'), question ? 'cc-review' : 'pending')
+    assert.equal(a.run(question ? 'respondFlow.reviewText' : 'pendingSendText()'), 'Words worth keeping')
+    assert.equal(a.run(question ? 'respondFlow.reviewPartial' : 'promptDraft.recoveredPartial'), true)
+    assert.equal(socket.onmessage, null)
+    assert.ok(a.requests.every(r => !r.url.includes('/input') && !r.url.includes('/respond')))
+  })
+}
+
+test('undo and Retry menu labels fit firmware limits in both languages', () => {
+  const a = app(); a.draft(); a.run('removeLastSentence(); serverOffline = true')
+  for (const lang of ['en', 'ja']) {
+    a.modules.get('./i18n').setLanguage(lang)
+    const items = a.run('lensMenuItems()')
+    assert.ok(items.some(i => i.itemID === a.run('LENS_MENU_ID_PROMPT_UNDO')))
+    assert.ok(items.some(i => i.itemID === a.run('LENS_MENU_ID_RETRY_CONNECTION')))
+    assert.ok(items.length <= 10)
+    for (const item of items) assert.ok(Buffer.byteLength(item.itemName) <= 32)
   }
 })

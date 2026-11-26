@@ -196,6 +196,13 @@ export function App() {
     setRoute(getRoute());
   };
 
+  // chat: true は URL の mode=chat だけを付ける。setMode は通さないので、
+  // 保存してある既定 (headlenss.modes) はこの遷移では変わらない。
+  const openSession = (name: string, opts?: { chat?: boolean; replace?: boolean }) => {
+    const query = opts?.chat ? '?mode=chat' : '';
+    navigate(`/sessions/${encodeURIComponent(name)}${query}`, { replace: opts?.replace });
+  };
+
   const switchMode = (mode: Mode, tab?: string | null) => {
     if (route.name !== 'session') return;
     setMode(route.sessionName, mode, tab);
@@ -311,7 +318,7 @@ export function App() {
   }, []);
 
   const metrics = systemStatus ? (
-    <div className="header-metrics" aria-label="PC usage">
+    <div className="header-metrics" aria-label={t('pcUsage')}>
       CPU {systemStatus.cpuPercent == null ? '-' : systemStatus.cpuPercent.toFixed(0) + '%'}
       <span>MEM {systemStatus.memory.usedPercent.toFixed(0)}% ({formatBytes(systemStatus.memory.used)} / {formatBytes(systemStatus.memory.total)})</span>
     </div>
@@ -341,7 +348,7 @@ export function App() {
       <div className="split-container" ref={splitContainerRef}>
         <div className="split-left" style={{ width: `calc(${splitRatio}% - 3px)` }}>
           <SessionList
-            onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`, { replace: true })}
+            onOpen={(name, opts) => openSession(name, { chat: opts?.chat, replace: true })}
             headerMetrics={metrics as ReactNode}
             activeSession={route.sessionName}
             splitToggle={splitToggle}
@@ -381,7 +388,7 @@ export function App() {
         onSwitchMode={switchMode}
       />
     )
-    : <SessionList onOpen={(name) => navigate(`/sessions/${encodeURIComponent(name)}`)} headerMetrics={metrics as ReactNode} splitToggle={splitToggle} />;
+    : <SessionList onOpen={(name, opts) => openSession(name, { chat: opts?.chat })} headerMetrics={metrics as ReactNode} splitToggle={splitToggle} />;
 
   return page;
 }

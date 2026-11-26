@@ -71,7 +71,7 @@ import {
   openMic,
   resetMicState,
 } from './mic'
-import { SpeechmaticsRT } from './speechmatics-rt'
+import { SpeechmaticsRT, recoverAsrText, type AsrOutcome } from './speechmatics-rt'
 import {
   applyTranslations,
   getLanguage,
@@ -201,7 +201,7 @@ const logEl = document.getElementById('log') as HTMLPreElement
 //                                        ↑doubleClick (戻る)┘
 //                          idle <──doubleClick (応答キャンセル)
 type Phase =
-  | 'boot' | 'unconfigured' | 'rootlist' | 'idle'
+  | 'boot' | 'unconfigured' | 'disconnected' | 'rootlist' | 'idle'
   | 'recording' | 'finalizing' | 'pending' | 'sending'
   | 'cc-message'   // Claude Code の承認/質問の本文を全文読む画面 (cc-response の手前)
   | 'cc-response'  // Claude Code の承認/質問待ちに応答する画面
@@ -254,6 +254,66 @@ let phase: Phase = 'boot'
 function currentPhase(): Phase { return phase }
 let serverProbeOk = false
 let serverErrorMsg = ''
+let serverOffline = false
+let connectionGeneration = 0
+let connectionBase = ''
+let backgroundStopped = false
+let healthRetryTimer: ReturnType<typeof setTimeout> | null = null
+let healthRetryAttempt = 0
+let probeInFlight = false
+const POLL_FAILURE_LIMIT = 3
+const POLL_TIMEOUT_MS = 10_000
+const pollFailures = { sessions: 0, list: 0, chat: 0 }
+let listUpdatedAt = 0
+let chatUpdatedAt = 0
+
+function scheduleHealthRetry(): void {
+  if (backgroundStopped || healthRetryTimer !== null || !settings.serverBaseUrl) return
+  const delay = Math.min(30_000, 2000 * 2 ** Math.min(healthRetryAttempt++, 4))
+  healthRetryTimer = setTimeout(() => {
+    healthRetryTimer = null
+    void probeServer()
+  }, delay)
+}
+
+function notePollFailure(feed: keyof typeof pollFailures): void {
+  pollFailures[feed]++
+  if (pollFailures[feed] < POLL_FAILURE_LIMIT) return
+  serverOffline = true
+  serverProbeOk = false
+  scheduleHealthRetry()
+  paintStatus()
+  void refreshG2(true)
+}
+
+function notePollSuccess(feed: keyof typeof pollFailures): void {
+  pollFailures[feed] = 0
+  if (feed === 'list') listUpdatedAt = Date.now()
+  if (feed === 'chat') chatUpdatedAt = Date.now()
+  if (probeInFlight) return // ヘルス復旧中は全データ取得が決着してから表示を更新する。
+  if (Object.values(pollFailures).some((n) => n >= POLL_FAILURE_LIMIT)) return
+  const wasOffline = serverOffline
+  serverOffline = false
+  serverProbeOk = true
+  healthRetryAttempt = 0
+  if (healthRetryTimer !== null) clearTimeout(healthRetryTimer)
+  healthRetryTimer = null
+  if (wasOffline) { paintStatus(); void refreshG2(true) }
+}
+
+function offlineStatus(): string {
+  const updated = phase === 'rootlist' ? listUpdatedAt : chatUpdatedAt
+  if (!updated) return t('offlineNoData')
+  const time = new Date(updated).toLocaleTimeString(getLanguage(), { hour: '2-digit', minute: '2-digit' })
+  return t('offlineLastUpdate').replace('{time}', time)
+}
+
+async function retryConnection(): Promise<void> {
+  if (healthRetryTimer !== null) clearTimeout(healthRetryTimer)
+  healthRetryTimer = null
+  healthRetryAttempt = 0
+  await probeServer()
+}
 let lastSessions: Session[] = []
 let history: HistoryEntry[] = []
 let historyCounter = 0
@@ -284,6 +344,8 @@ type PromptDraft = {
   sentences: string[]
   delivery: 'draft' | 'failed' | 'unknown'
   retryArmed: boolean
+  recoveredPartial: boolean
+  lastDeletion: { text: string; index: number } | null
 }
 // 下書きは録音開始時の宛先に束縛する。スマホでセッション/URLを切り替えても移し替えない。
 let promptDraft: PromptDraft | null = null
@@ -291,7 +353,7 @@ function ensurePromptDraft(): PromptDraft {
   return promptDraft ??= {
     sessionName: settings.sessionName,
     serverBaseUrl: settings.serverBaseUrl,
-    sentences: [], delivery: 'draft', retryArmed: false,
+    sentences: [], delivery: 'draft', retryArmed: false, recoveredPartial: false, lastDeletion: null,
   }
 }
 function pendingSentences(): string[] { return promptDraft?.sentences ?? [] }
@@ -300,7 +362,7 @@ function pendingSendText(): string    { return pendingSentences().join(' ') }
 function pendingHasContent(): boolean { return pendingSentences().some((s) => s.trim().length > 0) }
 function promptTargetName(): string   { return promptDraft?.sessionName ?? settings.sessionName }
 function promptRestPhase(): 'pending' | 'idle' {
-  if (pendingHasContent()) return 'pending'
+  if (pendingHasContent() || promptDraft?.lastDeletion) return 'pending'
   promptDraft = null // 空の録音を中止した後、古い宛先だけを次の録音へ持ち越さない。
   return 'idle'
 }
@@ -398,6 +460,8 @@ const LENS_MENU_ID_PROMPT_EDIT = 3
 const LENS_MENU_ID_PROMPT_DISCARD = 4
 const LENS_MENU_ID_REVIEW_RECORD = 5
 const LENS_MENU_ID_REVIEW_CHOICES = 6
+const LENS_MENU_ID_PROMPT_UNDO = 7
+const LENS_MENU_ID_RETRY_CONNECTION = 8
 
 /**
  * OS 長押しメニューの「★ お気に入り切替」が作用する対象のセッション名。
@@ -409,7 +473,7 @@ const LENS_MENU_ID_REVIEW_CHOICES = 6
  *  - 起動中 / 設定前 / エラー … 対象が無いので null。
  */
 function favoriteTargetSession(): string | null {
-  if (phase === 'boot' || phase === 'unconfigured' || phase === 'error') return null
+  if (phase === 'boot' || phase === 'unconfigured' || phase === 'disconnected' || phase === 'error') return null
   if (phase === 'rootlist') return currentRootRow()?.session.tmuxSessionName ?? null
   if (phase === 'pending' || phase === 'sending' || (phase === 'recording' && !recordingIsForRespond())) return promptTargetName() || null
   return settings.sessionName || null
@@ -428,21 +492,23 @@ function favoriteTargetSession(): string | null {
  * 結果 (付いた/外れた) は実行後にフッタの一時通知で必ず知らせる。
  */
 function lensMenuItems(): LensMenuItem[] | null {
-  if (favoriteTargetSession() === null) return null
-  const items = [{ itemID: LENS_MENU_ID_TOGGLE_FAVORITE, itemName: t('menuToggleFavorite') }]
+  const items: LensMenuItem[] = []
+  if (serverOffline && settings.serverBaseUrl) items.push({ itemID: LENS_MENU_ID_RETRY_CONNECTION, itemName: t('menuRetryConnection') })
+  if (favoriteTargetSession() !== null) items.push({ itemID: LENS_MENU_ID_TOGGLE_FAVORITE, itemName: t('menuToggleFavorite') })
   if (phase === 'pending') {
     items.push(
       { itemID: LENS_MENU_ID_PROMPT_SEND, itemName: t(promptDraft?.retryArmed ? 'menuPromptResend' : promptDraft?.delivery === 'draft' ? 'menuPromptSend' : 'menuPromptRetry') },
       { itemID: LENS_MENU_ID_PROMPT_EDIT, itemName: t('menuPromptEdit') },
       { itemID: LENS_MENU_ID_PROMPT_DISCARD, itemName: t('menuPromptDiscard') },
     )
+    if (promptDraft?.lastDeletion) items.push({ itemID: LENS_MENU_ID_PROMPT_UNDO, itemName: t('menuPromptUndo') })
   } else if (phase === 'cc-review') {
     items.push(
       { itemID: LENS_MENU_ID_REVIEW_RECORD, itemName: t('menuReviewRecord') },
       { itemID: LENS_MENU_ID_REVIEW_CHOICES, itemName: t('menuReviewChoices') },
     )
   }
-  return items
+  return items.length ? items : null
 }
 
 /** 送信済みメニューとの比較用の指紋。null (メニュー無し) も 1 つの状態として区別する。 */
@@ -539,6 +605,7 @@ type RespondFlow = {
   recording: boolean
   /** 未確定の音声回答。確認タップまでは answers に入れない。 */
   reviewText: string | null
+  reviewPartial: boolean
   reviewScrollOffset: number
   /**
    * 応答 POST を開始した時刻 (performance.now)。null = 送信中でない。
@@ -683,6 +750,7 @@ function dumpMicHealth(where: string): void {
 
 // ─── Status (top bar + G2) ─────────────────────────────────────────────
 function statusForCurrentPhase(): { dot: string; text: string } {
+  if (serverOffline && (phase === 'idle' || phase === 'rootlist' || phase === 'disconnected')) return { dot: 'err', text: offlineStatus() }
   switch (phase) {
     case 'boot':
       return { dot: 'idle', text: t('g2Booting') }
@@ -746,8 +814,10 @@ function recomputePhase(): void {
     phase === 'cc-response' ||
     phase === 'cc-review'
   ) return
-  if (!isReady()) {
+  if (!bridge || !isConfigured(settings)) {
     phase = 'unconfigured'
+  } else if (!serverProbeOk) {
+    if (phase !== 'idle' && phase !== 'rootlist') phase = 'disconnected'
   } else if (phase !== 'rootlist' && phase !== 'idle') {
     // boot or unconfigured から ready になった: rootlist へ
     phase = 'rootlist'
@@ -866,6 +936,7 @@ function updatePendingUI(): void {
 
 // ─── G2 lens ───────────────────────────────────────────────────────────
 function buildG2Content(): string {
+  if (phase === 'disconnected') return `${t('disconnected')}\n\n${t('connectionRetryHint')}`
   // ルート画面: tmux一覧 (cursor 中央)
   if (phase === 'rootlist') {
     return buildRootListView()
@@ -882,7 +953,7 @@ function buildG2Content(): string {
       // かかって切れる時、この空行を犠牲にして実テキストを安全域へ逃がす。
       return settings.chatBottomSpacer ? body + '\n' : body
     }
-    return `[${settings.sessionName || 'no session'}]\n${claudeChatLoading ? t('chatLoading') : t('chatNoMsg')}`
+    return `[${settings.sessionName || 'no session'}]\n${serverOffline ? t('offlineNoData') : claudeChatLoading ? t('chatLoading') : t('chatNoMsg')}`
   }
 
   // Claude Code 承認/質問 待ちのメッセージ全文閲覧画面 (応答画面の手前)
@@ -914,6 +985,7 @@ function buildG2Content(): string {
     // 「処理中」と見せると実態 (何も処理していない) と齟齬があるので empty 表示にする。
     lines.push('▌ ' + (liveTranscript || '(empty)'))
   } else if (phase === 'pending') {
+    if (promptDraft?.recoveredPartial) lines.push(...wrapText(t('asrPartialWarning'), CHAT_WRAP_PX), '')
     if (promptDraft?.delivery === 'unknown') lines.push(t('promptUnknownHint'), '')
     lines.push(pendingDisplayText() || t('promptEmpty'))
   } else if (phase === 'sending') {
@@ -1087,6 +1159,10 @@ function ccMessageLines(): string[] {
     }
     paras.push(q.question.slice(0, CC_MSG_MAX_CHARS))
     if (q.question.length > CC_MSG_MAX_CHARS) fullLength = q.question.length
+    for (const option of q.options ?? []) {
+      paras.push('', option.label)
+      if (option.description) paras.push(option.description)
+    }
   }
   // 切り詰めたことを黙っていると「読み切った」と誤解されるので末尾に明示する
   if (fullLength > 0) {
@@ -1156,7 +1232,11 @@ function buildCcMessageView(): string {
 
 /** 質問本文と未確定の回答を両方読む。確認タップ以外では送信しない。 */
 function answerReviewLines(): string[] {
-  const lines = [...ccMessageLines(), '', t('reviewAnswerText')]
+  const lines = respondFlow?.reviewPartial ? [...wrapText(t('asrPartialWarning'), CHAT_WRAP_PX), ''] : []
+  // 選択肢の説明は詳細画面で読む。確認画面では質問と自分の回答を先に見せる。
+  const question = claudePending?.questions?.[flowQIdx()]?.question ?? ''
+  for (const paragraph of question.slice(0, CC_MSG_MAX_CHARS).split('\n')) lines.push(...wrapText(paragraph, CHAT_WRAP_PX))
+  lines.push('', t('reviewAnswerText'))
   for (const paragraph of (respondFlow?.reviewText ?? '').split('\n')) {
     lines.push(...wrapText(paragraph, CHAT_WRAP_PX))
   }
@@ -1175,6 +1255,7 @@ function scrollAnswerReview(delta: number): void {
 function backToAnswerChoices(): void {
   if (phase !== 'cc-review' || !respondFlow) return
   respondFlow.reviewText = null
+  respondFlow.reviewPartial = false
   phase = 'cc-response'
   paintStatus()
   updateRecordButton()
@@ -1195,6 +1276,7 @@ function confirmReviewedAnswer(): void {
   if (!flow?.reviewText || flow.pendingId !== claudePending?.id || flow.sessionName !== settings.sessionName) return
   flow.answers[flow.qIdx] = { kind: 'type-something', text: flow.reviewText }
   flow.reviewText = null
+  flow.reviewPartial = false
   phase = 'cc-response'
   advanceToNextQuestionOrSubmit()
 }
@@ -1814,6 +1896,7 @@ function buildG2Footer(): string {
   if (flowIsInFlight(respondFlow) && isRespondFlowActive()) return t('respondSending')
   // 一時通知は操作案内より優先する。数秒か次の操作で自動的に消える。
   if (g2Notice !== null) return g2Notice
+  if (serverOffline && (phase === 'idle' || phase === 'rootlist' || phase === 'disconnected')) return offlineStatus()
   switch (phase) {
     case 'rootlist': {
       // 分母はカーソルが動ける行数 (プラグイン行を含む)。セッション数だと
@@ -1899,8 +1982,9 @@ function sessionStatusHeader(name: string, status: string): string {
 function buildG2Header(): string {
   switch (phase) {
     case 'boot':         return t('g2HeadBoot')
-    case 'unconfigured': return t('g2HeadSetup')
-    case 'rootlist':     return t('g2HeadRoot')
+    case 'unconfigured': return t('notConfigured')
+    case 'disconnected': return t('disconnected')
+    case 'rootlist':     return serverOffline ? t('disconnected') : t('g2HeadRoot')
     // 時間制限が無いのでカウントダウンはしない。代わりに経過秒をカウントアップする。
     case 'recording':    return sessionStatusHeader(recordingIsForRespond() ? settings.sessionName : promptTargetName(), `${t('g2HeadRecording')} ${getRecordingSeconds().toFixed(1)}s`)
     case 'finalizing':   return t('g2HeadFinalizing')
@@ -1928,7 +2012,7 @@ function buildG2Header(): string {
       return `${t('g2HeadCcResponse')}${num}${badge}`.slice(0, 56)
     }
     case 'error':        return t('g2HeadError')
-    case 'idle': return sessionStatusHeader(settings.sessionName, agentStatusBadge())
+    case 'idle': return sessionStatusHeader(settings.sessionName, serverOffline ? t('disconnected') : agentStatusBadge())
     default:             return t('appName')
   }
 }
@@ -2527,13 +2611,17 @@ async function reloadSessions(verbose = false): Promise<void> {
   if (!settings.serverBaseUrl || !serverProbeOk) return
   if (reloadSessionsInFlight) return
   reloadSessionsInFlight = true
+  const generation = connectionGeneration
   // 応答が返らないまま居座るのを防ぐ上限。時間切れで必ず in-flight が解ける。
   const ctrl = new AbortController()
   const timeout = setTimeout(() => ctrl.abort(), 10_000)
   try {
-    lastSessions = await client.listSessions(ctrl.signal)
+    const next = await withTimeout(client.listSessions(ctrl.signal), POLL_TIMEOUT_MS)
+    if (generation !== connectionGeneration) return
+    lastSessions = next
+    notePollSuccess('sessions')
     if (verbose) log(`sessions: ${lastSessions.map((s) => s.name).join(', ') || '(none)'}`)
-    if (lastSessions.length > 0 && !lastSessions.some((s) => s.name === settings.sessionName)) {
+    if (lastSessions.length > 0 && !settings.sessionName) {
       if (isRespondFlowActive() || promptDraft !== null) {
         // 応答フローの最中は自動切替を保留する。
         // なぜ: 回答を組んでいる最中に足元のセッションを差し替えると、作りかけの回答が
@@ -2554,10 +2642,13 @@ async function reloadSessions(verbose = false): Promise<void> {
     paintStatus()
     if (phase === 'rootlist') void refreshG2(true)
   } catch (e) {
+    if (generation !== connectionGeneration) return
+    notePollFailure('sessions')
     if ((e as DOMException).name !== 'AbortError') log(`listSessions error: ${(e as Error).message}`)
   } finally {
     clearTimeout(timeout)
-    reloadSessionsInFlight = false
+    ctrl.abort()
+    if (generation === connectionGeneration) reloadSessionsInFlight = false
   }
 }
 
@@ -2601,16 +2692,19 @@ async function reloadClaudeSessions(): Promise<void> {
   // 未解決リクエスト/プロミスが累積して重くなるのを防ぐ。タイムアウトで必ず解ける。
   if (reloadClaudeInFlight) return
   reloadClaudeInFlight = true
+  const generation = connectionGeneration
   const ctrl = new AbortController()
   const timeout = setTimeout(() => ctrl.abort(), 10_000)
   try {
-    const next = await client.listClaudeSessions(ctrl.signal)
+    const next = await withTimeout(client.listClaudeSessions(ctrl.signal), POLL_TIMEOUT_MS)
+    if (generation !== connectionGeneration) return
     // rootlist に出る行が変わったかを、実際に描く行の並びで比較する。
     // セッションだけを見ていると、プラグイン行の増減 (dev server の起動/停止) を
     // 取りこぼす。取りこぼすとレンズは古い一覧のままなのにカーソルは新しい行配列で
     // 解決されるため、光っている行とタップで実行される行がズレる。
     const before = rootRowSignature()
     claudeSessions = next
+    notePollSuccess('list')
     const changed = before !== rootRowSignature()
     // カーソルの指す行が消えた場合、キー解決内でクランプされる
     resolveRootCursorIndex()
@@ -2619,10 +2713,13 @@ async function reloadClaudeSessions(): Promise<void> {
     // rootlist を見ている間は中身が変わったら即レンズ再描画
     if (changed && phase === 'rootlist') void refreshG2(true)
   } catch (e) {
+    if (generation !== connectionGeneration) return
+    notePollFailure('list')
     if ((e as DOMException).name !== 'AbortError') log(`listClaudeSessions error: ${(e as Error).message}`)
   } finally {
     clearTimeout(timeout)
-    reloadClaudeInFlight = false
+    ctrl.abort()
+    if (generation === connectionGeneration) reloadClaudeInFlight = false
   }
 }
 
@@ -2636,19 +2733,20 @@ async function refreshClaudeData(): Promise<void> {
     setOutputDisplay('(no session selected)', 'muted')
     return
   }
-  // 前回の in-flight fetch を abort し、新しい AbortController を用意する
-  abortInFlightRefresh()
+  // 低速応答を毎 tick 中断しない。セッション切替は専用の abort 経路で無効化する。
+  if (refreshAbortCtrl) return
   const ctrl = new AbortController()
   refreshAbortCtrl = ctrl
+  const generation = connectionGeneration
   // fetch 開始時点のセッション名を保持。完了時にセッションが切り替わっていたら結果を捨てる
   const targetSession = settings.sessionName
   try {
-    const [chatResponse, pending] = await Promise.all([
+    const [chatResponse, pending] = await withTimeout(Promise.all([
       client.getClaudeChat(targetSession, ctrl.signal, 20),
       client.getClaudePending(targetSession, ctrl.signal),
-    ])
+    ]), POLL_TIMEOUT_MS)
     // ── セッション切替ガード: fetch 中にユーザがセッションを変えた場合は結果を破棄 ──
-    if (settings.sessionName !== targetSession) return
+    if (settings.sessionName !== targetSession || generation !== connectionGeneration || ctrl.signal.aborted) return
     // サーバが状態表示用に合成した行 (synthetic) は捨てる。表示は status から
     // ローカライズして作り直す。ドット数が 500ms ごとに変わるので、素通しすると
     // 指紋が毎回変わって全文の再整形が走り続ける、という問題も同時に消える。
@@ -2687,6 +2785,7 @@ async function refreshClaudeData(): Promise<void> {
     }
     claudeChat = chat
     claudeChatLoading = false
+    notePollSuccess('chat')
     // 応答画面を開いている間に、対象の用件そのものが入れ替わっていないかを突き合わせる
     reconcileRespondPending()
     if (chat.length > 0) {
@@ -2724,6 +2823,8 @@ async function refreshClaudeData(): Promise<void> {
       markAsRead(targetSession)
     }
   } catch (e) {
+    if (generation !== connectionGeneration || settings.sessionName !== targetSession || ctrl.signal.aborted) return
+    notePollFailure('chat')
     // AbortError はセッション切替による意図的キャンセルなので無視する
     if ((e as DOMException).name === 'AbortError') return
     // エラーでも現在セッション向けのフェッチならローディング解除
@@ -2732,6 +2833,9 @@ async function refreshClaudeData(): Promise<void> {
     setOutputDisplay(`error: ${msg}`, 'err')
     log(`refreshClaudeData error: ${msg}`)
     outputFetchOkLogged = false
+  } finally {
+    ctrl.abort()
+    if (refreshAbortCtrl === ctrl) refreshAbortCtrl = null
   }
 }
 
@@ -2849,6 +2953,13 @@ function startSessionsRefreshTimer(): void {
  * (取り込みに失敗して headlenss に戻る経路)。止める側と再開する側は必ず対で更新すること。
  */
 function stopAllBackgroundWork(): void {
+  backgroundStopped = true
+  connectionGeneration++
+  probeInFlight = false
+  reloadSessionsInFlight = false
+  reloadClaudeInFlight = false
+  if (healthRetryTimer !== null) clearTimeout(healthRetryTimer)
+  healthRetryTimer = null
   for (const t of [recordingTimer, sessionsRefreshTimer, outputPollTimer, historyRenderTimer]) {
     if (t) clearInterval(t)
   }
@@ -2910,6 +3021,8 @@ function stopAllBackgroundWork(): void {
  *   レンズ送信の待機枠  … 呼び出し側の再描画要求 (cancelPluginNavigation) で積み直す
  */
 function restartAllBackgroundWork(): void {
+  backgroundStopped = false
+  if (serverOffline) scheduleHealthRetry()
   startHistoryRenderTimer()
   startSessionsRefreshTimer()
   startOutputPolling()
@@ -2950,6 +3063,31 @@ async function persistSettings(): Promise<void> {
 }
 
 function applyClientBase(): void {
+  if (connectionBase !== settings.serverBaseUrl) {
+    connectionBase = settings.serverBaseUrl
+    connectionGeneration++
+    abortInFlightRefresh()
+    probeInFlight = false
+    reloadSessionsInFlight = false
+    reloadClaudeInFlight = false
+    pollFailures.sessions = pollFailures.list = pollFailures.chat = 0
+    healthRetryAttempt = 0
+    serverOffline = false
+    serverProbeOk = false
+    if (healthRetryTimer !== null) clearTimeout(healthRetryTimer)
+    healthRetryTimer = null
+    listUpdatedAt = chatUpdatedAt = 0
+    // 別サーバのキャッシュを同名セッションの履歴として見せない。
+    lastSessions = []
+    claudeSessions = []
+    claudeChat = []
+    chatLinesCache = []
+    chatLinesCacheKey = ''
+    claudeChatStatus = undefined
+    claudeDeliveryWarning = null
+    resetRespondStateForSessionChange()
+    resetScroll()
+  }
   client.setBase(settings.serverBaseUrl)
 }
 
@@ -3066,34 +3204,53 @@ function setProbeText(kind: 'ok' | 'err' | 'busy' | 'muted', text: string): void
 async function probeServer(): Promise<void> {
   if (!settings.serverBaseUrl) {
     serverProbeOk = false
-    serverErrorMsg = 'unset'
+    serverOffline = false
     setProbeText('muted', t('unset'))
-    renderSessionPills()
     recomputePhase()
     return
   }
+  if (probeInFlight || backgroundStopped) return
+  probeInFlight = true
+  const generation = connectionGeneration
+  const ctrl = new AbortController()
   setProbeText('busy', t('probeChecking'))
   try {
-    const res = await client.health()
-    if (res.ok) {
+    const res = await withTimeout(client.health(ctrl.signal), 8000)
+    if (generation !== connectionGeneration) return
+    if (!res.ok) throw new Error('health returned ok=false')
+    serverProbeOk = true
+    serverErrorMsg = ''
+    // ヘルス応答だけで古い chat を「最新」にしない。データも取得してから復旧する。
+    await Promise.all([reloadSessions(), reloadClaudeSessions(), refreshClaudeData()])
+    if (generation !== connectionGeneration) return
+    if (!Object.values(pollFailures).some((n) => n > 0)) {
+      serverOffline = false
       serverProbeOk = true
-      serverErrorMsg = ''
-      await reloadSessions()
-      setProbeText('ok', `OK · sessions: ${lastSessions.length}`)
-    } else {
-      serverProbeOk = false
-      serverErrorMsg = 'health returned ok=false'
-      setProbeText('err', serverErrorMsg)
+      healthRetryAttempt = 0
+      if (healthRetryTimer !== null) clearTimeout(healthRetryTimer)
+      healthRetryTimer = null
     }
+    setProbeText(serverOffline ? 'err' : 'ok', serverOffline ? t('disconnected') : t('probeOk'))
   } catch (e) {
+    if (generation !== connectionGeneration) return
     serverProbeOk = false
+    serverOffline = true
     serverErrorMsg = (e as Error).message
-    setProbeText('err', serverErrorMsg)
+    setProbeText('err', t('disconnected'))
     log(`probe error: ${serverErrorMsg}`)
   } finally {
-    renderSessionPills()
-    recomputePhase()
-    renderClaudeSessionsList()
+    ctrl.abort()
+    if (generation === connectionGeneration) {
+      probeInFlight = false
+      if (serverOffline) {
+        serverProbeOk = false
+        scheduleHealthRetry()
+      }
+      renderSessionPills()
+      recomputePhase()
+      renderClaudeSessionsList()
+      void refreshG2(true)
+    }
   }
 }
 
@@ -3337,6 +3494,9 @@ async function startRecording(): Promise<void> {
     if (rtSession !== session || phase !== 'recording') return
     if (notice) showG2Notice(notice)
     stopRecordingTimer()
+    stopRecordingClock()
+    recordingReady = false
+    void closeMic('start-failed', MIC_CLOSE_WAIT_MS)
     try { session.abort() } catch { /* ignore */ }
     rtSession = null
     const flow = respondFlow
@@ -3364,20 +3524,22 @@ async function startRecording(): Promise<void> {
         language: settings.speechmaticsLang,
         operatingPoint: settings.speechmaticsOperatingPoint,
         onPartial: (text) => {
+          if (rtSession !== session || phase !== 'recording') return
           liveTranscript = text
           void refreshG2()
         },
         onFinal: (text) => {
+          if (rtSession !== session || phase !== 'recording') return
           liveTranscript = text
           void refreshG2()
         },
         onError: (err) => log(`RT error: ${err.message}`),
         // 録音中に接続が死んだ場合。放っておくと「録音中」のまま無音を撮り続け、
         // 停止しても何も出てこない。ここで録音前の画面まで畳む。
-        onDead: (reason) => {
-          diag(`RT 接続が録音中に切れました (${reason}) — 録音を畳みます`)
+        onDead: (outcome) => {
+          diag(`RT 接続が録音中に切れました (${outcome.kind}) — 受信済みの語句を残します`)
           if (rtSession === session && phase === 'recording') {
-            revertToIdle(t('g2NoticeRecFailAsr'))
+            void stopRecordingToPending(outcome)
           }
         },
       })
@@ -3407,8 +3569,12 @@ async function startRecording(): Promise<void> {
       // になるので、診断だけ残して録音を続ける。
       dumpMicHealth('open-unsettled')
     } else if (!openResult.ok) {
-      // 例外 / 多重取得。これも録音は止めない (実機が開いていることがある)。
+      // 実際の取得エラーで PCM も無ければマイク失敗。busy / PCM 到着済みは継続。
       dumpMicHealth(`open-not-ok:${openResult.reason}`)
+      if (getPcmByteLength() === 0 && openResult.reason !== 'busy') {
+        revertToIdle(t('g2NoticeRecFailMic'))
+        return
+      }
     }
     // 待っている間に停止/畳み込みが入っていないか。
     if (rtSession !== session || phase !== 'recording') {
@@ -3431,7 +3597,7 @@ async function startRecording(): Promise<void> {
 }
 
 /** 録音停止 → ASR 確定 → pending 状態へ。送信はしない (ユーザの↑/↓判断待ち) */
-async function stopRecordingToPending(): Promise<void> {
+async function stopRecordingToPending(recovered?: AsrOutcome): Promise<void> {
   // ── 最初の await より前に「この録音が何のためのものか」を確保する ──
   // 停止処理には G2 マイク停止と ASR の最終結果待ちという 2 つの await が挟まり、
   // その間にセッション切替 (足場ごとの差し替え) が起こりうる。後から「今の状態」を
@@ -3449,6 +3615,13 @@ async function stopRecordingToPending(): Promise<void> {
    * 強制脱出 (タップで finalizing を打ち切った) 後も同じ扱いにする。
    */
   const abandonIfSessionSwitched = (where: string): boolean => {
+    if (recordingFlow && respondFlow !== recordingFlow) {
+      if (startedRt && rtSession === startedRt) {
+        startedRt.abort()
+        rtSession = null
+      }
+      return true // 新しい質問/録音の phase も消さない。
+    }
     if (recoveryEpoch !== startedEpoch) {
       log(`録音停止 (${where}): 強制リセット後なので結果を破棄します`)
       if (startedRt && rtSession === startedRt) {
@@ -3497,12 +3670,14 @@ async function stopRecordingToPending(): Promise<void> {
 
     /** 録音終了時の戻り先を決める共通ハンドラ。
      *  録音が cc-response の Type something 用なら応答画面へ、そうでなければ tmux 用 pending へ。 */
-    const finishWithText = (text: string): void => {
+    const finishWithOutcome = (outcome: AsrOutcome): void => {
       // 強制脱出で既に畳まれている場合、ここで書き戻すと現在の画面を壊す。
       if (recoveryEpoch !== startedEpoch) {
         log('録音停止: 強制リセット後なので結果は書き戻しません')
         return
       }
+      const text = outcome.text
+      if (!text) showG2Notice(t(outcome.kind === 'failure' && outcome.reason !== 'no-speech' ? 'asrLostNoSpeech' : 'asrNoSpeech'))
       if (recordingFlow) {
         recordingFlow.recording = false
         // 喋っている間に戻り先が消えていることがある (別経路で承認された / セッションを
@@ -3517,6 +3692,7 @@ async function stopRecordingToPending(): Promise<void> {
         // 音声回答は未確定のまま確認画面へ。停止操作だけでは次の質問/送信へ進めない。
         if (text) {
           flow.reviewText = text
+          flow.reviewPartial = outcome.kind === 'recovered-partial'
           flow.reviewScrollOffset = 0
           log(`respond type-something: "${text.slice(0, 40)}"`)
         } else {
@@ -3531,13 +3707,21 @@ async function stopRecordingToPending(): Promise<void> {
       // 通常 (tmux 用) フロー
       if (text) {
         recordingDraft?.sentences.push(text)
+        if (recordingDraft && outcome.kind === 'recovered-partial') recordingDraft.recoveredPartial = true
         log(`pending: appended sentence #${pendingSentences().length}`)
       }
-      phase = 'pending'
+      phase = promptRestPhase()
       paintStatus()
       updateRecordButton()
       updatePendingUI()
       void refreshG2(true)
+    }
+
+    if (recovered) {
+      if (rtSession === startedRt) rtSession = null
+      liveTranscript = ''
+      finishWithOutcome(recovered)
+      return
     }
 
     const seconds = getRecordingSeconds()
@@ -3547,20 +3731,20 @@ async function stopRecordingToPending(): Promise<void> {
       rtSession = null
       durationEl.textContent = '0.0s'
       liveTranscript = ''
-      finishWithText('')
+      finishWithOutcome({ kind: 'failure', text: '', reason: 'no-speech' })
       return
     }
 
     const rt = rtSession
     if (!rt) {
-      finishWithText('')
+      finishWithOutcome(recoverAsrText(liveTranscript, 'connection closed'))
       return
     }
-    let text = ''
+    let outcome: AsrOutcome
     const t0 = performance.now()
     try {
-      text = (await rt.stop()).trim()
-      log(`RT final: "${text.slice(0, 80)}" (${(performance.now() - t0).toFixed(0)}ms)`)
+      outcome = await rt.stop()
+      log(`RT ${outcome.kind}: "${outcome.text.slice(0, 80)}" (${(performance.now() - t0).toFixed(0)}ms)`)
     } catch (e) {
       const errorMsg = (e as Error).message
       log(`RT stop error: ${errorMsg}`)
@@ -3575,10 +3759,7 @@ async function stopRecordingToPending(): Promise<void> {
         durationMs: performance.now() - t0,
         errorMsg,
       })
-      durationEl.textContent = '0.0s'
-      liveTranscript = ''
-      finishWithText('')
-      return
+      outcome = recoverAsrText(rt.fullTranscript() || liveTranscript, errorMsg)
     } finally {
       // 片付けるのは自分が止めた接続だけ。世代が変わった後に始まった新しい録音の
       // 接続まで手放すと、その録音が確定できなくなる。
@@ -3588,11 +3769,11 @@ async function stopRecordingToPending(): Promise<void> {
     if (abandonIfSessionSwitched('ASR 確定後')) return
     durationEl.textContent = '0.0s'
     liveTranscript = ''
-    finishWithText(text)
+    finishWithOutcome(outcome)
   } finally {
     // どの経路 (return / 例外) から抜けても 'finalizing' を残さない。
     // 残すと操作を一切受け付けない画面に閉じ込められる。
-    if (recoveryEpoch === startedEpoch) {
+    if (recoveryEpoch === startedEpoch && (!recordingFlow || respondFlow === recordingFlow)) {
       blockingPhaseSince = 0
       if (phase === 'finalizing') {
         diag('録音停止が finalizing のまま抜けました — 畳んで操作を受け付けます')
@@ -3693,7 +3874,19 @@ function removeLastSentence(): void {
   if (pendingSentences().length === 0) return  // 既に空: そのまま pending に留まる
   if (promptDraft) promptDraft.retryArmed = false
   const removed = pendingSentences().pop()
+  if (promptDraft && removed !== undefined) promptDraft.lastDeletion = { text: removed, index: pendingSentences().length }
   log(`pending: removed last sentence "${(removed ?? '').slice(0, 40)}" (remaining ${pendingSentences().length})`)
+  updatePendingUI()
+  paintStatus()
+  void refreshG2(true)
+}
+
+function undoLastDeletion(): void {
+  if (phase !== 'pending' || !promptDraft?.lastDeletion) return
+  const { text, index } = promptDraft.lastDeletion
+  promptDraft.sentences.splice(index, 0, text)
+  promptDraft.lastDeletion = null
+  promptDraft.retryArmed = false
   updatePendingUI()
   paintStatus()
   void refreshG2(true)
@@ -3796,6 +3989,7 @@ function forceResetBlockedPhase(): void {
   stopRecordingClock()
   recordingReady = false
   const rt = rtSession
+  const recovered = phase === 'finalizing' ? recoverAsrText(rt?.fullTranscript() || liveTranscript, 'finalizing-interrupted') : null
   rtSession = null
   if (rt) { try { rt.abort() } catch { /* ignore */ } }
   // マイクは投げっぱなしで解放する (ここで待つと脱出口の意味がない)。
@@ -3817,9 +4011,18 @@ function forceResetBlockedPhase(): void {
     if (!claudePending || claudePending.id !== flow.pendingId) {
       resetRespondFlow('pending-gone')
     } else {
+      if (recovered?.text) {
+        flow.reviewText = recovered.text
+        flow.reviewPartial = true
+        flow.reviewScrollOffset = 0
+      }
       phase = flow.reviewText !== null ? 'cc-review' : 'cc-response'
     }
   } else {
+    if (recovered?.text && promptDraft) {
+      promptDraft.sentences.push(recovered.text)
+      promptDraft.recoveredPartial = true
+    }
     phase = promptRestPhase()
   }
   paintStatus()
@@ -4242,6 +4445,7 @@ function enterRespondFlow(pending: Pending): void {
     pendingId: pending.id,
     sessionName: settings.sessionName,
     reviewText: null,
+    reviewPartial: false,
     reviewScrollOffset: 0,
     qIdx: 0,
     cursor: 0,
@@ -4265,6 +4469,7 @@ function rebindRespondFlow(pending: Pending): void {
     pendingId: pending.id,
     sessionName: settings.sessionName,
     reviewText: null,
+    reviewPartial: false,
     reviewScrollOffset: 0,
     qIdx: 0,
     cursor: 0,
@@ -4384,6 +4589,8 @@ function assertRespondFlowInvariant(where: string): void {
  * Type something の録音中 / 確定待ちでも、録音を捨てて idle へ落とす。
  */
 function resetRespondStateForSessionChange(): void {
+  chatUpdatedAt = 0
+  pollFailures.chat = 0
   claudePending = null
   resetRespondFlow('session-change')
   replyFeedback = { session: '', lastReply: '', lastStatus: '', changed: false, ready: false }
@@ -5020,6 +5227,8 @@ async function boot(): Promise<void> {
         else if (itemID === LENS_MENU_ID_PROMPT_SEND && phase === 'pending') void confirmAndSend()
         else if (itemID === LENS_MENU_ID_PROMPT_EDIT && phase === 'pending') void editPromptDraft()
         else if (itemID === LENS_MENU_ID_PROMPT_DISCARD && phase === 'pending') discardPending()
+        else if (itemID === LENS_MENU_ID_PROMPT_UNDO) undoLastDeletion()
+        else if (itemID === LENS_MENU_ID_RETRY_CONNECTION) void retryConnection()
         else if (itemID === LENS_MENU_ID_REVIEW_RECORD && phase === 'cc-review') void recordAnswerAgain()
         else if (itemID === LENS_MENU_ID_REVIEW_CHOICES && phase === 'cc-review') backToAnswerChoices()
         else log(`未知のメニュー項目: itemID=${itemID}`)

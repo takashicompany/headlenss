@@ -191,8 +191,8 @@ export class HeadlenssClient {
     return `${trimTrailingSlash(this.base)}${path}`
   }
 
-  async health(): Promise<{ ok: boolean }> {
-    const res = await fetch(this.url('/api/health'))
+  async health(signal?: AbortSignal): Promise<{ ok: boolean }> {
+    const res = await fetch(this.url('/api/health'), { signal: signal ?? timeoutSignal(8000) })
     if (!res.ok) throw new Error(`health HTTP ${res.status}`)
     return (await res.json()) as { ok: boolean }
   }

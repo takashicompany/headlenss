@@ -39,6 +39,25 @@ type Pending = {
   createdAt: number;
 };
 
+/**
+ * 許可の前に見せる本文。空白と改行はそのまま残す (flatten すると
+ * `echo a\nrm` と `echo a rm` が同じに見える)。
+ * コマンドやパス等の決まった欄が無いときは null。その場合は生 JSON を開いて出す。
+ */
+function primaryToolInput(input: unknown): string | null {
+  const exact = (value: unknown): string | null => (
+    typeof value === 'string' && value.trim() ? value : null
+  );
+  if (typeof input === 'string') return exact(input);
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const obj = input as Record<string, unknown>;
+  for (const key of ['command', 'cmd', 'file_path', 'path', 'pattern', 'query', 'url', 'description', 'prompt']) {
+    const value = exact(obj[key]);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
 type CodexHookHealth = {
   status: 'ok' | 'missing' | 'incomplete';
   missingEvents: string[];
@@ -205,6 +224,15 @@ export function ChatView({
   const [currentQIdx, setCurrentQIdx] = useState(0);
   // 許可リクエスト用のメッセージ
   const [permMessage, setPermMessage] = useState('');
+  // 生 JSON は補助。本文が取れる依頼は閉じたまま、取れない依頼は最初から開く。
+  // 同じ id のポーリングでは、ここで開閉を戻さない。
+  const [permDetailsFor, setPermDetailsFor] = useState<string | null>(null);
+  const [permDetailsOpen, setPermDetailsOpen] = useState(false);
+  const permDetailsId = pendingInter?.kind === 'permission' ? pendingInter.id : null;
+  if (permDetailsId !== permDetailsFor) {
+    setPermDetailsFor(permDetailsId);
+    setPermDetailsOpen(permDetailsId !== null && primaryToolInput(pendingInter?.toolInput) === null);
+  }
   const [respondingPending, setRespondingPending] = useState(false);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -708,8 +736,10 @@ export function ChatView({
     void refreshWebTabs();
   }, [tab, bumpReload, refreshWebTabs]);
 
+  const showCheckTabs = webTabsLoaded && webTabs.length === 0;
+
   return (
-    <div className={`page-session chat-view${webTabs.length > 0 ? ' chat-view--tabbed' : ''}`}>
+    <div className={`page-session chat-view${webTabs.length > 0 ? ' chat-view--tabbed' : ''}${showCheckTabs ? ' chat-view--check' : ''}`}>
       <header className="session-header">
         <button onClick={onBack} aria-label={t('back')}>{t('back')}</button>
         <span className="session-title">{sessionName}</span>
@@ -866,7 +896,7 @@ export function ChatView({
                       onClick={() => setCurrentQIdx(totalQ - 1)}
                       disabled={respondingPending}
                     >
-                      {t('back')}
+                      {t('previous')}
                     </button>
                     <button
                       type="button"
@@ -1014,7 +1044,7 @@ export function ChatView({
                     onClick={() => setCurrentQIdx(idx - 1)}
                     disabled={idx === 0 || respondingPending}
                   >
-                    {t('back')}
+                    {t('previous')}
                   </button>
                   {isAnswered(idx) && (
                     <button
@@ -1034,13 +1064,29 @@ export function ChatView({
           {pendingInter?.kind === 'permission' && (
             <div className="chat-pending">
               <div className="chat-pending-title">{t('permRequestTitle')}</div>
-              <div className="chat-pending-tool">tool: <code>{pendingInter.toolName}</code></div>
-              <pre className="chat-pending-toolinput">
-                {(() => {
-                  try { return JSON.stringify(pendingInter.toolInput, null, 2); }
-                  catch { return String(pendingInter.toolInput); }
-                })()}
-              </pre>
+              <div className="chat-pending-tool">{t('toolLabel')}: <code>{pendingInter.toolName}</code></div>
+              {(() => {
+                const command = primaryToolInput(pendingInter.toolInput);
+                return command !== null ? (
+                  <pre className="chat-pending-toolsum">{command}</pre>
+                ) : null;
+              })()}
+              <button
+                type="button"
+                className="chat-pending-details"
+                aria-expanded={permDetailsOpen}
+                onClick={() => setPermDetailsOpen((open) => !open)}
+              >
+                {t('details')}
+              </button>
+              {permDetailsOpen && (
+                <pre className="chat-pending-toolinput">
+                  {(() => {
+                    try { return JSON.stringify(pendingInter.toolInput, null, 2); }
+                    catch { return String(pendingInter.toolInput); }
+                  })()}
+                </pre>
+              )}
               <textarea
                 className="chat-pending-notes"
                 placeholder={t('permMessagePlaceholder')}
@@ -1051,19 +1097,19 @@ export function ChatView({
               <div className="chat-pending-actions">
                 <button
                   type="button"
-                  className="chat-pending-submit allow"
-                  onClick={() => submitPermission('allow')}
-                  disabled={respondingPending}
-                >
-                  {t('allow')}
-                </button>
-                <button
-                  type="button"
                   className="chat-pending-submit deny"
                   onClick={() => submitPermission('deny')}
                   disabled={respondingPending}
                 >
                   {t('deny')}
+                </button>
+                <button
+                  type="button"
+                  className="chat-pending-submit allow"
+                  onClick={() => submitPermission('allow')}
+                  disabled={respondingPending}
+                >
+                  {t('allow')}
                 </button>
               </div>
             </div>
@@ -1192,10 +1238,14 @@ export function ChatView({
         />
       )}
 
-      {/* タブ帯は画面のいちばん下 (親指で届く位置)。登録が無ければ出さない */}
-      {webTabs.length > 0 && (
+      {/* タブ帯は画面のいちばん下。登録が無ければ、取り直すテキストボタンだけ出す。 */}
+      {webTabs.length > 0 ? (
         <Tabstrip tabs={webTabs} activeTab={tab} onSelect={onSwitchTab} stripRef={tabstripRef} />
-      )}
+      ) : showCheckTabs ? (
+        <button type="button" className="check-tabs" onClick={() => void refreshWebTabs()}>
+          {t('checkForTabs')}
+        </button>
+      ) : null}
     </div>
   );
 }

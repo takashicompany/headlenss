@@ -50,6 +50,12 @@ button {
   cursor: pointer;
 }
 
+/* キーボードフォーカスは 1 種類の輪郭だけ。マウスの :focus は各入力の枠色に任せる。 */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .muted {
   color: var(--muted);
 }
@@ -191,7 +197,7 @@ button {
   color: var(--text);
 }
 
-.create-form input:focus {
+.create-form input:focus:not(:focus-visible) {
   outline: none;
   border-color: var(--accent);
 }
@@ -248,6 +254,158 @@ button {
 .session-name {
   font-weight: 500;
   word-break: break-all;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  margin-top: 0.35rem;
+  padding: 0.12rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.3;
+  border: 1px solid transparent;
+}
+
+.status-pill--running {
+  color: #f5a623;
+  background: rgba(245, 166, 35, 0.14);
+}
+
+.status-pill--idle {
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--border);
+}
+
+.status-pill--permission {
+  color: #ffb4b4;
+  background: rgba(226, 85, 85, 0.16);
+}
+
+.status-pill--question {
+  color: #d7c8ff;
+  background: rgba(140, 110, 255, 0.18);
+}
+
+.status-pill--blocked {
+  color: #f5a623;
+  background: rgba(245, 166, 35, 0.16);
+  border-color: #f5a623;
+}
+
+.session-open .released-indicator {
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+}
+
+.needs-you {
+  margin: 0 0 0.75rem;
+  padding: 0.55rem 0.7rem 0.35rem;
+  background: rgba(226, 85, 85, 0.08);
+  border: 1px solid rgba(226, 85, 85, 0.35);
+  border-radius: 6px;
+}
+
+.needs-you-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #ffb4b4;
+  margin-bottom: 0.15rem;
+}
+
+.needs-you ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.needs-you li + li {
+  border-top: 1px solid rgba(226, 85, 85, 0.2);
+}
+
+.needs-you button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  min-height: 44px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 0.35rem 0.1rem;
+  text-align: left;
+}
+
+.needs-you-name {
+  font-weight: 500;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.needs-you .status-pill {
+  margin-top: 0;
+  flex: none;
+}
+
+.session-more {
+  display: flex;
+  border-left: 1px solid var(--border);
+}
+
+.session-more-btn {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 0 0.85rem;
+  font-size: 1.25rem;
+  line-height: 1;
+  min-width: 44px;
+}
+
+.session-more-btn:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.session-menu {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.session-menu button {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  text-align: left;
+  padding: 0.75rem 1rem;
+  min-height: 44px;
+  width: 100%;
+}
+
+.session-menu li + li {
+  border-top: 1px solid var(--border);
+}
+
+.session-menu button:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* 親の li が overflow: hidden なので、フォーカスリングは内側に描く */
+.session-menu button:focus-visible {
+  outline-offset: -2px;
+}
+
+.session-menu button.is-danger {
+  color: var(--danger);
 }
 
 .session-meta {
@@ -463,6 +621,26 @@ button {
 
 .tabstrip::-webkit-scrollbar {
   display: none;
+}
+
+/* 右にまだタブがあるときだけ、端が切れていることを示す。 */
+.tabstrip--fade-end {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 1.75rem), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 1.75rem), transparent);
+}
+
+.check-tabs {
+  align-self: center;
+  margin: 0.15rem 0 0;
+  padding: 0.45rem 0.8rem calc(0.45rem + env(safe-area-inset-bottom));
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font-size: 0.85rem;
+}
+
+.chat-view--check .chat-input {
+  padding-bottom: 0.6rem;
 }
 
 /* 帯が出ている間は、下端の安全域は帯が持つ */
@@ -793,6 +971,12 @@ button {
   50%      { opacity: 1;    transform: scale(1.1);  }
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .chat-status-dot {
+    animation: none;
+  }
+}
+
 .chat-diagnostic {
   background: rgba(245, 166, 35, 0.09);
   border: 1px solid rgba(245, 166, 35, 0.42);
@@ -947,7 +1131,7 @@ button {
   min-height: 2rem;
   max-height: 8rem;
 }
-.chat-pending-notes:focus { outline: none; border-color: var(--accent); }
+.chat-pending-notes:focus:not(:focus-visible) { outline: none; border-color: var(--accent); }
 
 .chat-pending-tool {
   font-size: 0.85rem;
@@ -957,6 +1141,28 @@ button {
   background: rgba(255, 255, 255, 0.06);
   padding: 0.1em 0.3em;
   border-radius: 3px;
+}
+
+.chat-pending-toolsum {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  background: #0e0e10;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem;
+}
+
+.chat-pending-details {
+  align-self: flex-start;
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  padding: 0.15rem 0;
+  font-size: 0.85rem;
 }
 
 .chat-pending-toolinput {
@@ -992,8 +1198,16 @@ button {
 }
 .chat-pending-submit:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.chat-pending-submit.allow { background: #2e7d4f; }
-.chat-pending-submit.deny  { background: var(--danger); }
+.chat-pending-submit.allow {
+  background: #2e7d4f;
+  flex: 1;
+}
+.chat-pending-submit.deny {
+  flex: 0 0 auto;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
 
 /* 質問ナビ用ボタン (戻る / 次へ) */
 .chat-pending-back,
@@ -1353,7 +1567,7 @@ button {
   overflow-y: auto;
 }
 
-.chat-input textarea:focus {
+.chat-input textarea:focus:not(:focus-visible) {
   outline: none;
   border-color: var(--accent);
 }

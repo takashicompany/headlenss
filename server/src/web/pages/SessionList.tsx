@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useLanguage, type Language, type StringKey } from '../i18n.tsx';
 
 type ClaudeStatus = 'idle' | 'busy' | 'waiting-permission' | 'waiting-question';
@@ -84,14 +84,6 @@ function saveManualOrder(enabled: boolean): void {
   } catch { /* ignore */ }
 }
 
-function agentLabel(agent: Session['agent']): string {
-  switch (agent) {
-    case 'claude': return 'Claude';
-    case 'codex': return 'Codex';
-    default: return 'Agent';
-  }
-}
-
 function lastChatLabel(lc: NonNullable<Session['lastChat']>, t: (key: StringKey) => string): string {
   if (lc.role === 'user') return lc.origin === 'external' ? t('originExternal') : 'YOU';
   switch (lc.agent) {
@@ -101,23 +93,42 @@ function lastChatLabel(lc: NonNullable<Session['lastChat']>, t: (key: StringKey)
   }
 }
 
-function claudeIndicator(
-  status: ClaudeStatus | undefined,
-  agent: Session['agent'],
-  t: (key: StringKey) => string,
-): string {
-  const label = agentLabel(agent);
-  switch (status) {
-    case 'busy': return '● ' + label + ' ' + t('ccBusy');
-    case 'idle': return '◯ ' + label + ' ' + t('ccIdle');
-    case 'waiting-permission': return '⏸ ' + label + ' ' + t('ccWaitingPermission');
-    case 'waiting-question': return '? ' + label + ' ' + t('ccWaitingQuestion');
-    default: return '';
+function sessionAgentStatus(s: Session): ClaudeStatus | undefined {
+  return s.agent === 'codex' ? s.codexStatus ?? s.claudeStatus : s.claudeStatus;
+}
+
+type StatusPill = {
+  kind: 'running' | 'idle' | 'permission' | 'question' | 'blocked';
+  label: string;
+};
+
+/** 行に出す状態は 1 つ。画面ブロックは status より先に出す (送っても届かないため)。 */
+function statusPill(s: Session, t: (key: StringKey) => string): StatusPill | null {
+  if (s.screenBlocked) return { kind: 'blocked', label: t('screenBlocked') };
+  switch (sessionAgentStatus(s)) {
+    case 'busy': return { kind: 'running', label: t('ccBusy') };
+    case 'idle': return { kind: 'idle', label: t('ccIdle') };
+    case 'waiting-permission': return { kind: 'permission', label: t('needsPermission') };
+    case 'waiting-question': return { kind: 'question', label: t('needsAnswer') };
+    default: return null;
   }
 }
 
+function waitingKind(s: Session): 'permission' | 'question' | null {
+  switch (sessionAgentStatus(s)) {
+    case 'waiting-permission': return 'permission';
+    case 'waiting-question': return 'question';
+    default: return null;
+  }
+}
+
+function fillName(template: string, name: string): string {
+  return template.replaceAll('{name}', name);
+}
+
 type Props = {
-  onOpen: (name: string) => void;
+  /** chat: true はその遷移だけ chat で開く。並びの既定モードは変えない。 */
+  onOpen: (name: string, opts?: { chat?: boolean }) => void;
   headerMetrics?: ReactNode;
   activeSession?: string;
   splitToggle?: ReactNode;
@@ -137,6 +148,32 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
   const [starred, setStarred] = useState<Set<string>>(loadStarred);
   const [manualOrder, setManualOrder] = useState(loadManualOrder);
   const [order, setOrder] = useState<string[]>(loadOrder);
+  const [menuFor, setMenuFor] = useState<string | null>(null);
+  // 開いている ⋯。Escape と、取り消した confirm/prompt のあとでここに戻す。
+  const menuTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const restoreMenuTrigger = () => {
+    menuTriggerRef.current?.focus();
+  };
+
+  useEffect(() => {
+    if (!menuFor) return;
+    const onPointer = (e: PointerEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (el?.closest('[data-session-menu]')) return;
+      setMenuFor(null);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      setMenuFor(null);
+      restoreMenuTrigger();
+    };
+    document.addEventListener('pointerdown', onPointer);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointerdown', onPointer);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [menuFor]);
 
   const toggleStar = useCallback((name: string) => {
     setStarred((prev) => {
@@ -221,7 +258,10 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
   };
 
   const remove = async (name: string) => {
-    if (!confirm(`Delete session "${name}" from HeadLenss?`)) return;
+    if (!confirm(fillName(t('confirmDelete'), name))) {
+      restoreMenuTrigger();
+      return;
+    }
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(name)}`, { method: 'DELETE' });
       const data = (await res.json()) as { ok?: boolean; error?: string };
@@ -240,7 +280,10 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
 
   const rename = async (name: string) => {
     const nextName = prompt(t('renameSession'), name)?.trim();
-    if (!nextName || nextName === name) return;
+    if (!nextName || nextName === name) {
+      restoreMenuTrigger();
+      return;
+    }
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(name)}`, {
         method: 'PATCH',
@@ -262,7 +305,10 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
   };
 
   const release = async (name: string) => {
-    if (!confirm(`Release tmux for "${name}" but keep it in the list?`)) return;
+    if (!confirm(fillName(t('confirmRelease'), name))) {
+      restoreMenuTrigger();
+      return;
+    }
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(name)}/release`, { method: 'POST' });
       const data = (await res.json()) as { ok?: boolean; error?: string };
@@ -274,9 +320,10 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
     }
   };
 
-  const open = async (session: Session) => {
+  const open = async (session: Session, chat = false) => {
+    const go = () => onOpen(session.name, chat ? { chat: true } : undefined);
     if (!session.released) {
-      onOpen(session.name);
+      go();
       return;
     }
     try {
@@ -285,7 +332,7 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
       setError(null);
       await refresh();
-      onOpen(session.name);
+      go();
     } catch (e) {
       setError((e as Error).message);
     }
@@ -365,7 +412,7 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
         <select
           value={newAgent}
           onChange={(e) => setNewAgent(e.target.value as 'shell' | 'claude' | 'codex')}
-          aria-label="start command"
+          aria-label={t('startCommand')}
         >
           <option value="shell">shell</option>
           <option value="claude">Claude</option>
@@ -418,67 +465,118 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
       ) : sessions.length === 0 && !unreachable ? (
         <div className="muted">{t('noSessions')}</div>
       ) : sessions.length === 0 ? null : (
-        <ul className="session-list">
-          {sortedSessions.map((s) => {
-            const status = s.agent === 'codex' ? s.codexStatus ?? s.claudeStatus : s.claudeStatus;
-            const cc = claudeIndicator(status, s.agent, t);
-            const agentOnly = !cc && s.agent ? agentLabel(s.agent) : '';
-            const codexHookLabel = s.agent === 'codex' && s.codexHookHealth?.status !== 'ok'
-              ? s.codexHookHealth?.status === 'missing' ? t('codexHooksMissing') : t('codexHooksIncomplete')
-              : s.agent === 'codex' && s.codexNeedsHookAttention ? t('codexHooksNeedTrust') : '';
-            const isStarred = starred.has(s.name);
-            return (
-              <li key={s.name} className={[s.released && 'is-released', activeSession === s.name && 'session-active'].filter(Boolean).join(' ') || undefined}>
-                <div className="session-row">
-                  {manualOrder && <div className="session-reorder">
-                    <button onClick={() => move(s.name, -1)} aria-label={t('moveUp')} title={t('moveUp')}>↑</button>
-                    <button onClick={() => move(s.name, 1)} aria-label={t('moveDown')} title={t('moveDown')}>↓</button>
-                  </div>}
-                  <button
-                    className={`session-star${isStarred ? ' is-starred' : ''}`}
-                    onClick={() => toggleStar(s.name)}
-                    aria-label={isStarred ? t('unstarSession') : t('starSession')}
-                    aria-pressed={isStarred}
-                  >
-                    {isStarred ? '★' : '☆'}
-                  </button>
-                  <button className="session-open" onClick={() => open(s)}>
-                    <span className="session-name">{s.name}</span>
-                    <span className="session-meta">
-                      {s.windows} {t(s.windows === 1 ? 'windowUnit' : 'windowUnitPlural')}
-                      {s.attached && ` • ${t('attached')}`}
-                      {s.released && <span className="released-indicator"> • {t('releasedSession')}</span>}
-                      {cc && <span className={`cc-indicator cc-${status}`}> • {cc}</span>}
-                      {agentOnly && <span className="agent-indicator"> • {agentOnly}</span>}
-                      {codexHookLabel && <span className="codex-hook-warning"> • {codexHookLabel}</span>}
-                      {s.screenBlocked && (
-                        <span className="screen-blocked-warning" title={t('screenBlockedBody')}> • ⚠ {t('screenBlocked')}</span>
+        <>
+          {/* 待ちのセッションだけを上に並べる。本体の手動順は動かさない。 */}
+          {sortedSessions.some((s) => waitingKind(s)) && (
+            <section className="needs-you" aria-label={t('needsYou')}>
+              <div className="needs-you-title">{t('needsYou')}</div>
+              <ul>
+                {sortedSessions.map((s) => {
+                  const kind = waitingKind(s);
+                  if (!kind) return null;
+                  return (
+                    <li key={s.name}>
+                      <button type="button" onClick={() => open(s, true)}>
+                        <span className="needs-you-name">{s.name}</span>
+                        <span className={`status-pill status-pill--${kind}`}>
+                          {kind === 'permission' ? t('needsPermission') : t('needsAnswer')}
+                        </span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </section>
+          )}
+          <ul className="session-list">
+            {sortedSessions.map((s) => {
+              const pill = statusPill(s, t);
+              const isStarred = starred.has(s.name);
+              const menuOpen = menuFor === s.name;
+              const actionsId = `session-actions-${encodeURIComponent(s.name)}`;
+              return (
+                <li key={s.name} className={[s.released && 'is-released', activeSession === s.name && 'session-active'].filter(Boolean).join(' ') || undefined}>
+                  <div className="session-row">
+                    {manualOrder && <div className="session-reorder">
+                      <button type="button" onClick={() => move(s.name, -1)} aria-label={t('moveUp')} title={t('moveUp')}>↑</button>
+                      <button type="button" onClick={() => move(s.name, 1)} aria-label={t('moveDown')} title={t('moveDown')}>↓</button>
+                    </div>}
+                    <button
+                      type="button"
+                      className={`session-star${isStarred ? ' is-starred' : ''}`}
+                      onClick={() => toggleStar(s.name)}
+                      aria-label={isStarred ? t('unstarSession') : t('starSession')}
+                      aria-pressed={isStarred}
+                    >
+                      {isStarred ? '★' : '☆'}
+                    </button>
+                    <button type="button" className="session-open" onClick={() => open(s)}>
+                      <span className="session-name">{s.name}</span>
+                      {pill && (
+                        <span
+                          className={`status-pill status-pill--${pill.kind}`}
+                          title={pill.kind === 'blocked' ? t('screenBlockedBody') : undefined}
+                        >
+                          {pill.label}
+                        </span>
                       )}
-                    </span>
-                  </button>
-                  <button className="session-action" onClick={() => rename(s.name)} aria-label={t('renameSession')} title={t('renameSession')}>
-                    ✎
-                  </button>
-                  {!s.released && <button className="session-action" onClick={() => release(s.name)} aria-label={t('releaseSession')} title={t('releaseSession')}>
-                    ⏏
-                  </button>}
-                  <button className="session-kill" onClick={() => remove(s.name)} aria-label={`delete ${s.name}`} title="Delete">
-                    ✕
-                  </button>
-                </div>
-                {s.lastChat && (
-                  <button
-                    className="session-last-chat"
-                    onClick={() => open(s)}
-                    title={`${lastChatLabel(s.lastChat, t)}: ${s.lastChat.text}`}
-                  >
-                    {lastChatLabel(s.lastChat, t)}: {s.lastChat.text}
-                  </button>
-                )}
-              </li>
-            );
-          })}
-        </ul>
+                      {s.released && <span className="released-indicator">{t('releasedSession')}</span>}
+                    </button>
+                    <div className="session-more" data-session-menu="">
+                      <button
+                        type="button"
+                        className="session-more-btn"
+                        aria-label={t('moreActions')}
+                        aria-expanded={menuOpen}
+                        aria-controls={menuOpen ? actionsId : undefined}
+                        ref={menuOpen ? menuTriggerRef : undefined}
+                        onClick={() => setMenuFor(menuOpen ? null : s.name)}
+                      >
+                        ⋯
+                      </button>
+                    </div>
+                  </div>
+                  {menuOpen && (
+                    <ul className="session-menu" id={actionsId} data-session-menu="">
+                      <li>
+                        <button type="button" onClick={() => { setMenuFor(null); void rename(s.name); }}>
+                          {t('renameSession')}
+                        </button>
+                      </li>
+                      {!s.released && (
+                        <li>
+                          <button type="button" onClick={() => { setMenuFor(null); void release(s.name); }}>
+                            {t('releaseSession')}
+                          </button>
+                        </li>
+                      )}
+                      <li>
+                        <button
+                          type="button"
+                          className="is-danger"
+                          aria-label={`${t('deleteSession')} ${s.name}`}
+                          onClick={() => { setMenuFor(null); void remove(s.name); }}
+                        >
+                          {t('deleteSession')}
+                        </button>
+                      </li>
+                    </ul>
+                  )}
+                  {s.lastChat && (
+                    <button
+                      type="button"
+                      className="session-last-chat"
+                      onClick={() => open(s)}
+                      title={`${lastChatLabel(s.lastChat, t)}: ${s.lastChat.text}`}
+                    >
+                      {lastChatLabel(s.lastChat, t)}: {s.lastChat.text}
+                    </button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </>
       )}
     </div>
   );

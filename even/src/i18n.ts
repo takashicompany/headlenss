@@ -36,6 +36,7 @@ const STRINGS = {
 
   // ─── Probe (server URL check) ────────────────────────────────
   probeChecking:       { en: 'Checking…',                       ja: '確認中…' },
+  probeOk:             { en: 'Connected',                       ja: '接続済み' },
   probeUnreachablePfx: { en: "Can't connect: ",                 ja: '接続できません: ' },
   probeTyping:         { en: 'Typing…',                         ja: '入力中…' },
 
@@ -90,6 +91,16 @@ const STRINGS = {
   promptRetryConfirm: { en: 'May send twice. ↑:Resend Tap:Edit',  ja: '二重送信の可能性 ↑:再送 タップ:編集' },
   g2FootPromptRetry:  { en: 'Tap:Edit ↑:Retry ↓:Del 2Tap:Discard', ja: 'タップ:編集 ↑:再送 ↓:削除 2タップ:破棄' },
   promptEmpty:        { en: '(empty draft)',                     ja: '(下書きは空です)' },
+  asrPartialWarning: { en: 'Connection lost — review partial text', ja: '接続が切れました — 途中の文字起こしを確認' },
+  asrNoSpeech:       { en: 'No speech captured · tap to retry', ja: '音声を取得できませんでした · タップで再試行' },
+  asrLostNoSpeech:   { en: 'Recording interrupted · No speech captured', ja: '録音が中断されました · 音声を取得できませんでした' },
+  disconnected:     { en: 'Disconnected', ja: '未接続' },
+  notConfigured:    { en: 'Not configured', ja: '未設定' },
+  offlineLastUpdate:{ en: 'Offline · last update {time}', ja: 'オフライン · 最終更新 {time}' },
+  offlineNoData:    { en: 'Offline · no cached data', ja: 'オフライン · 保存済みデータなし' },
+  connectionRetryHint: { en: 'Retry from the hold menu', ja: '長押しメニューから再試行' },
+  menuRetryConnection: { en: 'Retry connection', ja: '接続を再試行' },
+  menuPromptUndo:   { en: 'Undo last deletion', ja: '直前の削除を戻す' },
   promptSent:         { en: 'Prompt sent: {name}',               ja: '送信しました: {name}' },
 
   // ─── New Agent session detection ────────────────────────────

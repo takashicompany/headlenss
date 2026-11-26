@@ -44,11 +44,23 @@ const STRINGS = {
   manualOrder:            { en: 'Manual order', ja: '手動並び替え' },
   moveUp:                 { en: 'Move up', ja: '上へ移動' },
   moveDown:               { en: 'Move down', ja: '下へ移動' },
+  needsYou:               { en: 'Needs you', ja: '対応が必要' },
+  needsPermission:        { en: 'Needs permission', ja: '許可が必要' },
+  needsAnswer:            { en: 'Needs answer', ja: '回答が必要' },
+  moreActions:            { en: 'More actions', ja: 'その他の操作' },
+  deleteSession:          { en: 'Delete', ja: '削除' },
+  confirmDelete:          { en: 'Delete session "{name}" from HeadLenss?', ja: 'セッション「{name}」を HeadLenss から削除しますか?' },
+  confirmRelease:         { en: 'Release tmux for "{name}" but keep it in the list?', ja: '「{name}」の tmux を解放して、一覧には残しますか?' },
+  startCommand:           { en: 'Start command', ja: '起動コマンド' },
+  modeTmux:               { en: 'tmux', ja: 'tmux' },
+  modeChat:               { en: 'chat', ja: 'チャット' },
+  pcUsage:                { en: 'PC usage', ja: 'PC 使用状況' },
 
   // ── チャット画面の中のタブ (.headlenss-plugins.conf 由来) ──
   previewChatTab:         { en: 'Chat', ja: 'チャット' },
   previewReload:          { en: 'Reload this tab', ja: 'このタブを再読込' },
   previewOpenExternal:    { en: 'Open in a new tab', ja: '別タブで開く' },
+  checkForTabs:           { en: 'Check for tabs', ja: 'タブを確認' },
   previewTabMissingTitle: { en: 'This tab is not available',
                             ja: 'このタブは表示できません' },
   previewTabMissingBody:  { en: 'It is no longer declared in .headlenss-plugins.conf in the session folder, or the file it points to is gone.',
@@ -117,6 +129,9 @@ const STRINGS = {
   permMessagePlaceholder: { en: 'Message (optional)', ja: 'メッセージ (任意)' },
   allow:                  { en: 'Allow', ja: '許可' },
   deny:                   { en: 'Deny', ja: '拒否' },
+  previous:               { en: 'Previous', ja: '前へ' },
+  details:                { en: 'Details', ja: '詳細' },
+  toolLabel:              { en: 'Tool', ja: 'ツール' },
 
   // ── ChatView: errors ──
   sendErrorPrefix:        { en: 'Send error', ja: '送信エラー' },

@@ -46,6 +46,17 @@ const HANDSHAKE_TIMEOUT_MS = 8000
 
 export type RTRegion = 'eu' | 'us'
 
+export type AsrOutcome =
+  | { kind: 'final'; text: string }
+  | { kind: 'recovered-partial'; text: string; reason: string }
+  | { kind: 'failure'; text: ''; reason: string }
+
+/** 異常終了でも受信済みの語句は残す。確定結果としては扱わない。 */
+export function recoverAsrText(text: string, reason: string): AsrOutcome {
+  const words = text.trim()
+  return words ? { kind: 'recovered-partial', text: words, reason } : { kind: 'failure', text: '', reason }
+}
+
 export type SpeechmaticsRTOptions = {
   apiKey: string
   language: string
@@ -61,7 +72,7 @@ export type SpeechmaticsRTOptions = {
    * stop()/abort() で畳んだ場合は呼ばれない。呼び出し側はこれを受けて
    * 録音 phase を畳む (受け取らないと「録音中」表示のまま無音を撮り続ける)。
    */
-  onDead?: (reason: string) => void
+  onDead?: (outcome: AsrOutcome) => void
 }
 
 type ServerMessage =
@@ -98,7 +109,8 @@ export class SpeechmaticsRT {
   private seqNo = 0
   private finals: string[] = []
   private currentPartial = ''
-  private endWaiter: { resolve: (text: string) => void; reject: (err: Error) => void } | null = null
+  private endWaiter: { resolve: (outcome: AsrOutcome) => void; reject: (err: Error) => void } | null = null
+  private failureReason = 'connection closed'
   private opts: SpeechmaticsRTOptions | null = null
   private startedAt = 0
   /** abort() 済み。以後 WebSocket を作らない (JWT 待ちの間に捨てられた場合の保険)。 */
@@ -204,6 +216,10 @@ export class SpeechmaticsRT {
         } catch {
           return
         }
+        if (!opened && msg.message === 'Error') {
+          failOpen(`Speechmatics RT Error ${msg.type ?? ''}: ${msg.reason ?? ''}`)
+          return
+        }
         this.handleServerMessage(msg, () => {
           if (!opened) {
             opened = true
@@ -227,16 +243,6 @@ export class SpeechmaticsRT {
           failOpen(`WebSocket closed before start (${e.code} ${e.reason || ''})`)
           return
         }
-        const waiter = this.endWaiter
-        if (waiter) {
-          // stop() の待ち中に閉じた: 手元にある分を確定として返す。
-          this.endWaiter = null
-          this.clearStopTimer()
-          const text = this.fullTranscript()
-          this.teardown()
-          waiter.resolve(text)
-          return
-        }
         // 録音中に切れた。取り残しを作らず、呼び出し側に畳ませる。
         this.die(`WebSocket closed (${e.code} ${e.reason || ''})`)
       }
@@ -248,10 +254,14 @@ export class SpeechmaticsRT {
    * teardown() が opts を捨てるので、コールバックは先に手元へ取っておく。
    */
   private die(reason: string): void {
-    if (this.aborted || this.stopping) { this.teardown(); return }
+    if (this.aborted) { this.teardown(); return }
+    this.failureReason = reason
+    const outcome = recoverAsrText(this.fullTranscript(), reason)
+    const waiter = this.endWaiter
     const onDead = this.opts?.onDead
     this.teardown()
-    onDead?.(reason)
+    if (waiter) waiter.resolve(outcome)
+    else if (!this.stopping) onDead?.(outcome)
   }
 
   private handleServerMessage(msg: ServerMessage, onStarted: () => void): void {
@@ -276,22 +286,14 @@ export class SpeechmaticsRT {
         this.clearStopTimer()
         const text = this.finals.join('')
         this.teardown()
-        waiter?.resolve(text)
+        waiter?.resolve(text.trim() ? { kind: 'final', text: text.trim() } : { kind: 'failure', text: '', reason: 'no-speech' })
         break
       }
       case 'Error': {
         const reason = `${msg.type ?? ''}${msg.reason ? `: ${msg.reason}` : ''}`
         const err = new Error(`Speechmatics RT Error ${reason}`)
         this.opts?.onError?.(err)
-        const waiter = this.endWaiter
-        this.endWaiter = null
-        this.clearStopTimer()
-        if (waiter) {
-          this.teardown()
-          waiter.reject(err)
-        } else {
-          this.die(`Speechmatics RT Error ${reason}`)
-        }
+        this.die(err.message)
         break
       }
       case 'Warning':
@@ -321,22 +323,22 @@ export class SpeechmaticsRT {
   }
 
   /** EndOfStream を送り、EndOfTranscript を待って確定テキストを返す */
-  async stop(): Promise<string> {
+  async stop(): Promise<AsrOutcome> {
     this.stopping = true
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       // 既に閉じている/開けなかった。手元の確定分を返しつつ取り残しを掃除する。
-      const text = this.finals.join('')
+      const outcome = recoverAsrText(this.fullTranscript(), this.failureReason)
       this.teardown()
-      return text
+      return outcome
     }
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<AsrOutcome>((resolve, reject) => {
       const settle = (fn: () => void): void => {
         this.clearStopTimer()
         this.endWaiter = null
         fn()
       }
       this.endWaiter = {
-        resolve: (text) => settle(() => resolve(text.trim())),
+        resolve: (outcome) => settle(() => resolve(outcome)),
         reject: (err) => settle(() => reject(err)),
       }
       // 保険のタイマーは送信より先に張る。送信が同期 throw しても、
@@ -345,19 +347,14 @@ export class SpeechmaticsRT {
         this.stopTimer = null
         const waiter = this.endWaiter
         this.endWaiter = null
-        const text = this.fullTranscript()
+        const outcome = recoverAsrText(this.fullTranscript(), 'stop-timeout')
         this.teardown()
-        waiter?.resolve(text)
+        waiter?.resolve(outcome)
       }, STOP_TIMEOUT_MS)
       try {
         this.ws!.send(JSON.stringify({ message: 'EndOfStream', last_seq_no: this.seqNo }))
       } catch (err) {
-        const waiter = this.endWaiter
-        this.endWaiter = null
-        this.clearStopTimer()
-        this.teardown()
-        if (waiter) waiter.reject(err as Error)
-        else reject(err as Error)
+        this.die(`EndOfStream send failed: ${(err as Error).message}`)
       }
     })
   }
