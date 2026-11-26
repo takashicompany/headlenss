@@ -129,7 +129,10 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
   const [newName, setNewName] = useState('');
   const [newCwd, setNewCwd] = useState('');
   const [newAgent, setNewAgent] = useState<'shell' | 'claude' | 'codex'>('shell');
+  // 作成・削除などユーザ操作の失敗。一覧ポーリングでは消さない。
   const [error, setError] = useState<string | null>(null);
+  // 一覧の取得が届いていない。直前の sessions は残し、空一覧とは別に出す。
+  const [unreachable, setUnreachable] = useState(false);
   const [loading, setLoading] = useState(true);
   const [starred, setStarred] = useState<Set<string>>(loadStarred);
   const [manualOrder, setManualOrder] = useState(loadManualOrder);
@@ -175,9 +178,10 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
         saveOrder(next);
         return next;
       });
-      setError(null);
-    } catch (e) {
-      setError((e as Error).message);
+      // 届いたときだけ unreachable を下ろす。操作エラーはここから触らない。
+      setUnreachable(false);
+    } catch {
+      setUnreachable(true);
     } finally {
       setLoading(false);
     }
@@ -206,6 +210,7 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
       });
       const data = (await res.json()) as { ok?: boolean; error?: string };
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      setError(null);
       setNewName('');
       setNewCwd('');
       setNewAgent('shell');
@@ -221,6 +226,7 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
       const res = await fetch(`/api/sessions/${encodeURIComponent(name)}`, { method: 'DELETE' });
       const data = (await res.json()) as { ok?: boolean; error?: string };
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      setError(null);
       setOrder((prev) => {
         const next = prev.filter((n) => n !== name);
         saveOrder(next);
@@ -243,6 +249,7 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
       });
       const data = (await res.json()) as { ok?: boolean; error?: string };
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      setError(null);
       setOrder((prev) => {
         const next = prev.map((n) => n === name ? nextName : n);
         saveOrder(next);
@@ -260,6 +267,7 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
       const res = await fetch(`/api/sessions/${encodeURIComponent(name)}/release`, { method: 'POST' });
       const data = (await res.json()) as { ok?: boolean; error?: string };
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      setError(null);
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -275,6 +283,7 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
       const res = await fetch(`/api/sessions/${encodeURIComponent(session.name)}/mount`, { method: 'POST' });
       const data = (await res.json()) as { ok?: boolean; error?: string };
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      setError(null);
       await refresh();
       onOpen(session.name);
     } catch (e) {
@@ -376,13 +385,39 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
         </label>
       </div>
 
-      {error && <div className="error">{error}</div>}
+      {/* 常に DOM に残して、届かなくなった瞬間を aria-live が読めるようにする。 */}
+      <div
+        className={unreachable ? 'conn-status' : 'conn-status conn-status--off'}
+        role="status"
+        aria-live="polite"
+      >
+        {unreachable ? t('serverUnreachable') : ''}
+      </div>
+      <div
+        className={error ? 'error' : 'error is-off'}
+        role="status"
+        aria-live="polite"
+      >
+        {error && (
+          <>
+            <span>{error}</span>
+            <button
+              type="button"
+              className="error-dismiss"
+              onClick={() => setError(null)}
+              aria-label={t('dismissError')}
+            >
+              ×
+            </button>
+          </>
+        )}
+      </div>
 
       {loading ? (
         <div className="muted">{t('loading')}</div>
-      ) : sessions.length === 0 ? (
+      ) : sessions.length === 0 && !unreachable ? (
         <div className="muted">{t('noSessions')}</div>
-      ) : (
+      ) : sessions.length === 0 ? null : (
         <ul className="session-list">
           {sortedSessions.map((s) => {
             const status = s.agent === 'codex' ? s.codexStatus ?? s.claudeStatus : s.claudeStatus;

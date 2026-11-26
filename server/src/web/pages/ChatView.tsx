@@ -208,7 +208,14 @@ export function ChatView({
   const [respondingPending, setRespondingPending] = useState(false);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // 送信の失敗。ポーリング成功では消さない。次の成功した送信か、閉じる操作で消す。
+  const [sendError, setSendError] = useState<string | null>(null);
+  // アップロード / 許可応答 / 未回答など、送信以外の操作失敗。同じくポーリングでは消さない。
+  const [actionError, setActionError] = useState<string | null>(null);
+  // chat 取得が届いていない。送信エラーとは別の静かな表示にする。
+  const [reconnecting, setReconnecting] = useState(false);
+  // 一度でも chat 取得に成功したか。失敗のまま「まだ会話がありません」と出さないため。
+  const [chatLoaded, setChatLoaded] = useState(false);
 
   const scrollerRef = useRef<HTMLDivElement>(null);
   const chatInputRef = useRef<HTMLFormElement>(null);
@@ -391,9 +398,13 @@ export function ChatView({
             });
           }
         }
-        if (!disposed) setError(null);
-      } catch (e) {
-        if (!disposed) setError((e as Error).message);
+        // 取得の成否は再接続表示だけ。送信エラーはここに来ても残す。
+        if (!disposed) {
+          setChatLoaded(true);
+          setReconnecting(false);
+        }
+      } catch {
+        if (!disposed) setReconnecting(true);
       }
       if (!disposed) timer = setTimeout(tick, 1500);
     };
@@ -450,7 +461,6 @@ export function ChatView({
     scrollToBottom();
 
     setSending(true);
-    setError(null);
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(sessionName)}/input`, {
         method: 'POST',
@@ -461,11 +471,13 @@ export function ChatView({
         const j = (await res.json().catch(() => ({}))) as { error?: string };
         throw new Error(j.error ?? `HTTP ${res.status}`);
       }
+      // 成功した送信でだけ消す。試行の開始時に消すと、失敗が画面に残らない。
+      setSendError(null);
     } catch (e) {
       // 送信失敗時は楽観的メッセージを取り除いて入力欄に戻す
       setPending((p) => p.filter((m) => m !== optimistic));
       setInput(text);
-      setError((e as Error).message);
+      setSendError((e as Error).message);
     } finally {
       setSending(false);
       inputRef.current?.focus();
@@ -516,14 +528,14 @@ export function ChatView({
   const handleImageFiles = useCallback(async (files: File[]) => {
     if (files.length === 0) return;
     setUploading(true);
-    setError(null);
+    setActionError(null);
     try {
       for (const f of files) {
         try {
           const r = await uploadImage(f);
           insertAtCursor(`@${r.path} `);
         } catch (e) {
-          setError(`${t('uploadFailedPrefix')} (${f.name}): ${(e as Error).message}`);
+          setActionError(`${t('uploadFailedPrefix')} (${f.name}): ${(e as Error).message}`);
         }
       }
     } finally {
@@ -556,7 +568,7 @@ export function ChatView({
   ) => {
     if (!pendingInter || respondingPending) return;
     setRespondingPending(true);
-    setError(null);
+    setActionError(null);
     try {
       const res = await fetch(
         `/api/claude/sessions/${encodeURIComponent(sessionName)}/respond`,
@@ -579,7 +591,7 @@ export function ChatView({
       setQNotes({});
       setPermMessage('');
     } catch (e) {
-      setError(`${t('respondFailedPrefix')}: ${(e as Error).message}`);
+      setActionError(`${t('respondFailedPrefix')}: ${(e as Error).message}`);
     } finally {
       setRespondingPending(false);
     }
@@ -629,7 +641,7 @@ export function ChatView({
       if (a.answerKind === 'type-something') return !(a.text ?? '').trim();
       return false;
     })) {
-      setError(t('unansweredQuestions'));
+      setActionError(t('unansweredQuestions'));
       return;
     }
     void respondToPending({ kind: 'question', answers });
@@ -701,6 +713,13 @@ export function ChatView({
       <header className="session-header">
         <button onClick={onBack} aria-label={t('back')}>{t('back')}</button>
         <span className="session-title">{sessionName}</span>
+        <span
+          className={reconnecting ? 'conn-chip' : 'conn-chip conn-chip--off'}
+          role="status"
+          aria-live="polite"
+        >
+          {reconnecting ? t('reconnecting') : ''}
+        </span>
         {activeWebTab !== null && (
           <PreviewActions active={activeWebTab} onReload={reloadActiveTab} />
         )}
@@ -743,7 +762,10 @@ export function ChatView({
           )}
 
           {displayChat.length === 0 ? (
-            <div className="chat-empty">{t('chatEmpty')}</div>
+            // 一度も取得できていない間は「会話が無い」ではなく再接続チップに任せる。
+            chatLoaded || !reconnecting ? (
+              <div className="chat-empty">{t('chatEmpty')}</div>
+            ) : null
           ) : (
             <>
               {hasOlderChat && (
@@ -1066,7 +1088,44 @@ export function ChatView({
             {t('scrollToBottom')}
           </button>
         )}
-        {error && <div className="chat-error">{t('sendErrorPrefix')}: {error}</div>}
+        <div
+          className={sendError ? 'chat-error' : 'chat-error is-off'}
+          role="status"
+          aria-live="polite"
+        >
+          {sendError && (
+            <>
+              <span>{t('sendErrorPrefix')}: {sendError}</span>
+              <button
+                type="button"
+                className="error-dismiss"
+                onClick={() => setSendError(null)}
+                aria-label={t('dismissError')}
+              >
+                ×
+              </button>
+            </>
+          )}
+        </div>
+        <div
+          className={actionError ? 'chat-error' : 'chat-error is-off'}
+          role="status"
+          aria-live="polite"
+        >
+          {actionError && (
+            <>
+              <span>{actionError}</span>
+              <button
+                type="button"
+                className="error-dismiss"
+                onClick={() => setActionError(null)}
+                aria-label={t('dismissError')}
+              >
+                ×
+              </button>
+            </>
+          )}
+        </div>
         {/* 送達未確認の注意は入力欄のすぐ上に出す (次に送るかどうかの判断材料なので)。
             画面ブロックの注意が出ている時は原因が同じなので、そちらに任せて重ねない。 */}
         {deliveryWarning && !screenBlocked && (
