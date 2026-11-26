@@ -6,8 +6,19 @@ import { homedir } from 'node:os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const hookScript = resolve(__dirname, 'headlenss-codex-hook.mjs');
-const hooksPath = resolve(homedir(), '.codex', 'hooks.json');
-const command = `node ${JSON.stringify(hookScript)}`;
+const codexDir = resolve(process.env.CODEX_HOME || resolve(homedir(), '.codex'));
+const hooksPath = resolve(codexDir, 'hooks.json');
+const baseCommand = `node ${JSON.stringify(hookScript)}`;
+
+function isHeadlenssHook(hook) {
+  if (typeof hook?.command !== 'string') return false;
+  // Accept a bare command or one URL assignment, including quoted/escaped values.
+  const withoutServerUrl = hook.command.replace(
+    /^HEADLENSS_SERVER_URL=(?:'[^']*'|"(?:\\[\s\S]|[^"\\])*"|\\[\s\S]|[^\s'"\\;&|<>()`])*[ \t]+/,
+    '',
+  );
+  return withoutServerUrl === baseCommand;
+}
 
 if (!existsSync(hooksPath)) {
   console.log(`${hooksPath} does not exist; nothing to uninstall.`);
@@ -30,7 +41,7 @@ for (const [event, groups] of Object.entries(config.hooks)) {
       continue;
     }
     const nextHooks = group.hooks.filter((h) => {
-      const keep = h?.command !== command;
+      const keep = !isHeadlenssHook(h);
       if (!keep) removed += 1;
       return keep;
     });

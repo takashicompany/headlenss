@@ -74,7 +74,7 @@ tmux new -s codex-work -c /path/to/your/project codex
 
 The tmux session will appear in the HeadLenss browser/G2 session list, and its prompts, replies, and permission requests will appear in chat view.
 
-Set `HEADLENSS_SERVER_URL` if your server is not `http://localhost:3000`.
+Set `HEADLENSS_SERVER_URL` when installing if your server is not `http://localhost:3000`, for example: `HEADLENSS_SERVER_URL=http://<host>:3000 node /path/to/headlenss/plugin/codex-hooks/install.mjs`. The installer saves this URL in the hook commands. Run it again with a different URL to update existing hooks; running without the variable preserves the saved URL.
 
 
 - Access Claude Code (tmux) on your PC from G2.

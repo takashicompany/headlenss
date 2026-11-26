@@ -6,9 +6,14 @@ import { homedir } from 'node:os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const hookScript = resolve(__dirname, 'headlenss-codex-hook.mjs');
-const codexDir = resolve(homedir(), '.codex');
+const codexDir = resolve(process.env.CODEX_HOME || resolve(homedir(), '.codex'));
 const hooksPath = resolve(codexDir, 'hooks.json');
-const command = `node ${JSON.stringify(hookScript)}`;
+const baseCommand = `node ${JSON.stringify(hookScript)}`;
+const serverUrl = process.env.HEADLENSS_SERVER_URL;
+// Single quotes keep URL characters literal, including shell substitutions.
+const command = serverUrl
+  ? `HEADLENSS_SERVER_URL='${serverUrl.replace(/'/g, "'\\''")}' ${baseCommand}`
+  : baseCommand;
 
 const HEADLENSS_HOOKS = {
   SessionStart: [
@@ -73,8 +78,14 @@ function readExisting() {
   }
 }
 
-function hasHeadlenssHook(group) {
-  return Array.isArray(group?.hooks) && group.hooks.some((h) => h?.command === command);
+function isHeadlenssHook(hook) {
+  if (typeof hook?.command !== 'string') return false;
+  // Accept a bare command or one URL assignment, including quoted/escaped values.
+  const withoutServerUrl = hook.command.replace(
+    /^HEADLENSS_SERVER_URL=(?:'[^']*'|"(?:\\[\s\S]|[^"\\])*"|\\[\s\S]|[^\s'"\\;&|<>()`])*[ \t]+/,
+    '',
+  );
+  return withoutServerUrl === baseCommand;
 }
 
 function install() {
@@ -85,7 +96,20 @@ function install() {
   for (const [event, groups] of Object.entries(HEADLENSS_HOOKS)) {
     const current = Array.isArray(config.hooks[event]) ? config.hooks[event] : [];
     for (const group of groups) {
-      if (!current.some(hasHeadlenssHook)) {
+      let installed = false;
+      for (const existingGroup of current) {
+        if (!Array.isArray(existingGroup?.hooks)) continue;
+        for (const hook of existingGroup.hooks) {
+          if (!isHeadlenssHook(hook)) continue;
+          installed = true;
+          // Without an explicit override, preserve any previously installed URL.
+          if (serverUrl && hook.command !== command) {
+            hook.command = command;
+            changed = true;
+          }
+        }
+      }
+      if (!installed) {
         current.push(group);
         changed = true;
       }
