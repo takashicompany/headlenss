@@ -1,4 +1,4 @@
-import { useCallback, useState, type Ref } from 'react';
+import { useCallback, useEffect, useRef, useState, type Ref } from 'react';
 import { useLanguage } from '../i18n.tsx';
 import type { WebTab } from './SessionTabs.tsx';
 
@@ -160,8 +160,30 @@ export function Tabstrip({
   stripRef?: Ref<HTMLDivElement>;
 }) {
   const { t } = useLanguage();
+  const elRef = useRef<HTMLDivElement | null>(null);
+  const [fadeEnd, setFadeEnd] = useState(false);
+  const setNode = useCallback((node: HTMLDivElement | null) => {
+    elRef.current = node;
+    if (typeof stripRef === 'function') stripRef(node);
+    else if (stripRef) stripRef.current = node;
+  }, [stripRef]);
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const measure = () => {
+      setFadeEnd(el.scrollLeft + el.clientWidth < el.scrollWidth - 1);
+    };
+    measure();
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    ro?.observe(el);
+    el.addEventListener('scroll', measure, { passive: true });
+    return () => {
+      ro?.disconnect();
+      el.removeEventListener('scroll', measure);
+    };
+  }, [tabs]);
   return (
-    <div className="tabstrip" role="tablist" ref={stripRef}>
+    <div className={`tabstrip${fadeEnd ? ' tabstrip--fade-end' : ''}`} role="tablist" ref={setNode}>
       <button
         type="button"
         role="tab"

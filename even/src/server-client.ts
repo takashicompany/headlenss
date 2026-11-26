@@ -172,6 +172,14 @@ export class RespondInterruptedError extends Error {
   }
 }
 
+/** HTTP 応答を受け取れた失敗。通信断/タイムアウトは送達不明として呼び出し側に残す。 */
+export class PromptSendError extends Error {
+  constructor(message: string, readonly deliveryUnknown: boolean) {
+    super(message)
+    this.name = 'PromptSendError'
+  }
+}
+
 export class HeadlenssClient {
   constructor(private base: string) {}
 
@@ -183,8 +191,8 @@ export class HeadlenssClient {
     return `${trimTrailingSlash(this.base)}${path}`
   }
 
-  async health(): Promise<{ ok: boolean }> {
-    const res = await fetch(this.url('/api/health'))
+  async health(signal?: AbortSignal): Promise<{ ok: boolean }> {
+    const res = await fetch(this.url('/api/health'), { signal: signal ?? timeoutSignal(8000) })
     if (!res.ok) throw new Error(`health HTTP ${res.status}`)
     return (await res.json()) as { ok: boolean }
   }
@@ -210,7 +218,13 @@ export class HeadlenssClient {
     })
     if (!res.ok) {
       const body = await res.text().catch(() => '')
-      throw new Error(`sendKeys HTTP ${res.status}: ${body.slice(0, 200)}`)
+      // 400/500 等はキー注入の途中で失敗した可能性もある。注入前の拒否と
+      // 分かる応答だけ「未送信」と扱い、他は保守的に送達不明とする。
+      let code: unknown
+      try { code = (JSON.parse(body) as { code?: unknown }).code } catch { /* non-JSON */ }
+      const rejected = [401, 403, 404, 429].includes(res.status)
+        || (res.status === 409 && code === 'already_processing')
+      throw new PromptSendError(`sendKeys HTTP ${res.status}: ${body.slice(0, 200)}`, !rejected)
     }
   }
 

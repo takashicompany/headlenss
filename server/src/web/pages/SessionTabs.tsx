@@ -35,14 +35,19 @@ export function useWebTabs(sessionName: string): WebTabsState {
   // 中身が変わっていないときに再描画しない (iframe の載せ替えを起こさないため)
   const sigRef = useRef<string>('');
   const disposedRef = useRef(false);
+  // 画面復帰は focus と visibilitychange が続けて飛ぶ。古い応答が後から着地すると
+  // 新しいタブ一覧を巻き戻すので、最後に始めた取得だけを反映する。
+  const requestSeqRef = useRef(0);
 
   const fetchTabs = useCallback(async () => {
+    const seq = ++requestSeqRef.current;
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(sessionName)}/webtabs`);
+      if (seq !== requestSeqRef.current || disposedRef.current) return;
       if (!res.ok) return;
       const json = (await res.json()) as { tabs?: WebTab[] };
       const next = Array.isArray(json.tabs) ? json.tabs : [];
-      if (disposedRef.current) return;
+      if (seq !== requestSeqRef.current || disposedRef.current) return;
       const sig = JSON.stringify(next);
       if (sig !== sigRef.current) {
         sigRef.current = sig;
@@ -51,7 +56,7 @@ export function useWebTabs(sessionName: string): WebTabsState {
     } catch {
       /* 一時的な失敗は次のポーリングで回復する */
     } finally {
-      if (!disposedRef.current) setLoaded(true);
+      if (seq === requestSeqRef.current && !disposedRef.current) setLoaded(true);
     }
   }, [sessionName]);
 
@@ -59,9 +64,18 @@ export function useWebTabs(sessionName: string): WebTabsState {
     disposedRef.current = false;
     void fetchTabs();
     const timer = setInterval(() => void fetchTabs(), POLL_MS);
+    // 30 秒待ちせず、画面に戻ったタイミングでも宣言ファイルを取り直す。
+    const onFocus = () => { void fetchTabs(); };
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void fetchTabs();
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisible);
     return () => {
       disposedRef.current = true;
       clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisible);
     };
   }, [fetchTabs]);
 
@@ -85,7 +99,7 @@ export function ModeToggle({
         onClick={mode === 'tmux' ? undefined : () => onSwitchMode('tmux')}
         aria-pressed={mode === 'tmux'}
       >
-        tmux
+        {t('modeTmux')}
       </button>
       <button
         type="button"
@@ -93,7 +107,7 @@ export function ModeToggle({
         onClick={mode === 'chat' ? undefined : () => onSwitchMode('chat')}
         aria-pressed={mode === 'chat'}
       >
-        chat
+        {t('modeChat')}
       </button>
     </div>
   );

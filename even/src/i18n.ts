@@ -36,6 +36,7 @@ const STRINGS = {
 
   // ─── Probe (server URL check) ────────────────────────────────
   probeChecking:       { en: 'Checking…',                       ja: '確認中…' },
+  probeOk:             { en: 'Connected',                       ja: '接続済み' },
   probeUnreachablePfx: { en: "Can't connect: ",                 ja: '接続できません: ' },
   probeTyping:         { en: 'Typing…',                         ja: '入力中…' },
 
@@ -77,6 +78,30 @@ const STRINGS = {
   respondInterrupted:  { en: 'Interrupted — may be partly sent', ja: '中断 (一部送信済みの可能性)' },
   // 送信が既定時間内に決着せず、入力ガードだけ先に解除した場合。届いたかは不明
   respondUnknownResult:{ en: 'Send result unknown — tap to retry', ja: '送信結果不明 (タップで再試行)' },
+  respondSending:     { en: 'Sending response…',                 ja: '回答を送信中…' },
+  respondSent:        { en: 'Response sent',                     ja: '回答を送信しました' },
+  respondChanged:     { en: 'Request changed — check again',     ja: '用件が変わりました。再確認してください' },
+  reviewAnswer:       { en: 'Review answer',                     ja: '回答を確認' },
+  reviewAnswerText:   { en: 'Your answer:',                      ja: 'あなたの回答:' },
+  reviewConfirm:      { en: 'Confirm answer',                    ja: '回答を確定' },
+  g2FootReview:       { en: 'Tap:Confirm ↑↓:Read 2Tap:Choices',   ja: 'タップ:確定 ↑↓:読む 2タップ:選択肢' },
+  promptFailed:       { en: 'Send failed',                       ja: '送信失敗' },
+  promptUnknown:      { en: 'Delivery unknown',                  ja: '送達不明' },
+  promptUnknownHint:  { en: 'May have arrived. Check before retrying.', ja: '届いた可能性あり。再送前に確認してください。' },
+  promptRetryConfirm: { en: 'May send twice. ↑:Resend Tap:Edit',  ja: '二重送信の可能性 ↑:再送 タップ:編集' },
+  g2FootPromptRetry:  { en: 'Tap:Edit ↑:Retry ↓:Del 2Tap:Discard', ja: 'タップ:編集 ↑:再送 ↓:削除 2タップ:破棄' },
+  promptEmpty:        { en: '(empty draft)',                     ja: '(下書きは空です)' },
+  asrPartialWarning: { en: 'Connection lost — review partial text', ja: '接続が切れました — 途中の文字起こしを確認' },
+  asrNoSpeech:       { en: 'No speech captured · tap to retry', ja: '音声を取得できませんでした · タップで再試行' },
+  asrLostNoSpeech:   { en: 'Recording interrupted · No speech captured', ja: '録音が中断されました · 音声を取得できませんでした' },
+  disconnected:     { en: 'Disconnected', ja: '未接続' },
+  notConfigured:    { en: 'Not configured', ja: '未設定' },
+  offlineLastUpdate:{ en: 'Offline · last update {time}', ja: 'オフライン · 最終更新 {time}' },
+  offlineNoData:    { en: 'Offline · no cached data', ja: 'オフライン · 保存済みデータなし' },
+  connectionRetryHint: { en: 'Retry from the hold menu', ja: '長押しメニューから再試行' },
+  menuRetryConnection: { en: 'Retry connection', ja: '接続を再試行' },
+  menuPromptUndo:   { en: 'Undo last deletion', ja: '直前の削除を戻す' },
+  promptSent:         { en: 'Prompt sent: {name}',               ja: '送信しました: {name}' },
 
   // ─── New Agent session detection ────────────────────────────
   newClaudeDetecting:  { en: '(detecting…)',                    ja: '(検出中…)' },
@@ -178,11 +203,14 @@ const STRINGS = {
   // 幅の実測が置換文字と同じ = 実体が無い (レンズでは空白に見える) ため使わない。
   // 括弧で囲むのは、文中の句読点ではなく「印」だと一目で分かるようにするため。
   g2HeadBlocked:      { en: '(!) Check terminal',               ja: '(!) ターミナルを確認' },
-  // 回答待ちのヘッダ。g2HeadBlocked と同じ流儀 (セッション名の後ろに置いて点滅させる) なので
+  // 回答待ちのヘッダ。g2HeadBlocked と同じ流儀 (セッション名の後ろに常時表示) なので
   // 同じく短く保つ。マークは両方とも丸括弧の「?」。⏸ は G2 レンズのフォントに収録されて
   // いない疑いがある (Issue #72) ので使わない。質問待ち/承認待ちの区別は文言で伝える。
-  g2HeadWaitQ:        { en: '(?) Question waiting',             ja: '(?) 質問待ち' },
-  g2HeadWaitPerm:     { en: '(?) Approval waiting',             ja: '(?) 承認待ち' },
+  g2HeadWaitQ:        { en: '(?) Question',                     ja: '(?) 質問待ち' },
+  g2HeadWaitPerm:     { en: '(?) Approval',                     ja: '(?) 承認待ち' },
+  g2HeadWorking:     { en: 'Working',                          ja: '作業中' },
+  g2HeadReplyReady:  { en: 'Reply ready',                       ja: '返信あり' },
+  g2HeadAgentIdle:   { en: 'Agent idle',                        ja: '待機中' },
 
   // ─── G2 lens ─────────────────────────────────────────────────
   g2Booting:        { en: 'Booting…',                           ja: '起動中…' },
@@ -208,7 +236,7 @@ const STRINGS = {
   pluginConnecting: { en: 'Opening plugin...',                        ja: 'プラグインを開いています...' },
   g2FootRecOff:     { en: 'Tap:Done　2Tap:Cancel',                     ja: 'タップ:録音終了　2タップ:取消' },
   g2FootFinalizing: { en: 'Transcribing…',                                 ja: '文字起こし中…' },
-  g2FootPending:    { en: 'Tap:Add　↑:Send　↓:Del　2Tap:Back', ja: 'タップ:追加　↑:送信　↓:削除　2タップ:戻る' },
+  g2FootPending:    { en: 'Tap:Add ↑:Send ↓:Del 2Tap:Discard', ja: 'タップ:追加 ↑:送信 ↓:削除 2タップ:破棄' },
   g2FootSending:    { en: 'Sending to tmux…',                              ja: 'tmuxに送信中…' },
   g2FootSetup:      { en: 'Set up on phone',                               ja: 'スマホで設定' },
   g2FootIdle:       { en: 'Tap:Rec　↑↓:Scroll　2Tap:Back',         ja: 'タップ:録音　↑↓:履歴　2タップ:戻る' },
@@ -240,6 +268,13 @@ const STRINGS = {
   // カーソル行ごとに文言を変えると 1 行動かすたびにページ再構築が要るため。
   // 何が起きたかは実行後にフッタの一時通知で知らせる。
   menuToggleFavorite:  { en: '★ Toggle favorite',                    ja: '★ お気に入り切替' },
+  menuPromptSend:      { en: 'Send draft',                           ja: '下書きを送信' },
+  menuPromptRetry:     { en: 'Retry send',                           ja: '再送' },
+  menuPromptResend:    { en: 'Resend anyway',                        ja: '再送する' },
+  menuPromptEdit:      { en: 'Edit (add voice)',                     ja: '編集 (音声追加)' },
+  menuPromptDiscard:   { en: 'Discard draft',                        ja: '下書きを破棄' },
+  menuReviewRecord:    { en: 'Record answer again',                  ja: '回答を録り直す' },
+  menuReviewChoices:   { en: 'Back to choices',                      ja: '選択肢へ戻る' },
 } as const
 
 export type StringKey = keyof typeof STRINGS

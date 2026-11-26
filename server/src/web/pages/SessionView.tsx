@@ -68,6 +68,8 @@ export function SessionView({
   // pty WebSocket がサーバから 4404 (session not found) で閉じられた時に立てる。
   // 立つと reconnect ループを止めて「セッションが無い」UI を出す。
   const [sessionMissing, setSessionMissing] = useState(false);
+  // pty が落ちて再接続待ちの間だけヘッダに出す。初回接続の前は出さない。
+  const [ptyReconnecting, setPtyReconnecting] = useState(false);
   const showKeybar = useCoarsePointer();
 
   // 画像をアップロード → 取得した path を `@path ` として PTY に流し込む。
@@ -199,6 +201,7 @@ export function SessionView({
 
       ws.onopen = () => {
         if (disposed) { ws?.close(); return; }
+        setPtyReconnecting(false);
         ws!.send(JSON.stringify({ type: 'attach', cols: term.cols, rows: term.rows }));
         term.focus();
       };
@@ -244,9 +247,12 @@ export function SessionView({
         // 4404 = サーバ側で tmux にセッションが無いと判定して閉じられた。
         // auto-create 設計を廃止したのでこの code が来たら reconnect しない。
         if (event.code === 4404) {
+          setPtyReconnecting(false);
           setSessionMissing(true);
           return;
         }
+        // xterm 内の行は残す。ヘッダのチップはスクロールで流れないように別で出す。
+        setPtyReconnecting(true);
         term.write('\r\n\x1b[31m[disconnected — retrying…]\x1b[0m\r\n');
         reconnectTimer = setTimeout(() => { if (!disposed) openWs(); }, 1500);
       };
@@ -363,6 +369,13 @@ export function SessionView({
           {t('back')}
         </button>
         <span className="session-title">{sessionName}</span>
+        <span
+          className={ptyReconnecting ? 'conn-chip' : 'conn-chip conn-chip--off'}
+          role="status"
+          aria-live="polite"
+        >
+          {ptyReconnecting ? t('reconnecting') : ''}
+        </span>
         <button
           type="button"
           className="session-attach"
