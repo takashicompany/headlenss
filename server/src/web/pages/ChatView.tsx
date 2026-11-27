@@ -39,6 +39,25 @@ type Pending = {
   createdAt: number;
 };
 
+/**
+ * 許可の前に見せる本文。空白と改行はそのまま残す (flatten すると
+ * `echo a\nrm` と `echo a rm` が同じに見える)。
+ * コマンドやパス等の決まった欄が無いときは null。その場合は生 JSON を開いて出す。
+ */
+function primaryToolInput(input: unknown): string | null {
+  const exact = (value: unknown): string | null => (
+    typeof value === 'string' && value.trim() ? value : null
+  );
+  if (typeof input === 'string') return exact(input);
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const obj = input as Record<string, unknown>;
+  for (const key of ['command', 'cmd', 'file_path', 'path', 'pattern', 'query', 'url', 'description', 'prompt']) {
+    const value = exact(obj[key]);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
 type CodexHookHealth = {
   status: 'ok' | 'missing' | 'incomplete';
   missingEvents: string[];
@@ -205,10 +224,26 @@ export function ChatView({
   const [currentQIdx, setCurrentQIdx] = useState(0);
   // 許可リクエスト用のメッセージ
   const [permMessage, setPermMessage] = useState('');
+  // 生 JSON は補助。本文が取れる依頼は閉じたまま、取れない依頼は最初から開く。
+  // 同じ id のポーリングでは、ここで開閉を戻さない。
+  const [permDetailsFor, setPermDetailsFor] = useState<string | null>(null);
+  const [permDetailsOpen, setPermDetailsOpen] = useState(false);
+  const permDetailsId = pendingInter?.kind === 'permission' ? pendingInter.id : null;
+  if (permDetailsId !== permDetailsFor) {
+    setPermDetailsFor(permDetailsId);
+    setPermDetailsOpen(permDetailsId !== null && primaryToolInput(pendingInter?.toolInput) === null);
+  }
   const [respondingPending, setRespondingPending] = useState(false);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // 送信の失敗。ポーリング成功では消さない。次の成功した送信か、閉じる操作で消す。
+  const [sendError, setSendError] = useState<string | null>(null);
+  // アップロード / 許可応答 / 未回答など、送信以外の操作失敗。同じくポーリングでは消さない。
+  const [actionError, setActionError] = useState<string | null>(null);
+  // chat 取得が届いていない。送信エラーとは別の静かな表示にする。
+  const [reconnecting, setReconnecting] = useState(false);
+  // 一度でも chat 取得に成功したか。失敗のまま「まだ会話がありません」と出さないため。
+  const [chatLoaded, setChatLoaded] = useState(false);
 
   const scrollerRef = useRef<HTMLDivElement>(null);
   const chatInputRef = useRef<HTMLFormElement>(null);
@@ -391,9 +426,13 @@ export function ChatView({
             });
           }
         }
-        if (!disposed) setError(null);
-      } catch (e) {
-        if (!disposed) setError((e as Error).message);
+        // 取得の成否は再接続表示だけ。送信エラーはここに来ても残す。
+        if (!disposed) {
+          setChatLoaded(true);
+          setReconnecting(false);
+        }
+      } catch {
+        if (!disposed) setReconnecting(true);
       }
       if (!disposed) timer = setTimeout(tick, 1500);
     };
@@ -450,7 +489,6 @@ export function ChatView({
     scrollToBottom();
 
     setSending(true);
-    setError(null);
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(sessionName)}/input`, {
         method: 'POST',
@@ -461,11 +499,13 @@ export function ChatView({
         const j = (await res.json().catch(() => ({}))) as { error?: string };
         throw new Error(j.error ?? `HTTP ${res.status}`);
       }
+      // 成功した送信でだけ消す。試行の開始時に消すと、失敗が画面に残らない。
+      setSendError(null);
     } catch (e) {
       // 送信失敗時は楽観的メッセージを取り除いて入力欄に戻す
       setPending((p) => p.filter((m) => m !== optimistic));
       setInput(text);
-      setError((e as Error).message);
+      setSendError((e as Error).message);
     } finally {
       setSending(false);
       inputRef.current?.focus();
@@ -516,14 +556,14 @@ export function ChatView({
   const handleImageFiles = useCallback(async (files: File[]) => {
     if (files.length === 0) return;
     setUploading(true);
-    setError(null);
+    setActionError(null);
     try {
       for (const f of files) {
         try {
           const r = await uploadImage(f);
           insertAtCursor(`@${r.path} `);
         } catch (e) {
-          setError(`${t('uploadFailedPrefix')} (${f.name}): ${(e as Error).message}`);
+          setActionError(`${t('uploadFailedPrefix')} (${f.name}): ${(e as Error).message}`);
         }
       }
     } finally {
@@ -556,7 +596,7 @@ export function ChatView({
   ) => {
     if (!pendingInter || respondingPending) return;
     setRespondingPending(true);
-    setError(null);
+    setActionError(null);
     try {
       const res = await fetch(
         `/api/claude/sessions/${encodeURIComponent(sessionName)}/respond`,
@@ -579,7 +619,7 @@ export function ChatView({
       setQNotes({});
       setPermMessage('');
     } catch (e) {
-      setError(`${t('respondFailedPrefix')}: ${(e as Error).message}`);
+      setActionError(`${t('respondFailedPrefix')}: ${(e as Error).message}`);
     } finally {
       setRespondingPending(false);
     }
@@ -629,7 +669,7 @@ export function ChatView({
       if (a.answerKind === 'type-something') return !(a.text ?? '').trim();
       return false;
     })) {
-      setError(t('unansweredQuestions'));
+      setActionError(t('unansweredQuestions'));
       return;
     }
     void respondToPending({ kind: 'question', answers });
@@ -696,11 +736,20 @@ export function ChatView({
     void refreshWebTabs();
   }, [tab, bumpReload, refreshWebTabs]);
 
+  const showCheckTabs = webTabsLoaded && webTabs.length === 0;
+
   return (
-    <div className={`page-session chat-view${webTabs.length > 0 ? ' chat-view--tabbed' : ''}`}>
+    <div className={`page-session chat-view${webTabs.length > 0 ? ' chat-view--tabbed' : ''}${showCheckTabs ? ' chat-view--check' : ''}`}>
       <header className="session-header">
         <button onClick={onBack} aria-label={t('back')}>{t('back')}</button>
         <span className="session-title">{sessionName}</span>
+        <span
+          className={reconnecting ? 'conn-chip' : 'conn-chip conn-chip--off'}
+          role="status"
+          aria-live="polite"
+        >
+          {reconnecting ? t('reconnecting') : ''}
+        </span>
         {activeWebTab !== null && (
           <PreviewActions active={activeWebTab} onReload={reloadActiveTab} />
         )}
@@ -743,7 +792,10 @@ export function ChatView({
           )}
 
           {displayChat.length === 0 ? (
-            <div className="chat-empty">{t('chatEmpty')}</div>
+            // 一度も取得できていない間は「会話が無い」ではなく再接続チップに任せる。
+            chatLoaded || !reconnecting ? (
+              <div className="chat-empty">{t('chatEmpty')}</div>
+            ) : null
           ) : (
             <>
               {hasOlderChat && (
@@ -844,7 +896,7 @@ export function ChatView({
                       onClick={() => setCurrentQIdx(totalQ - 1)}
                       disabled={respondingPending}
                     >
-                      {t('back')}
+                      {t('previous')}
                     </button>
                     <button
                       type="button"
@@ -992,7 +1044,7 @@ export function ChatView({
                     onClick={() => setCurrentQIdx(idx - 1)}
                     disabled={idx === 0 || respondingPending}
                   >
-                    {t('back')}
+                    {t('previous')}
                   </button>
                   {isAnswered(idx) && (
                     <button
@@ -1012,13 +1064,29 @@ export function ChatView({
           {pendingInter?.kind === 'permission' && (
             <div className="chat-pending">
               <div className="chat-pending-title">{t('permRequestTitle')}</div>
-              <div className="chat-pending-tool">tool: <code>{pendingInter.toolName}</code></div>
-              <pre className="chat-pending-toolinput">
-                {(() => {
-                  try { return JSON.stringify(pendingInter.toolInput, null, 2); }
-                  catch { return String(pendingInter.toolInput); }
-                })()}
-              </pre>
+              <div className="chat-pending-tool">{t('toolLabel')}: <code>{pendingInter.toolName}</code></div>
+              {(() => {
+                const command = primaryToolInput(pendingInter.toolInput);
+                return command !== null ? (
+                  <pre className="chat-pending-toolsum">{command}</pre>
+                ) : null;
+              })()}
+              <button
+                type="button"
+                className="chat-pending-details"
+                aria-expanded={permDetailsOpen}
+                onClick={() => setPermDetailsOpen((open) => !open)}
+              >
+                {t('details')}
+              </button>
+              {permDetailsOpen && (
+                <pre className="chat-pending-toolinput">
+                  {(() => {
+                    try { return JSON.stringify(pendingInter.toolInput, null, 2); }
+                    catch { return String(pendingInter.toolInput); }
+                  })()}
+                </pre>
+              )}
               <textarea
                 className="chat-pending-notes"
                 placeholder={t('permMessagePlaceholder')}
@@ -1029,19 +1097,19 @@ export function ChatView({
               <div className="chat-pending-actions">
                 <button
                   type="button"
-                  className="chat-pending-submit allow"
-                  onClick={() => submitPermission('allow')}
-                  disabled={respondingPending}
-                >
-                  {t('allow')}
-                </button>
-                <button
-                  type="button"
                   className="chat-pending-submit deny"
                   onClick={() => submitPermission('deny')}
                   disabled={respondingPending}
                 >
                   {t('deny')}
+                </button>
+                <button
+                  type="button"
+                  className="chat-pending-submit allow"
+                  onClick={() => submitPermission('allow')}
+                  disabled={respondingPending}
+                >
+                  {t('allow')}
                 </button>
               </div>
             </div>
@@ -1066,7 +1134,44 @@ export function ChatView({
             {t('scrollToBottom')}
           </button>
         )}
-        {error && <div className="chat-error">{t('sendErrorPrefix')}: {error}</div>}
+        <div
+          className={sendError ? 'chat-error' : 'chat-error is-off'}
+          role="status"
+          aria-live="polite"
+        >
+          {sendError && (
+            <>
+              <span>{t('sendErrorPrefix')}: {sendError}</span>
+              <button
+                type="button"
+                className="error-dismiss"
+                onClick={() => setSendError(null)}
+                aria-label={t('dismissError')}
+              >
+                ×
+              </button>
+            </>
+          )}
+        </div>
+        <div
+          className={actionError ? 'chat-error' : 'chat-error is-off'}
+          role="status"
+          aria-live="polite"
+        >
+          {actionError && (
+            <>
+              <span>{actionError}</span>
+              <button
+                type="button"
+                className="error-dismiss"
+                onClick={() => setActionError(null)}
+                aria-label={t('dismissError')}
+              >
+                ×
+              </button>
+            </>
+          )}
+        </div>
         {/* 送達未確認の注意は入力欄のすぐ上に出す (次に送るかどうかの判断材料なので)。
             画面ブロックの注意が出ている時は原因が同じなので、そちらに任せて重ねない。 */}
         {deliveryWarning && !screenBlocked && (
@@ -1133,10 +1238,14 @@ export function ChatView({
         />
       )}
 
-      {/* タブ帯は画面のいちばん下 (親指で届く位置)。登録が無ければ出さない */}
-      {webTabs.length > 0 && (
+      {/* タブ帯は画面のいちばん下。登録が無ければ、取り直すテキストボタンだけ出す。 */}
+      {webTabs.length > 0 ? (
         <Tabstrip tabs={webTabs} activeTab={tab} onSelect={onSwitchTab} stripRef={tabstripRef} />
-      )}
+      ) : showCheckTabs ? (
+        <button type="button" className="check-tabs" onClick={() => void refreshWebTabs()}>
+          {t('checkForTabs')}
+        </button>
+      ) : null}
     </div>
   );
 }

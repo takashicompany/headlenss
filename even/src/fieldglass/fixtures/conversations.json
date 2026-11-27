@@ -1,0 +1,414 @@
+[
+  {
+    "name": "owner taken by the wearer",
+    "profile": "work", "wearer": "S1",
+    "steps": [
+      { "at": 1000, "text": "We still need somebody to run the network check.", "speaker": "S2", "endMs": 1000 },
+      { "at": 1600, "text": "I'll take it and send the results by Friday.", "speaker": "S1", "endMs": 1600 }
+    ],
+    "shows": ["owner"], "retracts": ["resolved"],
+    "commitments": ["I'll take it and send the results by Friday."]
+  },
+  {
+    "name": "same utterance resolves before publication",
+    "profile": "work",
+    "steps": [
+      { "at": 1000, "text": "We need someone for the network check. I'll take it.", "speaker": "S2", "endMs": 1000 }
+    ],
+    "shows": [], "retracts": [],
+    "commitments": ["I'll take it."]
+  },
+  {
+    "name": "a spoken deadline resolves a date question",
+    "profile": "work",
+    "steps": [
+      { "at": 1000, "text": "There is no deadline for the launch.", "speaker": "S2", "endMs": 1000 },
+      { "at": 1900, "text": "Friday.", "speaker": "S3", "endMs": 1900 }
+    ],
+    "shows": ["date"], "retracts": ["resolved"], "commitments": []
+  },
+  {
+    "name": "decision followed by a choice",
+    "profile": "work",
+    "steps": [
+      { "at": 1000, "text": "We haven't decided between the blue option and the green option.", "speaker": "S2", "endMs": 1000 },
+      { "at": 1700, "text": "Let's go with the green option.", "speaker": "S3", "endMs": 1700 }
+    ],
+    "shows": ["decision"], "retracts": ["resolved"], "commitments": []
+  },
+  {
+    "name": "blocker cleared",
+    "profile": "work",
+    "steps": [
+      { "at": 1000, "text": "We are blocked on the network check.", "speaker": "S2", "endMs": 1000 },
+      { "at": 1800, "text": "The network check blocker is resolved.", "speaker": "S3", "endMs": 1800 }
+    ],
+    "shows": ["blocker"], "retracts": ["resolved"], "commitments": []
+  },
+  {
+    "name": "listening waits for an expressed concern",
+    "profile": "listening", "wearer": "S1",
+    "steps": [
+      { "at": 1000, "text": "We need somebody to run the meeting.", "speaker": "S2", "endMs": 1000 },
+      { "at": 2000, "text": "I'm worried about the change.", "speaker": "S2", "endMs": 2000 },
+      { "at": 2500, "text": "I'm worried too.", "speaker": "S1", "endMs": 2500 }
+    ],
+    "shows": ["concern"], "retracts": [], "commitments": []
+  },
+  {
+    "name": "everyday recall and remembrance",
+    "profile": "everyday",
+    "steps": [
+      { "at": 1000, "text": "Remind me what we agreed about dinner.", "speaker": "S2", "endMs": 1000 },
+      { "at": 2000, "text": "I remember now.", "speaker": "S2", "endMs": 2000 }
+    ],
+    "shows": ["recall"], "retracts": ["resolved"], "commitments": []
+  },
+  {
+    "name": "ordinary talk, denials, hypotheticals and quoted examples stay quiet",
+    "profile": "work",
+    "steps": [
+      { "at": 1000, "text": "The weather is lovely today.", "speaker": "S2", "endMs": 1000 },
+      { "at": 2000, "text": "We don't need an owner for the archived project.", "speaker": "S2", "endMs": 2000 },
+      { "at": 3000, "text": "We are not blocked.", "speaker": "S2", "endMs": 3000 },
+      { "at": 4000, "text": "If we need somebody for the demo, I'll take it.", "speaker": "S2", "endMs": 4000 },
+      { "at": 5000, "text": "The example says \"I am worried about the deadline\".", "speaker": "S2", "endMs": 5000 }
+    ],
+    "shows": [], "retracts": [], "commitments": []
+  },
+  {
+    "name": "an interim hypothesis is revised to no opportunity",
+    "profile": "work",
+    "steps": [
+      { "at": 1000, "text": "We need someone to send the report", "speaker": "S2", "endMs": 1000, "isFinal": false },
+      { "at": 1500, "text": "We don't need someone to send the report.", "speaker": "S2", "endMs": 1500 }
+    ],
+    "shows": [], "retracts": [], "commitments": []
+  },
+  {
+    "name": "focus excludes unknown and other voices",
+    "profile": "work", "wearer": "S1", "focus": "S2",
+    "steps": [
+      { "at": 1000, "text": "We need somebody for the rollout.", "speaker": "S3", "endMs": 1000 },
+      { "at": 2000, "text": "We need somebody for the rollout.", "endMs": 2000 },
+      { "at": 3000, "text": "We need somebody for the rollout.", "speaker": "S2", "endMs": 3000 }
+    ],
+    "shows": ["owner"], "retracts": [], "commitments": []
+  },
+  {
+    "name": "unknown speaker cannot receive a personal concern cue",
+    "profile": "listening",
+    "steps": [
+      { "at": 1000, "text": "I'm worried about tomorrow.", "endMs": 1000 },
+      { "at": 2000, "text": "Remind me what I promised.", "speaker": "UU", "endMs": 2000 }
+    ],
+    "shows": [], "retracts": [], "commitments": []
+  },
+  {
+    "name": "Japanese owner and exact commitment",
+    "profile": "work", "lang": "ja", "wearer": "S1",
+    "steps": [
+      { "at": 1000, "text": "担当者が未定です。", "speaker": "S2", "endMs": 1000 },
+      { "at": 2000, "text": "私が担当します。金曜日までに送ります。", "speaker": "S1", "endMs": 2000 }
+    ],
+    "shows": ["owner"], "retracts": ["resolved"],
+    "commitments": ["私が担当します。", "金曜日までに送ります。"]
+  },
+  {
+    "name": "side talk leaves the blocker slot available",
+    "profile": "work",
+    "steps": [
+      {
+        "at": 1000,
+        "text": "I blocked my calendar from two to three.",
+        "speaker": "S2",
+        "endMs": 1000
+      },
+      {
+        "at": 2000,
+        "text": "We are stuck in conference room B.",
+        "speaker": "S2",
+        "endMs": 2000
+      },
+      {
+        "at": 3000,
+        "text": "I am waiting on hold with the vendor.",
+        "speaker": "S2",
+        "endMs": 3000
+      },
+      {
+        "at": 4000,
+        "text": "I'm waiting on my coffee.",
+        "speaker": "S2",
+        "endMs": 4000
+      },
+      {
+        "at": 5000,
+        "text": "I got stuck in traffic this morning.",
+        "speaker": "S2",
+        "endMs": 5000
+      },
+      {
+        "at": 6000,
+        "text": "We are blocked on the API review.",
+        "speaker": "S2",
+        "endMs": 6000
+      }
+    ],
+    "shows": [
+      "blocker"
+    ],
+    "retracts": [],
+    "commitments": []
+  },
+  {
+    "name": "named owner answers the owner question without inventing Who",
+    "profile": "work",
+    "steps": [
+      {
+        "at": 1000,
+        "text": "Who will run the network check?",
+        "speaker": "S2",
+        "endMs": 1000
+      },
+      {
+        "at": 2000,
+        "text": "Dana will run the network check by Thursday.",
+        "speaker": "S3",
+        "endMs": 2000
+      }
+    ],
+    "shows": [
+      "owner"
+    ],
+    "retracts": [
+      "resolved"
+    ],
+    "commitments": [
+      "Dana will run the network check by Thursday."
+    ]
+  },
+  {
+    "name": "contractions do not merge billing and auth blockers",
+    "profile": "work",
+    "steps": [
+      {
+        "at": 1000,
+        "text": "We're blocked on billing.",
+        "speaker": "S2",
+        "endMs": 1000
+      },
+      {
+        "at": 2000,
+        "text": "We're unblocked on auth now.",
+        "speaker": "S3",
+        "endMs": 2000
+      },
+      {
+        "at": 3000,
+        "text": "We're unblocked on billing now.",
+        "speaker": "S3",
+        "endMs": 3000
+      }
+    ],
+    "shows": [
+      "blocker"
+    ],
+    "retracts": [
+      "resolved"
+    ],
+    "commitments": []
+  },
+  {
+    "name": "availability does not accept a task but a bare acceptance does",
+    "profile": "work",
+    "steps": [
+      {
+        "at": 1000,
+        "text": "We need somebody for the network check.",
+        "speaker": "S2",
+        "endMs": 1000
+      },
+      {
+        "at": 2000,
+        "text": "I can do this afternoon.",
+        "speaker": "S3",
+        "endMs": 2000
+      },
+      {
+        "at": 3000,
+        "text": "I can do this.",
+        "speaker": "S3",
+        "endMs": 3000
+      }
+    ],
+    "shows": [
+      "owner"
+    ],
+    "retracts": [
+      "resolved"
+    ],
+    "commitments": [
+      "I can do this."
+    ]
+  },
+  {
+    "name": "Japanese incidental dates do not answer an open deadline",
+    "profile": "work",
+    "lang": "ja",
+    "steps": [
+      {
+        "at": 1000,
+        "text": "期限が未定です。",
+        "speaker": "S2",
+        "endMs": 1000
+      },
+      {
+        "at": 2000,
+        "text": "今日の天気はいいです。",
+        "speaker": "S3",
+        "endMs": 2000
+      },
+      {
+        "at": 3000,
+        "text": "金曜日です。",
+        "speaker": "S3",
+        "endMs": 3000
+      }
+    ],
+    "shows": [
+      "date"
+    ],
+    "retracts": [
+      "resolved"
+    ],
+    "commitments": []
+  },
+  {
+    "name": "relative availability leaves ownership open until explicit acceptance",
+    "profile": "work",
+    "steps": [
+      {
+        "at": 1000,
+        "text": "We need somebody for the network check.",
+        "speaker": "S2",
+        "endMs": 1000
+      },
+      {
+        "at": 2000,
+        "text": "I can do this tomorrow.",
+        "speaker": "S3",
+        "endMs": 2000
+      },
+      {
+        "at": 3000,
+        "text": "I can do that today.",
+        "speaker": "S3",
+        "endMs": 3000
+      },
+      {
+        "at": 4000,
+        "text": "I can do this next week.",
+        "speaker": "S3",
+        "endMs": 4000
+      },
+      {
+        "at": 5000,
+        "text": "I can do this.",
+        "speaker": "S3",
+        "endMs": 5000
+      }
+    ],
+    "shows": [
+      "owner"
+    ],
+    "retracts": [
+      "resolved"
+    ],
+    "commitments": [
+      "I can do this."
+    ]
+  },
+  {
+    "name": "incidental relative dates do not settle a report deadline",
+    "profile": "work",
+    "steps": [
+      {
+        "at": 1000,
+        "text": "There is no deadline for the report.",
+        "speaker": "S2",
+        "endMs": 1000
+      },
+      {
+        "at": 2000,
+        "text": "I read the report today.",
+        "speaker": "S2",
+        "endMs": 2000
+      },
+      {
+        "at": 3000,
+        "text": "The report arrived today.",
+        "speaker": "S2",
+        "endMs": 3000
+      },
+      {
+        "at": 4000,
+        "text": "We discuss the report next week.",
+        "speaker": "S2",
+        "endMs": 4000
+      },
+      {
+        "at": 5000,
+        "text": "The deadline is Friday.",
+        "speaker": "S2",
+        "endMs": 5000
+      }
+    ],
+    "shows": [
+      "date"
+    ],
+    "retracts": [
+      "resolved"
+    ],
+    "commitments": []
+  },
+  {
+    "name": "calendar words do not become owners but explicit names do",
+    "profile": "work",
+    "steps": [
+      {
+        "at": 1000,
+        "text": "We need somebody for the plan.",
+        "speaker": "S2",
+        "endMs": 1000
+      },
+      {
+        "at": 2000,
+        "text": "Monday will review the plan.",
+        "speaker": "S2",
+        "endMs": 2000
+      },
+      {
+        "at": 3000,
+        "text": "June will deliver the plan.",
+        "speaker": "S2",
+        "endMs": 3000
+      },
+      {
+        "at": 4000,
+        "text": "Alex will review the plan.",
+        "speaker": "S2",
+        "endMs": 4000
+      }
+    ],
+    "shows": [
+      "owner"
+    ],
+    "retracts": [
+      "resolved"
+    ],
+    "commitments": [
+      "Alex will review the plan."
+    ]
+  }
+]

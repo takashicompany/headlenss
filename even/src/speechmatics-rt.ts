@@ -46,6 +46,17 @@ const HANDSHAKE_TIMEOUT_MS = 8000
 
 export type RTRegion = 'eu' | 'us'
 
+export type AsrOutcome =
+  | { kind: 'final'; text: string }
+  | { kind: 'recovered-partial'; text: string; reason: string }
+  | { kind: 'failure'; text: ''; reason: string }
+
+/** 異常終了でも受信済みの語句は残す。確定結果としては扱わない。 */
+export function recoverAsrText(text: string, reason: string): AsrOutcome {
+  const words = text.trim()
+  return words ? { kind: 'recovered-partial', text: words, reason } : { kind: 'failure', text: '', reason }
+}
+
 export type SpeechmaticsRTOptions = {
   apiKey: string
   language: string
@@ -61,14 +72,103 @@ export type SpeechmaticsRTOptions = {
    * stop()/abort() で畳んだ場合は呼ばれない。呼び出し側はこれを受けて
    * 録音 phase を畳む (受け取らないと「録音中」表示のまま無音を撮り続ける)。
    */
-  onDead?: (reason: string) => void
+  onDead?: (outcome: AsrOutcome) => void
+  /**
+   * 話者分離 (diarization: 'speaker')。Fieldglass の連続セッション用。
+   * 有効にすると結果の各語に S1/S2… の話者ラベルが付き、onSegment に載る。
+   */
+  diarization?: boolean
+  /**
+   * 発話の終わり (EndOfUtterance) を受け取る無音秒数。0 / 未指定なら要求しない。
+   * Speechmatics の conversation_config.end_of_utterance_silence_trigger (0〜2 秒)。
+   */
+  endOfUtteranceSilence?: number
+  /**
+   * 語単位の時刻・話者付きの区切り (Fieldglass の cue engine 入力)。
+   * 確定 (AddTranscript) は話者が変わるたびに 1 区切り、partial は全体で 1 区切り。
+   * EndOfUtterance は text='' / endOfUtterance=true の区切りとして届く。
+   */
+  onSegment?: (seg: AsrSegment) => void
+  /**
+   * 確定文を全文として手元に溜め続けるか (既定 true = 従来の音声入力)。
+   * 連続セッションでは false: 溜めない (メモリも本文も残さない)。
+   * false のとき onFinal は直近 1 件の確定文だけを渡す。
+   */
+  retainTranscript?: boolean
+}
+
+/** 時刻・話者付きの文字起こし区切り。cue-engine の Segment と同じ形。 */
+export type AsrSegment = {
+  text: string
+  isFinal: boolean
+  /** ASR の話者ラベル (S1, S2…)。不明 (UU) や話者分離なしは undefined。 */
+  speaker?: string
+  /** この接続の音声開始からの ms (再接続時のずらしは呼び出し側で足す) */
+  startMs: number
+  endMs: number
+  endOfUtterance?: boolean
+}
+
+type RtResult = {
+  type?: 'word' | 'punctuation' | string
+  start_time?: number
+  end_time?: number
+  is_eos?: boolean
+  attaches_to?: 'previous' | 'next' | 'both' | 'none' | string
+  alternatives?: Array<{ content?: string; speaker?: string; confidence?: number }>
+}
+
+/** スペースで語を区切らない言語 (Speechmatics の語は空白無しで連結する)。 */
+const NO_SPACE_LANGS = new Set(['ja', 'cmn', 'yue', 'zh', 'th'])
+
+function speakerOf(r: RtResult): string | undefined {
+  const sp = r.alternatives?.[0]?.speaker
+  return sp && sp !== 'UU' ? sp : undefined
+}
+
+/**
+ * 結果配列を話者が連続する区間ごとの区切りにする (純関数・テスト用に export)。
+ * 句読点は直前の語の話者に付ける (句読点には話者が付かないことがあるため)。
+ */
+export function segmentsFromResults(results: RtResult[], isFinal: boolean, language: string): AsrSegment[] {
+  const spaced = !NO_SPACE_LANGS.has(language)
+  const out: AsrSegment[] = []
+  type Building = AsrSegment & { parts: string[] }
+  let cur = null as Building | null
+  for (const r of results) {
+    const content = r.alternatives?.[0]?.content ?? ''
+    if (!content) continue
+    const punct = r.type === 'punctuation'
+    const sp: string | undefined = punct ? (cur ? cur.speaker : undefined) : speakerOf(r)
+    const startMs = Math.round((r.start_time ?? 0) * 1000)
+    const endMs = Math.round((r.end_time ?? r.start_time ?? 0) * 1000)
+    if (!cur || (!punct && sp !== cur.speaker)) {
+      if (cur) out.push(finishSeg(cur, spaced))
+      cur = { text: '', parts: [], isFinal, speaker: sp, startMs, endMs }
+    }
+    if (punct && cur.parts.length > 0 && r.attaches_to !== 'next') cur.parts[cur.parts.length - 1] += content
+    else cur.parts.push(content)
+    cur.endMs = Math.max(cur.endMs, endMs)
+    if (r.is_eos) cur.endOfUtterance = true
+  }
+  if (cur) out.push(finishSeg(cur, spaced))
+  return out
+}
+
+function finishSeg(seg: AsrSegment & { parts: string[] }, spaced: boolean): AsrSegment {
+  const { parts, ...rest } = seg
+  const out: AsrSegment = { ...rest, text: parts.join(spaced ? ' ' : '').trim() }
+  if (out.speaker === undefined) delete out.speaker
+  if (!out.endOfUtterance) delete out.endOfUtterance
+  return out
 }
 
 type ServerMessage =
   | { message: 'RecognitionStarted'; id?: string }
   | { message: 'AudioAdded'; seq_no: number }
-  | { message: 'AddPartialTranscript'; metadata: { transcript: string } }
-  | { message: 'AddTranscript'; metadata: { transcript: string } }
+  | { message: 'AddPartialTranscript'; metadata: { transcript: string; start_time?: number; end_time?: number }; results?: RtResult[] }
+  | { message: 'AddTranscript'; metadata: { transcript: string; start_time?: number; end_time?: number }; results?: RtResult[] }
+  | { message: 'EndOfUtterance'; metadata?: { start_time?: number; end_time?: number }; start_time?: number; end_time?: number }
   | { message: 'EndOfTranscript' }
   | { message: 'Info'; type?: string; reason?: string }
   | { message: 'Warning'; type?: string; reason?: string }
@@ -98,7 +198,8 @@ export class SpeechmaticsRT {
   private seqNo = 0
   private finals: string[] = []
   private currentPartial = ''
-  private endWaiter: { resolve: (text: string) => void; reject: (err: Error) => void } | null = null
+  private endWaiter: { resolve: (outcome: AsrOutcome) => void; reject: (err: Error) => void } | null = null
+  private failureReason = 'connection closed'
   private opts: SpeechmaticsRTOptions | null = null
   private startedAt = 0
   /** abort() 済み。以後 WebSocket を作らない (JWT 待ちの間に捨てられた場合の保険)。 */
@@ -187,6 +288,14 @@ export class SpeechmaticsRT {
             max_delay: opts.maxDelay ?? 1.0,
             max_delay_mode: 'flexible',
             enable_partials: opts.enablePartials ?? true,
+            // 話者分離は Fieldglass の連続セッションだけ。従来の音声入力の設定は 1 バイトも変えない。
+            ...(opts.diarization ? { diarization: 'speaker' } : {}),
+            // conversation_config は transcription_config の中 (StartRecognition の直下ではない)。
+            // https://docs.speechmatics.com/speech-to-text/realtime/turn-detection
+            // 0〜2 秒、max_delay より小さく保つこと (同ページ)。
+            ...(opts.endOfUtteranceSilence
+              ? { conversation_config: { end_of_utterance_silence_trigger: opts.endOfUtteranceSilence } }
+              : {}),
           },
         }
         try {
@@ -202,6 +311,10 @@ export class SpeechmaticsRT {
         try {
           msg = JSON.parse(ev.data) as ServerMessage
         } catch {
+          return
+        }
+        if (!opened && msg.message === 'Error') {
+          failOpen(`Speechmatics RT Error ${msg.type ?? ''}: ${msg.reason ?? ''}`)
           return
         }
         this.handleServerMessage(msg, () => {
@@ -227,16 +340,6 @@ export class SpeechmaticsRT {
           failOpen(`WebSocket closed before start (${e.code} ${e.reason || ''})`)
           return
         }
-        const waiter = this.endWaiter
-        if (waiter) {
-          // stop() の待ち中に閉じた: 手元にある分を確定として返す。
-          this.endWaiter = null
-          this.clearStopTimer()
-          const text = this.fullTranscript()
-          this.teardown()
-          waiter.resolve(text)
-          return
-        }
         // 録音中に切れた。取り残しを作らず、呼び出し側に畳ませる。
         this.die(`WebSocket closed (${e.code} ${e.reason || ''})`)
       }
@@ -248,10 +351,14 @@ export class SpeechmaticsRT {
    * teardown() が opts を捨てるので、コールバックは先に手元へ取っておく。
    */
   private die(reason: string): void {
-    if (this.aborted || this.stopping) { this.teardown(); return }
+    if (this.aborted) { this.teardown(); return }
+    this.failureReason = reason
+    const outcome = recoverAsrText(this.fullTranscript(), reason)
+    const waiter = this.endWaiter
     const onDead = this.opts?.onDead
     this.teardown()
-    onDead?.(reason)
+    if (waiter) waiter.resolve(outcome)
+    else if (!this.stopping) onDead?.(outcome)
   }
 
   private handleServerMessage(msg: ServerMessage, onStarted: () => void): void {
@@ -262,12 +369,21 @@ export class SpeechmaticsRT {
       case 'AddPartialTranscript':
         this.currentPartial = msg.metadata?.transcript ?? ''
         this.opts?.onPartial?.(this.fullTranscript())
+        this.emitSegments(msg.results, false)
         break
       case 'AddTranscript': {
         const text = msg.metadata?.transcript ?? ''
-        if (text) this.finals.push(text)
+        const retain = this.opts?.retainTranscript !== false
+        if (text && retain) this.finals.push(text)
         this.currentPartial = ''
-        this.opts?.onFinal?.(this.finals.join(''))
+        this.opts?.onFinal?.(retain ? this.finals.join('') : text)
+        this.emitSegments(msg.results, true)
+        break
+      }
+      case 'EndOfUtterance': {
+        // 時刻は metadata 内 (docs の並びでは直下にも見えるので両方読む)。話者は付かない。
+        const endMs = Math.round((msg.metadata?.end_time ?? msg.end_time ?? 0) * 1000)
+        this.opts?.onSegment?.({ text: '', isFinal: true, startMs: endMs, endMs, endOfUtterance: true })
         break
       }
       case 'EndOfTranscript': {
@@ -276,22 +392,14 @@ export class SpeechmaticsRT {
         this.clearStopTimer()
         const text = this.finals.join('')
         this.teardown()
-        waiter?.resolve(text)
+        waiter?.resolve(text.trim() ? { kind: 'final', text: text.trim() } : { kind: 'failure', text: '', reason: 'no-speech' })
         break
       }
       case 'Error': {
         const reason = `${msg.type ?? ''}${msg.reason ? `: ${msg.reason}` : ''}`
         const err = new Error(`Speechmatics RT Error ${reason}`)
         this.opts?.onError?.(err)
-        const waiter = this.endWaiter
-        this.endWaiter = null
-        this.clearStopTimer()
-        if (waiter) {
-          this.teardown()
-          waiter.reject(err)
-        } else {
-          this.die(`Speechmatics RT Error ${reason}`)
-        }
+        this.die(err.message)
         break
       }
       case 'Warning':
@@ -300,6 +408,15 @@ export class SpeechmaticsRT {
         break
       default:
         break
+    }
+  }
+
+  private emitSegments(results: RtResult[] | undefined, isFinal: boolean): void {
+    const opts = this.opts
+    if (!opts?.onSegment || !results?.length) return
+    for (const seg of segmentsFromResults(results, isFinal, opts.language)) {
+      // 呼び出し側の例外で受信ループを壊さない (次のメッセージも処理させる)
+      try { opts.onSegment(seg) } catch (err) { opts.onError?.(err as Error) }
     }
   }
 
@@ -321,22 +438,22 @@ export class SpeechmaticsRT {
   }
 
   /** EndOfStream を送り、EndOfTranscript を待って確定テキストを返す */
-  async stop(): Promise<string> {
+  async stop(): Promise<AsrOutcome> {
     this.stopping = true
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       // 既に閉じている/開けなかった。手元の確定分を返しつつ取り残しを掃除する。
-      const text = this.finals.join('')
+      const outcome = recoverAsrText(this.fullTranscript(), this.failureReason)
       this.teardown()
-      return text
+      return outcome
     }
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<AsrOutcome>((resolve, reject) => {
       const settle = (fn: () => void): void => {
         this.clearStopTimer()
         this.endWaiter = null
         fn()
       }
       this.endWaiter = {
-        resolve: (text) => settle(() => resolve(text.trim())),
+        resolve: (outcome) => settle(() => resolve(outcome)),
         reject: (err) => settle(() => reject(err)),
       }
       // 保険のタイマーは送信より先に張る。送信が同期 throw しても、
@@ -345,19 +462,14 @@ export class SpeechmaticsRT {
         this.stopTimer = null
         const waiter = this.endWaiter
         this.endWaiter = null
-        const text = this.fullTranscript()
+        const outcome = recoverAsrText(this.fullTranscript(), 'stop-timeout')
         this.teardown()
-        waiter?.resolve(text)
+        waiter?.resolve(outcome)
       }, STOP_TIMEOUT_MS)
       try {
         this.ws!.send(JSON.stringify({ message: 'EndOfStream', last_seq_no: this.seqNo }))
       } catch (err) {
-        const waiter = this.endWaiter
-        this.endWaiter = null
-        this.clearStopTimer()
-        this.teardown()
-        if (waiter) waiter.reject(err as Error)
-        else reject(err as Error)
+        this.die(`EndOfStream send failed: ${(err as Error).message}`)
       }
     })
   }
