@@ -30,6 +30,7 @@ import {
 import { pruneScreenBlockObservations, resolveScreenBlocked } from './screen-block.ts';
 import { getRetainedSession, hasRetainedSession, listRetainedSessions, removeRetainedSession, renameRetainedSession, retainSession } from './retained-sessions.ts';
 import { handleWebTabs, servePreview } from './web-preview.ts';
+import { mountFieldglass } from './fieldglass/index.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIST = resolve(__dirname, '../../dist/web');
@@ -593,6 +594,7 @@ app.get('/api/sessions/:name/webtabs', handleWebTabs);
 
 app.route('/api', claudeRouter);
 app.route('/api', codexRouter);
+mountFieldglass(app);
 
 // ───────── 画像アップロード (Web UI → Claude Code) ─────────
 //

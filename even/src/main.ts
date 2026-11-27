@@ -78,9 +78,14 @@ import {
   LANGUAGE_LABELS,
   setLanguage,
   t,
+  tf,
   type Language,
 } from './i18n'
 import { installOneShotTimerGuard } from './timer-guard'
+import { createCueEngine, resetCueRatings } from './fieldglass/cue-engine'
+import { FgPrefs, FieldglassLens, sameFgTag, type FgFrameTag } from './fieldglass/lens'
+import { MessagesLens, sameMsgTag, type MsgFrameTag } from './fieldglass/messages'
+import { MicArbiter } from './fieldglass/mic-arbiter'
 
 // SDK (0.0.10 以降) の one-shot タイマーは、ホストの __tickShadowTimers と
 // 実タイマーの両方から発火することがある = 1 回のはずの処理が 2 回走る。
@@ -206,6 +211,8 @@ type Phase =
   | 'cc-message'   // Claude Code の承認/質問の本文を全文読む画面 (cc-response の手前)
   | 'cc-response'  // Claude Code の承認/質問待ちに応答する画面
   | 'cc-review'    // 音声で作った回答を、送信/次の質問へ進む前に確認する画面
+  | 'fieldglass'   // Fieldglass (会議キュー)。中の画面遷移は fieldglass/lens.ts が持つ
+  | 'messages'     // iMessage の一覧/スレッド/送信確認。中の画面遷移は fieldglass/messages.ts。返信の録音と下書きは既存の recording/pending を使う
   | 'error'
 
 const TMUX_OUTPUT_LINES = 200          // (legacy) capture-pane 用 — 現状未使用
@@ -346,6 +353,11 @@ type PromptDraft = {
   retryArmed: boolean
   recoveredPartial: boolean
   lastDeletion: { text: string; index: number } | null
+  /**
+   * iMessage への返信下書き (AMENDMENT 2)。あれば宛先は tmux ではなくこのスレッド。
+   * 送信は Messages の確認画面の Tap だけ (pending の ↑ は確認画面へ進むだけ)。
+   */
+  reply?: { threadId: string; name: string; draftId: string; draftText?: string }
 }
 // 下書きは録音開始時の宛先に束縛する。スマホでセッション/URLを切り替えても移し替えない。
 let promptDraft: PromptDraft | null = null
@@ -360,11 +372,58 @@ function pendingSentences(): string[] { return promptDraft?.sentences ?? [] }
 function pendingDisplayText(): string { return pendingSentences().join('\n') }
 function pendingSendText(): string    { return pendingSentences().join(' ') }
 function pendingHasContent(): boolean { return pendingSentences().some((s) => s.trim().length > 0) }
-function promptTargetName(): string   { return promptDraft?.sessionName ?? settings.sessionName }
-function promptRestPhase(): 'pending' | 'idle' {
+function promptTargetName(): string {
+  if (promptDraft?.reply) return tf('msgDraftTo', { name: promptDraft.reply.name })
+  return promptDraft?.sessionName ?? settings.sessionName
+}
+function promptRestPhase(): 'pending' | 'idle' | 'messages' {
   if (pendingHasContent() || promptDraft?.lastDeletion) return 'pending'
+  const wasReply = promptDraft?.reply !== undefined
   promptDraft = null // 空の録音を中止した後、古い宛先だけを次の録音へ持ち越さない。
+  if (wasReply) {
+    // 返信の録音を何も録らずに終えた → スレッド画面へ戻す
+    messages.returnToThread()
+    return 'messages'
+  }
   return 'idle'
+}
+/** iMessage 返信の下書き画面: 本文を何行目から見せているか (↑↓ で読む)。 */
+let replyDraftScroll = 0
+/** 返信画面の 1 行目 (宛先の見出し)。本文幅に収める。 */
+function replyDraftHead(): string {
+  return truncateToPx(tf('msgDraftHead', { name: promptDraft?.reply?.name ?? '' }), CHAT_WRAP_PX).s
+}
+/**
+ * 下書き確認 (pending) の本文。必ず折り返し、7 行の窓に収める。
+ *   - iMessage 返信: 1 行目は宛先の見出し。本文は ↑↓ で読める (はみ出す時は末尾に ▼ n/m)。
+ *   - tmux 向け: 最新の行が見えるよう末尾の窓 (↑↓ は従来どおり送信 / 削除なのでスクロールは無い)。
+ */
+function pendingLensLines(): string[] {
+  const fixed: string[] = []
+  if (promptDraft?.reply) fixed.push(replyDraftHead())
+  if (promptDraft?.recoveredPartial) fixed.push(...wrapText(t('asrPartialWarning'), CHAT_WRAP_PX))
+  if (promptDraft?.delivery === 'unknown' && !promptDraft.reply) fixed.push(...wrapText(t('promptUnknownHint'), CHAT_WRAP_PX))
+  const body = pendingSentences().flatMap((s) => wrapText(s, CHAT_WRAP_PX))
+  if (body.length === 0) body.push(t('promptEmpty'))
+  const room = CC_LIST_VISIBLE - fixed.length
+  if (body.length <= room) return [...fixed, ...body]
+  if (!promptDraft?.reply) return [...fixed, ...body.slice(body.length - room)]
+  const view = room - 1  // 最終行は位置表示
+  replyDraftScroll = Math.max(0, Math.min(replyDraftScroll, body.length - view))
+  const end = replyDraftScroll + view
+  return [...fixed, ...body.slice(replyDraftScroll, end), `▼ ${Math.min(end, body.length)}/${body.length}`]
+}
+function scrollReplyDraft(delta: number): void {
+  replyDraftScroll = Math.max(0, replyDraftScroll + delta)
+  void refreshG2(true)
+}
+/** 返信下書きの本文はログに出さない (長さだけ)。tmux 向けは従来どおり冒頭を出す。 */
+function draftLogText(text: string, max: number): string {
+  return promptDraft?.reply ? `(${text.length} chars)` : `"${text.slice(0, max)}"`
+}
+function newDraftId(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto
+  return c?.randomUUID?.() ?? `d-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 let tmuxOutput = ''     // (legacy) tmux 出力 — 現状ダッシュボードとレンズには使わない
 let outputPollTimer: ReturnType<typeof setInterval> | null = null
@@ -462,6 +521,8 @@ const LENS_MENU_ID_REVIEW_RECORD = 5
 const LENS_MENU_ID_REVIEW_CHOICES = 6
 const LENS_MENU_ID_PROMPT_UNDO = 7
 const LENS_MENU_ID_RETRY_CONNECTION = 8
+/** iMessage 返信の下書き: 末尾 1 文を削除 (返信では ↓ がスクロールなので、削除は長押しメニュー)。 */
+const LENS_MENU_ID_PROMPT_DELETE_LAST = 9
 
 /**
  * OS 長押しメニューの「★ お気に入り切替」が作用する対象のセッション名。
@@ -474,7 +535,12 @@ const LENS_MENU_ID_RETRY_CONNECTION = 8
  */
 function favoriteTargetSession(): string | null {
   if (phase === 'boot' || phase === 'unconfigured' || phase === 'disconnected' || phase === 'error') return null
-  if (phase === 'rootlist') return currentRootRow()?.session.tmuxSessionName ?? null
+  if (phase === 'fieldglass' || phase === 'messages') return null
+  if (promptDraft?.reply && (phase === 'pending' || phase === 'recording' || phase === 'finalizing')) return null
+  if (phase === 'rootlist') {
+    const row = currentRootRow()
+    return row && (row.kind === 'session' || row.kind === 'plugin') ? row.session.tmuxSessionName : null
+  }
   if (phase === 'pending' || phase === 'sending' || (phase === 'recording' && !recordingIsForRespond())) return promptTargetName() || null
   return settings.sessionName || null
 }
@@ -492,15 +558,24 @@ function favoriteTargetSession(): string | null {
  * 結果 (付いた/外れた) は実行後にフッタの一時通知で必ず知らせる。
  */
 function lensMenuItems(): LensMenuItem[] | null {
+  if (phase === 'fieldglass') {
+    const fg = fieldglass.menuItems()
+    return fg.length ? fg : null
+  }
+  if (phase === 'messages') {
+    const m = messages.menuItems()
+    return m.length ? m : null
+  }
   const items: LensMenuItem[] = []
   if (serverOffline && settings.serverBaseUrl) items.push({ itemID: LENS_MENU_ID_RETRY_CONNECTION, itemName: t('menuRetryConnection') })
   if (favoriteTargetSession() !== null) items.push({ itemID: LENS_MENU_ID_TOGGLE_FAVORITE, itemName: t('menuToggleFavorite') })
   if (phase === 'pending') {
     items.push(
-      { itemID: LENS_MENU_ID_PROMPT_SEND, itemName: t(promptDraft?.retryArmed ? 'menuPromptResend' : promptDraft?.delivery === 'draft' ? 'menuPromptSend' : 'menuPromptRetry') },
+      { itemID: LENS_MENU_ID_PROMPT_SEND, itemName: t(promptDraft?.reply ? 'msgMenuReview' : promptDraft?.retryArmed ? 'menuPromptResend' : promptDraft?.delivery === 'draft' ? 'menuPromptSend' : 'menuPromptRetry') },
       { itemID: LENS_MENU_ID_PROMPT_EDIT, itemName: t('menuPromptEdit') },
       { itemID: LENS_MENU_ID_PROMPT_DISCARD, itemName: t('menuPromptDiscard') },
     )
+    if (promptDraft?.reply && pendingSentences().length > 0) items.push({ itemID: LENS_MENU_ID_PROMPT_DELETE_LAST, itemName: t('msgMenuDeleteLast') })
     if (promptDraft?.lastDeletion) items.push({ itemID: LENS_MENU_ID_PROMPT_UNDO, itemName: t('menuPromptUndo') })
   } else if (phase === 'cc-review') {
     items.push(
@@ -686,6 +761,126 @@ function recordingIsForRespond(): boolean {
 let g2RefreshLastAt = -G2_REFRESH_THROTTLE_MS - 1000
 const client = new HeadlenssClient('')
 
+// ─── Fieldglass ────────────────────────────────────────────────────────
+// 会議中のキューと約束の保存。画面と操作は fieldglass/lens.ts、ここは配線だけ。
+// 鍵とサーバは HeadLenss の設定をそのまま使う (Fieldglass 専用の設定は無い)。
+let fgPrefs = new FgPrefs()
+
+// G2 マイクの持ち主は 1 か所 (通常録音と Fieldglass で共有)。閉じるのは今の持ち主の札だけ、
+// 止めた後に遅れて開いた取得は誰も持っていなければ閉じ直す (fieldglass/mic-arbiter.ts)。
+const micArbiter = new MicArbiter({ open: () => openMic(), close: (reason, waitMs) => closeMic(reason, waitMs ?? 0) }, (m) => diag(m))
+/** 通常録音 (tmux 用 / 応答の Type something / iMessage 返信) が持っているマイクの札。 */
+let recMicToken: number | null = null
+/** 通常録音のマイクを閉じる。持ち主でなければ閉じない (Fieldglass のマイクを止めない)。
+ *  誰も持ち主を名乗っていないのにマイクが握られたまま (取り残し) なら、それは閉じる。 */
+function releaseRecordingMic(reason: string, waitMs = 0): Promise<boolean> {
+  const token = recMicToken
+  recMicToken = null
+  if (token !== null && micArbiter.isCurrent(token)) return micArbiter.release(token, reason, waitMs)
+  if (micArbiter.owner() === null && micIsHeld()) return micArbiter.closeAll(reason, waitMs)
+  return Promise.resolve(true)
+}
+/** 通常録音側の片付けが要るマイク (自分の札 / 持ち主不明の取り残し)。Fieldglass の分は含めない。 */
+function recordingMicHeld(): boolean {
+  return micArbiter.owner() === 'recording' || (micArbiter.owner() === null && micIsHeld())
+}
+const fieldglass = new FieldglassLens({
+  client: () => (settings.serverBaseUrl ? client : null),
+  createEngine: (opts) => createCueEngine(opts),
+  createAsr: () => new SpeechmaticsRT(),
+  asrConfig: () => (settings.speechmaticsApiKey
+    ? { apiKey: settings.speechmaticsApiKey, language: settings.speechmaticsLang, operatingPoint: settings.speechmaticsOperatingPoint }
+    : null),
+  mic: {
+    acquire: (owner) => micArbiter.acquire(owner),
+    release: (token, reason) => micArbiter.release(token, reason, MIC_CLOSE_WAIT_MS),
+  },
+  redraw: (force) => { paintStatus(); updateRecordButton(); return refreshG2(force) },
+  notice: (text) => showG2Notice(text),
+  exit: () => leaveFieldglass(),
+  wrap: (text) => wrapText(text, CHAT_WRAP_PX),
+  store: { get: (k) => fgPrefs.get(k), set: (k, v) => fgPrefs.set(k, v) },
+  log: (msg) => log(msg),
+  // 評価の記憶は store にあるので、使い捨てのエンジン経由で消す (全プロファイル)
+  resetRatings: () => resetCueRatings(createCueEngine({
+    profile: 'work', now: () => Date.now(), store: { get: (k) => fgPrefs.get(k), set: (k, v) => fgPrefs.set(k, v) },
+  })),
+})
+
+// ─── Messages (iMessage) ───────────────────────────────────────────────
+const messages = new MessagesLens({
+  client: () => (settings.serverBaseUrl ? client : null),
+  // 返信の送信先は下書きを作った時のサーバに固定する (設定を変えても別の Mac へ送らない)
+  clientFor: (base) => (base ? new HeadlenssClient(base) : null),
+  fitHeader: (text) => truncateToPx(text, HEADER_INNER_WIDTH).s,
+  redraw: (force) => { paintStatus(); updateRecordButton(); return refreshG2(force) },
+  notice: (text) => showG2Notice(text),
+  wrap: (text) => wrapText(text, CHAT_WRAP_PX),
+  exit: () => {
+    if (phase !== 'messages') return
+    phase = 'rootlist'
+    rootCursorKey = MESSAGES_ROW_KEY
+    paintStatus(); updateRecordButton(); void refreshG2(true)
+  },
+  startReply: (thread) => {
+    // 既存の録音 → 下書き確認フローを、宛先をスレッドに差し替えて使う (部分回復・追加録音・削除・取り消しも同じ)
+    replyDraftScroll = 0
+    promptDraft = {
+      sessionName: '', serverBaseUrl: settings.serverBaseUrl,
+      sentences: [], delivery: 'draft', retryArmed: false, recoveredPartial: false, lastDeletion: null,
+      reply: { threadId: thread.id, name: thread.name, draftId: newDraftId() },
+    }
+    void startRecording()
+  },
+  backToDraft: () => {
+    if (!promptDraft?.reply) return
+    phase = 'pending'
+    paintStatus(); updateRecordButton(); updatePendingUI(); void refreshG2(true)
+  },
+  draft: () => {
+    const reply = promptDraft?.reply
+    if (!promptDraft || !reply) return null
+    // draftId は「この本文」1 つに 1 つ。同じ本文の再試行は同じ id (サーバが重複を無視する)、
+    // 編集して本文が変わったら新しい id (サーバは同じ id で別の本文を拒否する)。
+    const text = pendingSendText()
+    if (reply.draftText !== undefined && reply.draftText !== text) reply.draftId = newDraftId()
+    reply.draftText = text
+    return {
+      threadId: reply.threadId, name: reply.name, draftId: reply.draftId, text,
+      recoveredPartial: promptDraft.recoveredPartial, serverBaseUrl: promptDraft.serverBaseUrl,
+    }
+  },
+  clearDraft: () => { if (promptDraft?.reply) { promptDraft = null; updatePendingUI() } },
+  log: (msg) => log(msg),
+})
+
+function enterMessages(): void {
+  if (phase !== 'rootlist') return
+  phase = 'messages'
+  messages.enter()
+  paintStatus()
+  updateRecordButton()
+  void refreshG2(true)
+}
+
+function enterFieldglass(): void {
+  if (phase !== 'rootlist') return
+  phase = 'fieldglass'
+  fieldglass.enter()
+  paintStatus()
+  updateRecordButton()
+  void refreshG2(true)
+}
+
+function leaveFieldglass(): void {
+  if (phase !== 'fieldglass') return
+  phase = 'rootlist'
+  rootCursorKey = FIELDGLASS_ROW_KEY
+  paintStatus()
+  updateRecordButton()
+  void refreshG2(true)
+}
+
 // ─── Logging ───────────────────────────────────────────────────────────
 // logEl は新しい行を先頭に前置する。上限を設けないと textContent が無制限に肥大し、
 // 1回の log で全文を read/concat/再代入するため累積コストが二乗的になり、巨大な <pre>
@@ -764,6 +959,10 @@ function statusForCurrentPhase(): { dot: string; text: string } {
       }
     case 'cc-review':
       return { dot: 'busy', text: t('reviewAnswer') }
+    case 'fieldglass':
+      return { dot: fieldglass.isLive() ? 'rec' : 'ready', text: fieldglass.statusText() }
+    case 'messages':
+      return { dot: 'ready', text: t('msgRootLabel') }
     case 'recording':
       return { dot: 'rec', text: `${t('g2Recording')} ${getRecordingSeconds().toFixed(1)}s` }
     case 'finalizing':
@@ -812,7 +1011,9 @@ function recomputePhase(): void {
     phase === 'sending' ||
     phase === 'cc-message' ||
     phase === 'cc-response' ||
-    phase === 'cc-review'
+    phase === 'cc-review' ||
+    phase === 'fieldglass' ||
+    phase === 'messages'
   ) return
   if (!bridge || !isConfigured(settings)) {
     phase = 'unconfigured'
@@ -834,11 +1035,18 @@ function recomputePhase(): void {
  * カーソルはこの行配列の上を動く (プラグイン行にも止まれる)。
  */
 type RootRow =
+  | { kind: 'fieldglass' }
+  | { kind: 'messages' }
   | { kind: 'session'; session: ClaudeSessionInfo }
   | { kind: 'plugin'; session: ClaudeSessionInfo; plugin: G2PluginInfo }
 
 /** 行の同一性キー。並びが変わってもカーソル位置を保つために index ではなくこれで追う。 */
+const FIELDGLASS_ROW_KEY = 'fg'
+const MESSAGES_ROW_KEY = 'msg'
+
 function rootRowKey(row: RootRow): string {
+  if (row.kind === 'fieldglass') return FIELDGLASS_ROW_KEY
+  if (row.kind === 'messages') return MESSAGES_ROW_KEY
   return row.kind === 'session'
     ? `s:${row.session.tmuxSessionName}`
     // 名前も含める。URL だけだと、同じ URL を別名で 2 行宣言した時にキーが衝突し、
@@ -854,7 +1062,8 @@ function rootRowKey(row: RootRow): string {
  */
 function rootRowSignature(): string {
   return rootRows()
-    .map((r) => (r.kind === 'session'
+    .map((r) => (r.kind === 'fieldglass' ? `${FIELDGLASS_ROW_KEY}|${fieldglass.rootRowLabel()}`
+      : r.kind === 'messages' ? `${MESSAGES_ROW_KEY}|${messages.rootRowLabel()}` : r.kind === 'session'
       ? `${rootRowKey(r)}|${r.session.status}|${r.session.screenBlocked === true}|${r.session.source ?? ''}|${r.session.lastChat ?? ''}|${isUnread(r.session)}|${isFavoriteSession(r.session)}`
       : `${rootRowKey(r)}|${r.plugin.name}`))
     .join('\n')
@@ -870,7 +1079,8 @@ function rootRows(): RootRow[] {
   const ordered = favoriteSessions.size === 0
     ? claudeSessions
     : [...claudeSessions.filter(isFavoriteSession), ...claudeSessions.filter((s) => !isFavoriteSession(s))]
-  const rows: RootRow[] = []
+  // Fieldglass は常に先頭 (セッションが無くても入れる)。
+  const rows: RootRow[] = [{ kind: 'fieldglass' }, { kind: 'messages' }]
   for (const session of ordered) {
     rows.push({ kind: 'session', session })
     for (const plugin of session.g2Plugins ?? []) rows.push({ kind: 'plugin', session, plugin })
@@ -936,6 +1146,8 @@ function updatePendingUI(): void {
 
 // ─── G2 lens ───────────────────────────────────────────────────────────
 function buildG2Content(): string {
+  if (phase === 'fieldglass') return fieldglass.content()
+  if (phase === 'messages') return messages.content()
   if (phase === 'disconnected') return `${t('disconnected')}\n\n${t('connectionRetryHint')}`
   // ルート画面: tmux一覧 (cursor 中央)
   if (phase === 'rootlist') {
@@ -977,17 +1189,20 @@ function buildG2Content(): string {
     // 秒数表示は header。content は live transcript (もしくは状態メッセージ) を
     // レンズ幅で折り返し、スクロール位置に応じた窓だけ出す。
     const all = recordingLines()
-    const n = chatDisplayLines()
+    // iMessage 返信: 1 行目は見出し (返信の本文を 1 行目に置かない = 描画経路の console に出さない)
+    const head = promptDraft?.reply && !recordingIsForRespond() ? [replyDraftHead()] : []
+    const n = chatDisplayLines() - head.length
     const end = Math.max(n, all.length - recordingScrollOffset)
-    return all.slice(Math.max(0, end - n), end).join('\n')
+    return [...head, ...all.slice(Math.max(0, end - n), end)].join('\n')
   } else if (phase === 'finalizing') {
     // 接続中など PCM が乗る前に停止すると liveTranscript は空のまま finalize に入る。
     // 「処理中」と見せると実態 (何も処理していない) と齟齬があるので empty 表示にする。
-    lines.push('▌ ' + (liveTranscript || '(empty)'))
+    if (promptDraft?.reply) lines.push(replyDraftHead())
+    // 折り返して最新の行だけ (7 行の窓)。確定待ちの短い間でも枠からはみ出さない。
+    const tail = wrapText('▌ ' + (liveTranscript || '(empty)'), CHAT_WRAP_PX)
+    lines.push(...tail.slice(Math.max(0, tail.length - (CC_LIST_VISIBLE - lines.length))))
   } else if (phase === 'pending') {
-    if (promptDraft?.recoveredPartial) lines.push(...wrapText(t('asrPartialWarning'), CHAT_WRAP_PX), '')
-    if (promptDraft?.delivery === 'unknown') lines.push(t('promptUnknownHint'), '')
-    lines.push(pendingDisplayText() || t('promptEmpty'))
+    return pendingLensLines().join('\n')
   } else if (phase === 'sending') {
     lines.push(`${t('g2HeadSending')} → ${promptTargetName()}`)
     lines.push('')
@@ -1074,9 +1289,6 @@ function tailLines(text: string, n: number): string {
 /** G2 rootlist 画面: Claude Code 起動中の tmux 一覧 (待機状態は記号で示す) */
 function buildRootListView(): string {
   const items = rootRows()
-  if (items.length === 0) {
-    return t('rootListEmpty')
-  }
   const total = items.length
   const rootCursor = resolveRootCursorIndex()
 
@@ -1096,6 +1308,14 @@ function buildRootListView(): string {
   for (let i = rootListStart; i < Math.min(rootListStart + ROOT_LIST_VISIBLE, total); i++) {
     const row = items[i]
     const cursor = i === rootCursor ? '▶ ' : '  '
+    if (row.kind === 'fieldglass') {
+      lines.push(truncateToPx(`${cursor}${fieldglass.rootRowLabel()}`, CHAT_WRAP_PX).s)
+      continue
+    }
+    if (row.kind === 'messages') {
+      lines.push(truncateToPx(`${cursor}${messages.rootRowLabel()}`, CHAT_WRAP_PX).s)
+      continue
+    }
     if (row.kind === 'plugin') {
       // セッション行の下にぶら下げる。字下げで従属関係を示す。
       // ★ は親セッション行にだけ出す (プラグイン単体はお気に入りの対象ではない)。
@@ -1111,7 +1331,9 @@ function buildRootListView(): string {
     const prefix = `${cursor}${star}${s.tmuxSessionName} [${agent}] ${unread}${mark}`
     lines.push(appendRootPreview(prefix, s.lastChat))
   }
-  return lines.join('\n')
+  // エージェントのセッションが 1 つも無い時は、Fieldglass 行の下に従来の案内を出す
+  if (claudeSessions.length === 0) lines.push('', ...t('rootListEmpty').split('\n'))
+  return lines.slice(0, ROOT_LIST_VISIBLE).join('\n')
 }
 
 /**
@@ -1896,6 +2118,8 @@ function buildG2Footer(): string {
   if (flowIsInFlight(respondFlow) && isRespondFlowActive()) return t('respondSending')
   // 一時通知は操作案内より優先する。数秒か次の操作で自動的に消える。
   if (g2Notice !== null) return g2Notice
+  if (phase === 'fieldglass') return fieldglass.footer()
+  if (phase === 'messages') return messages.footer()
   if (serverOffline && (phase === 'idle' || phase === 'rootlist' || phase === 'disconnected')) return offlineStatus()
   switch (phase) {
     case 'rootlist': {
@@ -1932,6 +2156,7 @@ function buildG2Footer(): string {
     }
     case 'finalizing':    return t('g2FootFinalizing')
     case 'pending':
+      if (promptDraft?.reply) return t('msgFootPending')  // ↑ は送信ではなく確認画面へ
       if (promptDraft?.retryArmed) return t('promptRetryConfirm')
       return t(promptDraft?.delivery === 'draft' ? 'g2FootPending' : 'g2FootPromptRetry')
     case 'sending':       return t('g2FootSending')
@@ -1981,6 +2206,9 @@ function sessionStatusHeader(name: string, status: string): string {
 /** G2 レンズ最上段に表示する「現在の画面/フェーズ」のタイトル文字列 */
 function buildG2Header(): string {
   switch (phase) {
+    // マイクが開いている間は必ず「● LIVE mm:ss」が入る (lens.ts が保証する)
+    case 'fieldglass':   return fieldglass.header()
+    case 'messages':     return messages.header()
     case 'boot':         return t('g2HeadBoot')
     case 'unconfigured': return t('notConfigured')
     case 'disconnected': return t('disconnected')
@@ -2048,7 +2276,26 @@ function buildG2Header(): string {
 //   full render は content も送り直すので、実行時に content-only の待機枠は捨てる。
 //   スクロールアニメの着地点 (最後のコマ) もこの待機枠を通るので、必ず届く。
 /** レンズ 1 画面ぶんのスナップショット (同じ状態から組んだ 3 コンテナの内容)。 */
-type G2Frame = { header: string; content: string; footer: string }
+/**
+ * フレームの身元札 (送信成功の照合用。本文の文字列では照合しない)。
+ *   fg  … Fieldglass のキューを載せたフレーム (計測の renderedAt)
+ *   msg … iMessage の送信確認カード (このフレームが実際に出るまで Send を受け付けない)
+ */
+type AckTag = { kind: 'fg'; tag: FgFrameTag } | { kind: 'msg'; tag: MsgFrameTag }
+/** fgTag: 上の札 (名前は互換のため)。 */
+type G2Frame = { header: string; content: string; footer: string; fgTag?: AckTag | null }
+/** 最後にレンズへ送れた本文の身元札 (札の無い画面は null)。 */
+let g2ContentLastSentTag: AckTag | null = null
+/** いま組むフレームの札 (フレームを組むのと同じ同期区間で呼ぶ)。 */
+function currentAckTag(): AckTag | null {
+  if (phase === 'fieldglass') { const tag = fieldglass.frameTag(); return tag ? { kind: 'fg', tag } : null }
+  if (phase === 'messages') { const tag = messages.frameTag(); return tag ? { kind: 'msg', tag } : null }
+  return null
+}
+function sameAckTag(a: AckTag | null | undefined, b: AckTag | null | undefined): boolean {
+  if (!a || !b || a.kind !== b.kind) return false
+  return a.kind === 'fg' ? sameFgTag(a.tag, b.tag as FgFrameTag) : sameMsgTag(a.tag, b.tag as MsgFrameTag)
+}
 
 // ─── 未決着送信の会計 (時間切れ後の背圧) ────────────────────────────────
 // renderer の 5 秒タイムアウトは「こちらが待つのをやめる」だけで、SDK 側のフレームは
@@ -2394,13 +2641,16 @@ async function executeFullRender(force: boolean, frame: G2Frame | null = null): 
   try {
     // header / content / footer を同期的に一括ビルド (同一 phase スナップショット)。
     // 呼び出し側が既に組んだスナップショットがあればそれを使う (二重ビルドの解消)。
-    const { header, content, footer } = frame ?? buildG2Frame()
+    const { header, content, footer, fgTag = null } = frame ?? buildG2Frame()
     // ヘッダも出す: Agent の状態更新のように「同じ phase で送信内容だけが変わる」
     // 挙動は、この行の時系列でしか外から確かめられない。
     console.log(`[refreshG2] firing (phase=${phase}, force=${force}) header=${JSON.stringify(header)}`)
     // 本文とフッタは devMode の時だけ。「レンズに何が出ているか」はグラスを掛けずに
     // 追える唯一の手掛かりなので、開発モードでは必ず残す (既定では 1 行も出さない)。
-    log(`[refreshG2] content=${JSON.stringify(content)} footer=${JSON.stringify(footer)}`)
+    // Fieldglass の本文には会話の引用やキューが載る。保存しなかった言葉をログに残さない。
+    log(phase === 'fieldglass' || phase === 'messages' || promptDraft?.reply
+      ? `[refreshG2] content=(${phase}, ${content.length} chars redacted) footer=${JSON.stringify(footer)}`
+      : `[refreshG2] content=${JSON.stringify(content)} footer=${JSON.stringify(footer)}`)
 
     // 長押しメニューが変わる時 (= 一覧に入った/出た) だけはページごと組み直す。
     // menuObject は textContainerUpgrade に載らないので、差分更新では差し替わらない。
@@ -2420,8 +2670,10 @@ async function executeFullRender(force: boolean, frame: G2Frame | null = null): 
       g2ContentLastSent = content
       g2FooterLastSent = footer
       g2MenuLastSent = menuSig
+      g2ContentLastSentTag = fgTag
       g2LastSentAt = performance.now()
       noteBridgeSendOk()
+      noteG2FrameShown(fgTag)
       return
     }
     // dedup 基準は「送れたもの」だけを 1 つずつ記録する: scroll tick とポーリング由来の
@@ -2441,10 +2693,13 @@ async function executeFullRender(force: boolean, frame: G2Frame | null = null): 
       g2HeaderLastSent = header
       sentAny = true
     }
-    if (content !== g2ContentLastSent) {
+    // 同じ文面でも、別のキュー (札) のフレームなら送り直す: 送信の成功はフレームの身元で照合するため
+    if (content !== g2ContentLastSent || (fgTag !== null && !sameAckTag(fgTag, g2ContentLastSentTag))) {
       await updateContent(content)
       g2ContentLastSent = content
+      g2ContentLastSentTag = fgTag
       sentAny = true
+      noteG2FrameShown(fgTag)
     }
     if (footer !== g2FooterLastSent) {
       await updateFooter(footer)
@@ -2491,6 +2746,8 @@ async function runExclusiveG2Send(body: () => Promise<void>): Promise<void> {
  * boot / foreground 再入場 / 言語切替などページ全体再構築時に使う。
  */
 async function sendShowScreen(header: string, content: string, footer: string): Promise<void> {
+  // 引数を組んだのと同じ同期区間で札を取る (ロック待ちの間に状態が変わっても、送る本文の札のまま)
+  const fgTag = currentAckTag()
   await runExclusiveG2Send(async () => {
     // ページ全体を送り直すので、待機中の content-only は用済み。dedup 基準も更新する。
     const menu = lensMenuItems()
@@ -2500,6 +2757,7 @@ async function sendShowScreen(header: string, content: string, footer: string): 
     g2ContentLastSent = content
     g2FooterLastSent = footer
     g2MenuLastSent = menuSig
+    g2ContentLastSentTag = null
     try {
       await showScreen(header, content, footer, menu)
       g2LastSentAt = performance.now()
@@ -2507,7 +2765,18 @@ async function sendShowScreen(header: string, content: string, footer: string): 
       invalidateG2Dedup()
       throw err
     }
+    g2ContentLastSentTag = fgTag
+    noteG2FrameShown(fgTag)
   })
+}
+
+/**
+ * 本文がレンズへ送れた後にだけ呼ぶ。Fieldglass の renderedAt はこれを起点にする
+ * (refreshG2 の resolve は「送った」ではない: 送信中なら待機枠に積んだだけで返る)。
+ */
+function noteG2FrameShown(tag: AckTag | null): void {
+  if (tag?.kind === 'fg') fieldglass.onFrameRendered(tag.tag)
+  else if (tag?.kind === 'msg') messages.onFrameRendered(tag.tag)
 }
 
 /**
@@ -2529,7 +2798,7 @@ function g2FrameWouldChange(frame: G2Frame): boolean {
 
 /** 現在の状態から 3 コンテナぶんの内容を一度に組む (同一スナップショット)。 */
 function buildG2Frame(): G2Frame {
-  return { header: buildG2Header(), content: buildG2Content(), footer: buildG2Footer() }
+  return { header: buildG2Header(), content: buildG2Content(), footer: buildG2Footer(), fgTag: currentAckTag() }
 }
 
 // ─── Sessions ──────────────────────────────────────────────────────────
@@ -3087,6 +3356,8 @@ function applyClientBase(): void {
     claudeDeliveryWarning = null
     resetRespondStateForSessionChange()
     resetScroll()
+    // Messages: 別の Mac のスレッド名・一覧・取得中の結果を新しいサーバの物として見せない
+    messages.serverChanged()
   }
   client.setBase(settings.serverBaseUrl)
 }
@@ -3410,6 +3681,13 @@ function updateRecordButton(): void {
     recordBtn.classList.remove('recording')
     return
   }
+  if (phase === 'fieldglass') {
+    recordBtn.disabled = !fieldglass.hasSession()
+    recordBtn.textContent = fieldglass.hasSession() ? 'Stop Fieldglass mic' : 'Fieldglass (start on G2)'
+    if (fieldglass.isLive()) recordBtn.classList.add('recording')
+    else recordBtn.classList.remove('recording')
+    return
+  }
   if (phase === 'rootlist') {
     recordBtn.disabled = true
     recordBtn.textContent = 'Pick session on G2'
@@ -3438,7 +3716,8 @@ async function startRecording(): Promise<void> {
     return
   }
   const target = recordingIsForRespond() ? settings : promptDraft ?? settings
-  if (!settings.speechmaticsApiKey || !target.serverBaseUrl || !target.sessionName) {
+  // 返信 (iMessage) の下書きは tmux セッションを持たない。宛先はスレッド。
+  if (!settings.speechmaticsApiKey || !target.serverBaseUrl || (!target.sessionName && !promptDraft?.reply)) {
     log('startRecording blocked: not configured')
     // タップしたのに何も起きない状態にしない。理由の切り分けはスマホ側で行う。
     showG2Notice(t('g2NoticeRecFail'))
@@ -3496,7 +3775,7 @@ async function startRecording(): Promise<void> {
     stopRecordingTimer()
     stopRecordingClock()
     recordingReady = false
-    void closeMic('start-failed', MIC_CLOSE_WAIT_MS)
+    void releaseRecordingMic('start-failed', MIC_CLOSE_WAIT_MS)
     try { session.abort() } catch { /* ignore */ }
     rtSession = null
     const flow = respondFlow
@@ -3563,7 +3842,9 @@ async function startRecording(): Promise<void> {
     //    (タイマー 0.0s / 音が入らない / 停止も効かない)。PCM が届く経路は
     //    この応答とは別なので、決着しないまま音だけ来ることもある。
     //    少しだけ待って、決着しなくてもそのまま録音を続ける。
-    const openResult = await settleWithin(openMic(), MIC_OPEN_SETTLE_MS)
+    const ticket = micArbiter.acquire('recording')
+    recMicToken = ticket.token
+    const openResult = await settleWithin(ticket.result, MIC_OPEN_SETTLE_MS)
     if (openResult === null) {
       // 未決着。失敗ではない。ここで畳むと「実機は開いているのにアプリだけ諦めた」
       // になるので、診断だけ残して録音を続ける。
@@ -3581,7 +3862,8 @@ async function startRecording(): Promise<void> {
       log('mic: 取得を待っている間に録音が終わっていました — 解放してから畳みます')
       if (rtSession === session) rtSession = null
       try { session.abort() } catch { /* ignore */ }
-      void closeMic('stale-after-open', MIC_CLOSE_WAIT_MS)
+      // 自分の札で閉じる。札がもう持ち主でないなら、遅れて開いた分は arbiter が誰も使っていない時だけ閉じ直す。
+      if (recMicToken === ticket.token) void releaseRecordingMic('stale-after-open', MIC_CLOSE_WAIT_MS)
       return
     }
     // レンズ表示を「接続中…」から「録音中」に切り替え (取得の決着は待たない)。
@@ -3663,7 +3945,7 @@ async function stopRecordingToPending(recovered?: AsrOutcome): Promise<void> {
     // G2マイク停止。決着は待ちきらない。ホストが応答を返さないことがあり、
     // 待ち続けると「停止を押しても固まったまま」になる。喋った内容の確定・送信を
     // マイクの解放にぶら下げない。解放そのものはバックグラウンドで決着させる。
-    if (!await closeMic('stop', MIC_CLOSE_WAIT_MS)) {
+    if (!await releaseRecordingMic('stop', MIC_CLOSE_WAIT_MS)) {
       dumpMicHealth('stop-close-unsettled')
     }
     if (abandonIfSessionSwitched('マイク停止後')) return
@@ -3744,7 +4026,7 @@ async function stopRecordingToPending(recovered?: AsrOutcome): Promise<void> {
     const t0 = performance.now()
     try {
       outcome = await rt.stop()
-      log(`RT ${outcome.kind}: "${outcome.text.slice(0, 80)}" (${(performance.now() - t0).toFixed(0)}ms)`)
+      log(`RT ${outcome.kind}: ${draftLogText(outcome.text, 80)} (${(performance.now() - t0).toFixed(0)}ms)`)
     } catch (e) {
       const errorMsg = (e as Error).message
       log(`RT stop error: ${errorMsg}`)
@@ -3753,7 +4035,7 @@ async function stopRecordingToPending(recovered?: AsrOutcome): Promise<void> {
       try { rt.abort() } catch { /* ignore */ }
       if (abandonIfSessionSwitched('ASR 失敗後')) return
       addHistoryEntry({
-        text: liveTranscript || '(ASR failed)',
+        text: promptDraft?.reply ? '(message reply)' : liveTranscript || '(ASR failed)',
         session: settings.sessionName,
         ok: false,
         durationMs: performance.now() - t0,
@@ -3791,6 +4073,15 @@ async function stopRecordingToPending(recovered?: AsrOutcome): Promise<void> {
 /** 送達不明の再送は二段階。下書きも宛先も成功が分かるまで残す。 */
 async function confirmAndSend(): Promise<void> {
   if (phase !== 'pending' || !pendingHasContent() || !promptDraft) return
+  if (promptDraft.reply) {
+    // iMessage は下書きからは送らない。宛先と全文を見せる確認画面へ進むだけ (送信はそこでの Tap)。
+    phase = 'messages'
+    messages.openConfirm()
+    paintStatus()
+    updateRecordButton()
+    updatePendingUI()
+    return
+  }
   const draft = promptDraft
   if (draft.delivery === 'unknown' && !draft.retryArmed) {
     draft.retryArmed = true
@@ -3859,6 +4150,15 @@ async function editPromptDraft(): Promise<void> {
 function discardPending(): void {
   if (phase !== 'pending') return
   log(`pending discarded (${pendingSentences().length} sentences dropped)`)
+  if (promptDraft?.reply) {
+    promptDraft = null
+    phase = 'messages'
+    messages.returnToThread()
+    paintStatus()
+    updateRecordButton()
+    updatePendingUI()
+    return
+  }
   promptDraft = null
   phase = 'idle'
   recomputePhase()
@@ -3875,7 +4175,7 @@ function removeLastSentence(): void {
   if (promptDraft) promptDraft.retryArmed = false
   const removed = pendingSentences().pop()
   if (promptDraft && removed !== undefined) promptDraft.lastDeletion = { text: removed, index: pendingSentences().length }
-  log(`pending: removed last sentence "${(removed ?? '').slice(0, 40)}" (remaining ${pendingSentences().length})`)
+  log(`pending: removed last sentence ${draftLogText(removed ?? '', 40)} (remaining ${pendingSentences().length})`)
   updatePendingUI()
   paintStatus()
   void refreshG2(true)
@@ -3904,7 +4204,7 @@ async function abortRecording(): Promise<void> {
   const wasRecording = phase === 'recording'
   // 'finalizing' 中の rtSession は停止処理が使っている最中なので触らない。
   const orphanRt = !wasRecording && phase !== 'finalizing' ? rtSession : null
-  if (!wasRecording && !micIsHeld() && !orphanRt) return
+  if (!wasRecording && !recordingMicHeld() && !orphanRt) return
   if (wasRecording) log(`recording aborted (kept ${pendingSentences().length} sentences)`)
   else if (orphanRt) log('録音画面ではないが ASR 接続が残っているので破棄します')
   else log('録音画面ではないがマイクが握られたままなので解放します')
@@ -3954,9 +4254,10 @@ async function abortRecording(): Promise<void> {
 
     // G2 マイク停止。画面はこの前に畳み終えているが、決着まで待つと
     // 「取得中」の内部状態が残り続けるので、ここも締切付きで待つ。
-    await closeMic('abort', MIC_CLOSE_WAIT_MS)
+    await releaseRecordingMic('abort', MIC_CLOSE_WAIT_MS)
     // 未決着の取得が残っていたらここで解く。残すと次のタップで取得が出せない。
-    resetMicState('abort')
+    // ただし Fieldglass が今マイクを持っているなら、その状態は壊さない。
+    if (micArbiter.owner() !== 'fieldglass') resetMicState('abort')
   } finally {
     // 例外で抜けても 'recording' に固着させない。
     if (phase === 'recording') {
@@ -3993,9 +4294,9 @@ function forceResetBlockedPhase(): void {
   rtSession = null
   if (rt) { try { rt.abort() } catch { /* ignore */ } }
   // マイクは投げっぱなしで解放する (ここで待つと脱出口の意味がない)。
-  if (micIsHeld()) void closeMic('stuck-reset', MIC_CLOSE_WAIT_MS)
-  // 未決着の取得が残っていると次のタップで取得を出せない。手元だけで解く。
-  resetMicState('stuck-reset')
+  void releaseRecordingMic('stuck-reset', MIC_CLOSE_WAIT_MS)
+  // 未決着の取得が残っていると次のタップで取得を出せない。手元だけで解く (Fieldglass の分は除く)。
+  if (micArbiter.owner() !== 'fieldglass') resetMicState('stuck-reset')
   liveTranscript = ''
   durationEl.textContent = '0.0s'
   if (phase === 'sending') {
@@ -4033,6 +4334,11 @@ function forceResetBlockedPhase(): void {
 }
 
 async function toggleRecording(): Promise<void> {
+  // Fieldglass 中のスマホの録音ボタンは「マイクを止める」専用 (レンズの Tap は別経路)
+  if (phase === 'fieldglass') {
+    if (fieldglass.hasSession()) await fieldglass.endLive()
+    return
+  }
   if (phase === 'finalizing' || phase === 'sending') {
     // 通常はここで無視する (二重停止・二重送信を作らない)。ただし長引いている
     // 場合だけは、このタップを捨てずに脱出へ使う。捨てると「何度叩いても
@@ -4047,6 +4353,8 @@ async function toggleRecording(): Promise<void> {
   if (phase === 'recording') {
     await stopRecordingToPending()
   } else if (phase === 'pending') {
+    // iMessage 返信: Tap = 確認画面へ (送信はそこでの Tap)。追加録音は長押しメニュー。
+    if (promptDraft?.reply) { await confirmAndSend(); return }
     // 追加録音 — 既存 pendingSentences は保持されたまま新しい文を末尾に追加する
     await editPromptDraft()
     return
@@ -4087,7 +4395,7 @@ function moveRootCursor(delta: number): void {
   const next = (cur + delta + rows.length) % rows.length
   rootCursorKey = rootRowKey(rows[next])
   const row = rows[next]
-  log(`rootlist cursor=${row.kind} ${row.kind === 'plugin' ? row.plugin.name : row.session.tmuxSessionName}`)
+  log(`rootlist cursor=${row.kind} ${row.kind === 'plugin' ? row.plugin.name : row.kind === 'fieldglass' || row.kind === 'messages' ? row.kind : row.session.tmuxSessionName}`)
   void refreshG2(true)
 }
 
@@ -4280,6 +4588,14 @@ function activateSelectedFromRoot(): void {
   if (phase !== 'rootlist') return
   const row = currentRootRow()
   if (!row) return
+  if (row.kind === 'fieldglass') {
+    enterFieldglass()
+    return
+  }
+  if (row.kind === 'messages') {
+    enterMessages()
+    return
+  }
   if (row.kind === 'plugin') {
     openG2Plugin(row.plugin)
     return
@@ -4290,7 +4606,7 @@ function activateSelectedFromRoot(): void {
 function openSelectedFromRoot(): void {
   if (phase !== 'rootlist') return
   const row = currentRootRow()
-  const sel = row?.session ?? claudeSessions[0]
+  const sel = (row && (row.kind === 'session' || row.kind === 'plugin') ? row.session : undefined) ?? claudeSessions[0]
   if (!sel) return
   // セッション切替: 前回の in-flight fetch を中断してから新セッションに切替
   abortInFlightRefresh()
@@ -4525,7 +4841,7 @@ function discardRespondRecording(): void {
   stopRecordingTimer()
   // ここは同期の後始末なので待たない (解放そのものは出しっぱなしで決着させる)。
   // マイクを握っていなければ実機へは何も出ない。
-  if (micIsHeld()) void closeMic('discard-respond')
+  void releaseRecordingMic('discard-respond')
   rtSession?.abort()
   rtSession = null
   resetPcmCounter()
@@ -5132,6 +5448,25 @@ async function changeLanguage(lang: Language): Promise<void> {
   }
 }
 
+/** G2 アプリ画面を離れた (SDK の foreground exit)。テストからも同じ処理を通せるよう関数にしてある。 */
+function handleForegroundExit(): void {
+  // Messages の定期取得を止め、取得中の結果も無効にする (アプリの外で読みに行かない)
+  messages.pause()
+  // 録音中に離脱した場合はここで必ず後始末する。放置するとマイクが開いたまま、
+  // 音声認識の WebSocket も開いたままになり、離脱のたびに積み上がる。
+  // 録音済みの確定文 (pendingSentences) は abortRecording が保持する。
+  // 判断は phase だけでなくマイクの実態でも行う: 取得の途中で畳まれた等で
+  // 「録音画面ではないがマイクは握ったまま」になっている場合もここで解く。
+  // Fieldglass: マイクと音声認識を止める (会話の中身は残し、戻ったら Tap で再開)
+  if (fieldglass.hasSession()) fieldglass.suspend('foreground-exit')
+  if (phase !== 'fieldglass' && (phase === 'recording' || recordingMicHeld() || rtSession)) {
+    log('foreground exit — 録音/マイクを後始末します')
+    void abortRecording()
+  }
+  // ページが破棄されている可能性に備え、次回入場時に createStartUpPageContainer に戻す
+  resetPageState()
+}
+
 async function boot(): Promise<void> {
   setupLogToolbar()
   setupLanguageSelector()
@@ -5155,13 +5490,24 @@ async function boot(): Promise<void> {
   // ページごと消える経路 (WebView 破棄 / 遷移) の保険。
   // SDK のイベントが来ないまま消えることがあり、その時はマイクも ASR 接続も
   // 握られたまま残る。ここでは待てないので、出すだけ出して去る。
+  // 画面ロック等で WebView が隠れたら、SDK の foreground exit を待たずに Fieldglass のマイクを止める
+  // (foreground exit が来るかは端末次第。隠れたのに聞き続けるより、戻ってタップで再開の方が安全)。
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && fieldglass.hasSession()) {
+      fieldglass.suspend('hidden')
+      void refreshG2(true)
+    }
+  })
   window.addEventListener('pagehide', () => {
+    fieldglass.destroy('pagehide')
+    messages.destroy()
     if (rtSession) {
       const rt = rtSession
       rtSession = null
       try { rt.abort() } catch { /* ignore */ }
     }
-    if (micIsHeld()) void closeMic('pagehide')
+    // ページごと消える: 持ち主に関係なく必ず閉じる
+    void micArbiter.closeAll('pagehide')
     resetMicState('pagehide')
   })
 
@@ -5192,8 +5538,11 @@ async function boot(): Promise<void> {
       // cc-response: 上下=選択肢移動 / dbl=cc-message へ戻る
       onScrollUp: () => {
         clearG2Notice()  // 一時通知は次の操作で消す
+        if (phase === 'fieldglass') { fieldglass.onScroll(-1); return }
+        if (phase === 'messages') { messages.onScroll(-1); return }
         if (respondInputBlocked()) return  // 応答 POST 中は応答画面の入力を無視
         if (phase === 'rootlist') moveRootCursor(-1)
+        else if (phase === 'pending' && promptDraft?.reply) scrollReplyDraft(-1)  // 返信: ↑↓ は読むだけ
         else if (phase === 'pending') void confirmAndSend()
         else if (phase === 'idle') scrollBack()
         else if (phase === 'recording') recordingScrollBack()
@@ -5203,8 +5552,11 @@ async function boot(): Promise<void> {
       },
       onScrollDown: () => {
         clearG2Notice()  // 一時通知は次の操作で消す
+        if (phase === 'fieldglass') { fieldglass.onScroll(1); return }
+        if (phase === 'messages') { messages.onScroll(1); return }
         if (respondInputBlocked()) return  // 応答 POST 中は応答画面の入力を無視
         if (phase === 'rootlist') moveRootCursor(1)
+        else if (phase === 'pending' && promptDraft?.reply) scrollReplyDraft(1)
         else if (phase === 'pending') removeLastSentence() // 末尾1文だけ削除。空になれば idle
         else if (phase === 'idle') scrollForward()
         else if (phase === 'recording') recordingScrollForward()
@@ -5214,6 +5566,8 @@ async function boot(): Promise<void> {
       },
       onClick: () => {
         clearG2Notice()  // 一時通知は次の操作で消す
+        if (phase === 'fieldglass') { fieldglass.onClick(); return }
+        if (phase === 'messages') { messages.onClick(); return }
         if (respondInputBlocked()) return  // 応答 POST 中はタップも無視
         void toggleRecording()
       },
@@ -5222,12 +5576,21 @@ async function boot(): Promise<void> {
       // 実行側 (toggleFavoriteFromMenu) に集約してある。
       onMenuItem: (itemID) => {
         clearG2Notice()  // 一時通知は次の操作で消す
+        if (phase === 'fieldglass') {
+          if (!fieldglass.onMenuItem(itemID)) log(`未知のメニュー項目 (Fieldglass): itemID=${itemID}`)
+          return
+        }
+        if (phase === 'messages') {
+          if (!messages.onMenuItem(itemID)) log(`未知のメニュー項目 (Messages): itemID=${itemID}`)
+          return
+        }
         if (respondInputBlocked()) return
         if (itemID === LENS_MENU_ID_TOGGLE_FAVORITE) toggleFavoriteFromMenu()
         else if (itemID === LENS_MENU_ID_PROMPT_SEND && phase === 'pending') void confirmAndSend()
         else if (itemID === LENS_MENU_ID_PROMPT_EDIT && phase === 'pending') void editPromptDraft()
         else if (itemID === LENS_MENU_ID_PROMPT_DISCARD && phase === 'pending') discardPending()
         else if (itemID === LENS_MENU_ID_PROMPT_UNDO) undoLastDeletion()
+        else if (itemID === LENS_MENU_ID_PROMPT_DELETE_LAST && phase === 'pending') removeLastSentence()
         else if (itemID === LENS_MENU_ID_RETRY_CONNECTION) void retryConnection()
         else if (itemID === LENS_MENU_ID_REVIEW_RECORD && phase === 'cc-review') void recordAnswerAgain()
         else if (itemID === LENS_MENU_ID_REVIEW_CHOICES && phase === 'cc-review') backToAnswerChoices()
@@ -5240,6 +5603,8 @@ async function boot(): Promise<void> {
         // (接続先が落ちていると Connecting 表示のまま戻れなくなるため)
         // 描画停止だけが残っている状態 (取り込み直前で失敗した等) も同じ口で解く。
         if (navigatingToPlugin || pluginNavBlocksG2Render) { cancelPluginNavigation(); return }
+        if (phase === 'fieldglass') { fieldglass.onDoubleClick(); return }
+        if (phase === 'messages') { messages.onDoubleClick(); return }
         // 応答 POST 中は「戻る/キャンセル」も無視する。ここだけ通していたので、
         // 送信中のダブルタップでフロー (と対象 pending の束縛) が消え、返ってきた
         // 応答の後始末が迷子になっていた。返事が来るまで待たせる。
@@ -5263,6 +5628,8 @@ async function boot(): Promise<void> {
         }
       },
       onAudio: (pcm) => {
+        // Fieldglass の会話中は、音はそちらの音声認識にだけ流す
+        if (phase === 'fieldglass') { fieldglass.onAudio(pcm); return }
         // 録音画面にいる間は無条件で音を通す。マイク取得の決着を条件にすると、
         // ホストが応答を返さない時に届いている音まで捨ててしまう
         // (PCM の経路は audioControl の応答とは別)。ASR 側は接続前なら
@@ -5281,6 +5648,8 @@ async function boot(): Promise<void> {
         }
         log('foreground enter — re-rendering lens')
         resetPageState()
+        // Messages: 画面が開いていれば定期取得を再開 (離脱中は止めてある)
+        if (phase === 'messages') messages.resume()
         void (async () => {
           try {
             await sendShowScreen(buildG2Header(), buildG2Content(), buildG2Footer())
@@ -5291,24 +5660,14 @@ async function boot(): Promise<void> {
           startOutputPolling()  // ポーリングタイマーをリセット
         })()
       },
-      onForegroundExit: () => {
-        // 録音中に離脱した場合はここで必ず後始末する。放置するとマイクが開いたまま、
-        // 音声認識の WebSocket も開いたままになり、離脱のたびに積み上がる。
-        // 録音済みの確定文 (pendingSentences) は abortRecording が保持する。
-        // 判断は phase だけでなくマイクの実態でも行う: 取得の途中で畳まれた等で
-        // 「録音画面ではないがマイクは握ったまま」になっている場合もここで解く。
-        if (phase === 'recording' || micIsHeld() || rtSession) {
-          log('foreground exit — 録音/マイクを後始末します')
-          void abortRecording()
-        }
-        // ページが破棄されている可能性に備え、次回入場時に createStartUpPageContainer に戻す
-        resetPageState()
-      },
+      onForegroundExit: () => handleForegroundExit(),
       // 異常終了 / OS 側からの終了。foreground exit と同じ後始末をする。
       // ここを黙殺していたので、落ち方によってはマイクを握ったまま消えていた。
       onAppExit: (kind) => {
         diag(`${kind} — foreground exit と同じ後始末をします`)
-        if (phase === 'recording' || micIsHeld() || rtSession) void abortRecording()
+        fieldglass.destroy(`app-exit-${kind}`)
+        messages.destroy()
+        if (phase !== 'fieldglass' && (phase === 'recording' || recordingMicHeld() || rtSession)) void abortRecording()
         // 未決着の取得を握ったまま終わらせない (次の起動まで残ることがある)。
         resetMicState('app-exit')
         resetPageState()
@@ -5333,6 +5692,10 @@ async function boot(): Promise<void> {
   // ★ (お気に入り) もここで復元する。設定と同じくブリッジ主体の二重保存なので、
   // 起動のたびに WebView の localStorage が空になる本番環境でも残る。
   favoriteSessions = await loadFavorites(bridge)
+  // Fieldglass の好み (プロファイル・評価の記憶) も同じくブリッジ主体で保存する
+  fgPrefs = new FgPrefs(bridge)
+  await fgPrefs.load()
+  fieldglass.reloadPrefs()
   log(`Loaded settings: server=${settings.serverBaseUrl || '(none)'} session=${settings.sessionName} lang=${settings.language} favorites=${favoriteSessions.size}`)
   applyClientBase()
   setScrollCooldownMs(settings.scrollCooldownMs) // events.ts に保存済みの値を反映
@@ -5390,6 +5753,10 @@ async function boot(): Promise<void> {
 
   // セッション一覧を定期的に更新
   startSessionsRefreshTimer()
+  // Fieldglass の「次の予定」(サーバのキャッシュを読むだけ。カレンダー取得はサーバの裏仕事)
+  fieldglass.startBackground()
+  // Messages の行 (新着数 / 要設定) は起動時に 1 回だけ取る。定期取得は画面を開いている間だけ。
+  void messages.refreshSummary().then(() => { if (phase === 'rootlist') void refreshG2() })
 
   // tmux 出力ポーリング (idle時のみ実行)
   startOutputPolling()

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { SessionList } from './pages/SessionList.tsx';
 import { SessionPane } from './pages/SessionPane.tsx';
+import { Fieldglass } from './pages/Fieldglass.tsx';
 import type { Mode } from './pages/SessionTabs.tsx';
 import { useLanguage } from './i18n.tsx';
 
@@ -11,6 +12,7 @@ type SystemStatus = {
 };
 type Route =
   | { name: 'list' }
+  | { name: 'fieldglass' }
   | { name: 'session'; sessionName: string; mode: Mode; tab: string | null };
 
 // localStorage 上のセッション別モード設定。
@@ -70,6 +72,7 @@ function resolveMode(sessionName: string): Mode {
 }
 
 function getRoute(): Route {
+  if (/^\/fieldglass\/?$/.test(window.location.pathname)) return { name: 'fieldglass' };
   const m = window.location.pathname.match(/^\/sessions\/([^/]+)\/?$/);
   if (m) {
     const sessionName = decodeURIComponent(m[1]);
@@ -374,6 +377,11 @@ export function App() {
     );
   }
 
+  // Fieldglass companion is a full page of its own (never inside the split view).
+  if (route.name === 'fieldglass') {
+    return <Fieldglass onBack={() => navigate('/')} />;
+  }
+
   // Classic mode
   // key を付けて、別セッションへ移った時に画面ごと作り直す
   // (付けないと開いていたタブやプレビューの iframe が次のセッションへ持ち越される)
@@ -388,7 +396,14 @@ export function App() {
         onSwitchMode={switchMode}
       />
     )
-    : <SessionList onOpen={(name, opts) => openSession(name, { chat: opts?.chat })} headerMetrics={metrics as ReactNode} splitToggle={splitToggle} />;
+    : (
+      <SessionList
+        onOpen={(name, opts) => openSession(name, { chat: opts?.chat })}
+        headerMetrics={metrics as ReactNode}
+        splitToggle={splitToggle}
+        onOpenFieldglass={() => navigate('/fieldglass')}
+      />
+    );
 
   return page;
 }

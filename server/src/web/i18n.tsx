@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useState, type ReactNode } from 'react';
+import { FIELDGLASS_STRINGS } from './fieldglass/strings.ts';
 
 // Web UI の i18n。en を基本とし ja を併記する。
 // 言語は localStorage に永続化し、セッション一覧画面の言語切替 UI から変更する。
@@ -160,6 +161,9 @@ const STRINGS = {
   sessionMissingHint:     { en: 'Create it from the session list page first.',
                             ja: '先にセッション一覧画面で作成してください。' },
   backToList:             { en: '← back to list', ja: '← 一覧に戻る' },
+
+  // ── Fieldglass (web companion) ──
+  ...FIELDGLASS_STRINGS,
 } as const;
 
 export type StringKey = keyof typeof STRINGS;

@@ -132,9 +132,11 @@ type Props = {
   headerMetrics?: ReactNode;
   activeSession?: string;
   splitToggle?: ReactNode;
+  /** Opens the Fieldglass companion. Omitted in split view (the list pane stays a session list). */
+  onOpenFieldglass?: () => void;
 };
 
-export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle }: Props) {
+export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle, onOpenFieldglass }: Props) {
   const { t, language, setLanguage } = useLanguage();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [newName, setNewName] = useState('');
@@ -380,6 +382,21 @@ export function SessionList({ onOpen, headerMetrics, activeSession, splitToggle 
           </label>
           {splitToggle}
         </div>
+        {onOpenFieldglass && (
+          <a
+            className="fg-entry"
+            href="/fieldglass"
+            onClick={(e) => {
+              if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+              e.preventDefault();
+              onOpenFieldglass();
+            }}
+          >
+            <span className="fg-entry-title">{t('fgOpen')}</span>
+            <span className="muted">{t('fgOpenHint')}</span>
+            <span className="fg-entry-arrow" aria-hidden="true">→</span>
+          </a>
+        )}
       </header>
 
       <form className="create-form" onSubmit={create}>
