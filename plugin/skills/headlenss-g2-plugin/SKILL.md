@@ -429,6 +429,8 @@ export default defineConfig({
   プレビュータブにも使われる。出す先はトークン (`web` / `g2`) で決まり、無指定は両方。
   作った HTML を相対パスで宣言して Web だけに出す方法は `headlenss-preview-tabs` スキルへ。
 - dev server の立て方 (ポートの選び方・HTTPS 化) は `headlenss-dev-server` スキルへ。
+- 実機の代わりに Even 公式シミュレータ (evenhub-simulator) で確認する場合は、必ずメモリ上限付きで
+  起動する → `even-simulator-memcap` スキルへ。
 
 ## 前提
 
